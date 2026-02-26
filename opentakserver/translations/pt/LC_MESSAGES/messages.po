@@ -8,16 +8,16 @@ msgstr ""
 "Project-Id-Version: PROJECT VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
 "POT-Creation-Date: 2026-01-09 15:52-0500\n"
-"PO-Revision-Date: 2025-12-20 13:43+0000\n"
+"PO-Revision-Date: 2026-02-26 15:42+0000\n"
 "Last-Translator: Brian Wallen <bwallen@gmail.com>\n"
+"Language-Team: Portuguese <https://weblate.opentakserver.io/projects/"
+"opentakserver/opentakserver/pt/>\n"
 "Language: pt\n"
-"Language-Team: Portuguese "
-"<https://weblate.opentakserver.io/projects/opentakserver/opentakserver/pt/>"
-"\n"
-"Plural-Forms: nplurals=2; plural=(n != 1);\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"X-Generator: Weblate 5.13.3\n"
 "Generated-By: Babel 2.15.0\n"
 
 #: blueprints/marti_api/cot_marti_api.py:31
@@ -26,9 +26,9 @@ msgid "No CoT found for UID %(uid)s"
 msgstr "UID desconhecido: %(uid)s"
 
 #: blueprints/marti_api/cot_marti_api.py:50
-#, fuzzy, python-format
+#, python-format
 msgid "Invalid secago value: %(sec_ago)s"
-msgstr "Nome de usuário inválido: %(username)s"
+msgstr "secago Inválido: %(sec_ago)s"
 
 #: blueprints/marti_api/data_package_marti_api.py:45
 msgid "This data package has already been uploaded"
@@ -39,14 +39,14 @@ msgid "A file is required"
 msgstr "É necessário um arquivo"
 
 #: blueprints/marti_api/data_package_marti_api.py:127
-#, fuzzy, python-format
+#, python-format
 msgid "Invalid file extension: %(extension)s"
-msgstr "Direção inválida: %(direction)s"
+msgstr "Extensão de ficheiro inválida: %(extension)s"
 
 #: blueprints/marti_api/data_package_marti_api.py:271
-#, fuzzy, python-format
+#, python-format
 msgid "File not found: %(filename)s}"
-msgstr "Não foi possível encontrar o usuário %(username)s"
+msgstr "Ficheiro não encontrado: %(filename)s"
 
 #: blueprints/marti_api/group_marti_api.py:31
 msgid "Groups are only supported on SSL connections"
@@ -92,9 +92,9 @@ msgid "%(username)s is not in the %(group_name)s group"
 msgstr "%(username)s não está no grupo %(group_name)s"
 
 #: blueprints/marti_api/group_marti_api.py:234
-#, fuzzy, python-format
+#, python-format
 msgid "Failed to update group subscriptions for %(username)s: %(e)s"
-msgstr "Falha ao excluir %(group_name)s: %(e)s"
+msgstr "Falha ao atualizar as assinaturas de grupo para %(username)s: %(e)s"
 
 #: blueprints/marti_api/group_marti_api.py:254
 #, fuzzy
@@ -344,9 +344,9 @@ msgid "Video stream with uid %(uid)s not found"
 msgstr "Fluxo de vídeo com uid %(uid)s não encontrado"
 
 #: blueprints/ots_api/api.py:77
-#, fuzzy, python-format
+#, python-format
 msgid "Invalid sort column: %(sort_by)s"
-msgstr "Tipo inválido: %(cot_type)s"
+msgstr "Coluna de classificação inválida: %(sort_by)s"
 
 #: blueprints/ots_api/api.py:217
 #, python-format
@@ -746,4 +746,3 @@ msgstr "Gravação não encontrada"
 
 #~ msgid "Mission %(mission_name)S not found"
 #~ msgstr "Missão %(mission_name)S não encontrada"
-
