@@ -8,16 +8,16 @@ msgstr ""
 "Project-Id-Version: PROJECT VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
 "POT-Creation-Date: 2026-02-26 10:44-0500\n"
-"PO-Revision-Date: 2026-02-26 15:42+0000\n"
+"PO-Revision-Date: 2026-02-26 15:51+0000\n"
 "Last-Translator: Brian Wallen <bwallen@gmail.com>\n"
+"Language-Team: Portuguese <https://weblate.opentakserver.io/projects/"
+"opentakserver/opentakserver/pt/>\n"
 "Language: pt\n"
-"Language-Team: Portuguese "
-"<https://weblate.opentakserver.io/projects/opentakserver/opentakserver/pt/>"
-"\n"
-"Plural-Forms: nplurals=2; plural=(n != 1);\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+"X-Generator: Weblate 5.13.3\n"
 "Generated-By: Babel 2.15.0\n"
 
 #: blueprints/marti_api/cot_marti_api.py:32
@@ -597,9 +597,9 @@ msgid "Plugin %(plugin_name)s not found"
 msgstr "Plugin %(plugin_name)s não encontrado"
 
 #: blueprints/ots_api/token_api.py:191
-#, fuzzy, python-format
+#, python-format
 msgid "No token found for %(username)s"
-msgstr "UID desconhecido: %(uid)s"
+msgstr "Nenhum token encontrado para %(username)s"
 
 #: blueprints/ots_api/token_api.py:222
 #, python-format
@@ -749,4 +749,3 @@ msgstr "Gravação não encontrada"
 
 #~ msgid "No token found for %s(username)s"
 #~ msgstr ""
-
