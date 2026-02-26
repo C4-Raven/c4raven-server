@@ -18,7 +18,7 @@ class EUD(db.Model):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     uid: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
-    callsign: Mapped[str] = mapped_column(String(255), nullable=True)
+    callsign: Mapped[str] = mapped_column(String(255), nullable=True, unique=True)
     device: Mapped[str] = mapped_column(String(255), nullable=True)
     os: Mapped[str] = mapped_column(String(255), nullable=True)
     platform: Mapped[str] = mapped_column(String(255), nullable=True)

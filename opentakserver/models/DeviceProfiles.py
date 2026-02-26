@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
@@ -10,6 +11,7 @@ from opentakserver.functions import iso8601_string_from_datetime
 # from .EUD import EUD
 
 
+@dataclass
 class DeviceProfiles(db.Model):
     __tablename__ = "device_profiles"
 
@@ -26,6 +28,7 @@ class DeviceProfiles(db.Model):
         String(255),
         ForeignKey("euds.uid", ondelete="CASCADE"),
         nullable=True,
+        default=None
     )
     eud = relationship("EUD", back_populates="profiles")
 
