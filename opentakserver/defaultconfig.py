@@ -22,6 +22,12 @@ class DefaultConfig:
         "KR": {"name": "한국어", "language_code": "ko"},
         "PL": {"name": "Polski", "language_code": "pl"},
         "BR": {"name": "Português", "language_code": "pt_BR"},
+        "IT": {"name": "Italiano", "language_code": "it"},
+        "JA": {"name": "日本語", "language_code": "ja"},
+        "NL": {"name": "Nederlands", "language_code": "nl"},
+        "CN": {"name": "简化字", "language_code": "zh"},
+        "SE": {"name": "Svenska", "language_code": "sv"},
+        "TH": {"name": "ภาษาไทย", "language_code": "th"},
     }
 
     OTS_DATA_FOLDER = os.getenv("OTS_DATA_FOLDER", os.path.join(Path.home(), "ots"))

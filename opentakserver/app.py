@@ -247,6 +247,10 @@ def create_app(cli=True):
             with open(os.path.join(app.config.get("OTS_DATA_FOLDER"), "config.yml"), "w") as config:
                 conf = {}
                 for option in DefaultConfig.__dict__:
+                    # Don't save a list of languages to the config, use the list in defaultconfig.py instead
+                    if option == "OTS_LANGUAGES":
+                        continue
+
                     # Fix the sqlite DB path on Windows
                     if (
                         option == "SQLALCHEMY_DATABASE_URI"
