@@ -7,17 +7,17 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PROJECT VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-02-18 16:34-0500\n"
+"POT-Creation-Date: 2026-02-26 10:44-0500\n"
 "PO-Revision-Date: 2026-02-20 13:58+0000\n"
 "Last-Translator: Peter-Paul K <peterpaul@netone.nl>\n"
-"Language-Team: Dutch <https://weblate.opentakserver.io/projects/"
-"opentakserver/opentakserver/nl/>\n"
 "Language: nl\n"
+"Language-Team: Dutch "
+"<https://weblate.opentakserver.io/projects/opentakserver/opentakserver/nl/>"
+"\n"
+"Plural-Forms: nplurals=2; plural=n != 1;\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Plural-Forms: nplurals=2; plural=n != 1;\n"
-"X-Generator: Weblate 5.13.3\n"
 "Generated-By: Babel 2.15.0\n"
 
 #: blueprints/marti_api/cot_marti_api.py:32
@@ -440,8 +440,8 @@ msgstr "Toevoegen van %(name)s groep: %(e)s mislukt"
 #: blueprints/ots_api/group_api.py:341 blueprints/ots_api/user_api.py:548
 msgid "LDAP is enabled, please use your LDAP server to add users to groups"
 msgstr ""
-"LDAP is geactiveerd, gebruik de LDAP server om gebruikers aan groepen toe te "
-"voegen"
+"LDAP is geactiveerd, gebruik de LDAP server om gebruikers aan groepen toe"
+" te voegen"
 
 #: blueprints/ots_api/group_api.py:358
 msgid "Please provide a list of users, group name, and direction"
@@ -585,8 +585,8 @@ msgid "Plugin %(plugin_name)s not found"
 msgstr "Plugin %(plugin_name)s niet gevonden"
 
 #: blueprints/ots_api/token_api.py:191
-#, python-format
-msgid "No token found for %s(username)s"
+#, fuzzy, python-format
+msgid "No token found for %(username)s"
 msgstr "Geen token gevonden voor %s(username)s"
 
 #: blueprints/ots_api/token_api.py:222
@@ -618,8 +618,7 @@ msgstr "%(username)s is al een bestaande gebruiker"
 
 #: blueprints/ots_api/user_api.py:114
 msgid "LDAP is enabled, please use your LDAP server to delete users"
-msgstr ""
-"LDAP is geactiveerd, gebruik de LDAP server om gebruikers te verwijderen"
+msgstr "LDAP is geactiveerd, gebruik de LDAP server om gebruikers te verwijderen"
 
 #: blueprints/ots_api/user_api.py:126
 msgid "You can't delete your own account"
@@ -650,8 +649,7 @@ msgstr "Gebruiker niet gevonden: %(username)s"
 
 #: blueprints/ots_api/user_api.py:213
 msgid "LDAP is enabled, please use your LDAP server to deactivate users"
-msgstr ""
-"LDAP is geactiveerd, gebruik de LDAP server om gebruikers te de-activeren"
+msgstr "LDAP is geactiveerd, gebruik de LDAP server om gebruikers te de-activeren"
 
 #: blueprints/ots_api/user_api.py:225
 msgid "Please specify the username to deactivate"
@@ -731,3 +729,4 @@ msgstr "Ongeldig recording_id: %(recording_id)s"
 #: blueprints/ots_api/video_api.py:97
 msgid "Recording not found"
 msgstr "Opname niet gevonden"
+

@@ -188,7 +188,7 @@ def get_atak_qr_strings():
             jsonify(
                 {
                     "success": False,
-                    "error": gettext("No token found for %s(username)s", username=username),
+                    "error": gettext("No token found for %(username)s", username=username),
                 }
             ),
             404,
