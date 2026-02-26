@@ -8,8 +8,8 @@ msgstr ""
 "Project-Id-Version: PROJECT VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
 "POT-Creation-Date: 2026-01-09 15:52-0500\n"
-"PO-Revision-Date: 2026-02-23 23:32+0000\n"
-"Last-Translator: deantonious <deantonious@gmail.com>\n"
+"PO-Revision-Date: 2026-02-26 15:42+0000\n"
+"Last-Translator: Brian Wallen <bwallen@gmail.com>\n"
 "Language-Team: Spanish <https://weblate.opentakserver.io/projects/"
 "opentakserver/opentakserver/es/>\n"
 "Language: es\n"
@@ -347,9 +347,9 @@ msgid "Video stream with uid %(uid)s not found"
 msgstr "No se encontró la transmisión de video con uid %(uid)s"
 
 #: blueprints/ots_api/api.py:77
-#, fuzzy, python-format
+#, python-format
 msgid "Invalid sort column: %(sort_by)s"
-msgstr "Tipo no válido: %(cot_type)s"
+msgstr "Columna de ordenación no válida: %(sort_by)s"
 
 #: blueprints/ots_api/api.py:217
 #, python-format
