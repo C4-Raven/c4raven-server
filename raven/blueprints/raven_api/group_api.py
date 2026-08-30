@@ -14,8 +14,14 @@ from raven.blueprints.raven_api.api import paginate, search
 from raven.extensions import db, ldap_manager, logger
 from raven.models.Group import Group
 from raven.models.GroupUser import GroupUser
+from raven.models.user import User
 
 group_api = Blueprint("group_api", __name__)
+
+# Prefix for groups auto-managed by the user visibility diagram (one per
+# connected pair of users). These are an implementation detail -- never
+# shown in the regular groups list or editable/deletable directly.
+PAIRWISE_PREFIX = "__uv__"
 
 
 @group_api.route("/api/groups")
@@ -46,7 +52,7 @@ def get_groups():
             400,
         )
 
-    query = db.session.query(Group)
+    query = db.session.query(Group).filter(~Group.name.startswith(PAIRWISE_PREFIX))
     query = search(query, Group, "name")
     query = search(query, Group, "type")
     query = search(query, Group, "bitpos")
@@ -92,6 +98,8 @@ def get_all_groups():
         # Make sure a group is only added once, not twice for both IN and OUT
         group_names = []
         for group in groups:
+            if group.group.name.startswith(PAIRWISE_PREFIX):
+                continue
             if group.group.name not in group_names:
                 group_names.append(group.group.name)
             else:
@@ -99,7 +107,9 @@ def get_all_groups():
             return_value.append(group.group.to_json())
 
     else:
-        groups = db.session.execute(db.session.query(Group)).scalars()
+        groups = db.session.execute(
+            db.session.query(Group).filter(~Group.name.startswith(PAIRWISE_PREFIX))
+        ).scalars()
         for group in groups:
             return_value.append(group.to_json())
 
@@ -281,6 +291,16 @@ def add_group():
         return jsonify({"success": False, "error": gettext("Missing name")}), 400
 
     name = bleach.clean(request.json.get("name"))
+    if name.startswith(PAIRWISE_PREFIX):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Group names starting with %(prefix)s are reserved", prefix=PAIRWISE_PREFIX),
+                }
+            ),
+            400,
+        )
     description = (
         bleach.clean(request.json.get("description"))
         if "description" in request.json.keys()
@@ -430,6 +450,19 @@ def delete_group():
             jsonify({"success": False, "error": gettext("The __ANON__ group cannot be deleted")}),
             400,
         )
+    if group_name.startswith(PAIRWISE_PREFIX):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "This group is managed by the user visibility diagram -- disconnect the "
+                        "users there instead of deleting it directly"
+                    ),
+                }
+            ),
+            400,
+        )
 
     try:
         group = db.session.execute(db.session.query(Group).filter_by(name=group_name)).first()
@@ -472,89 +505,60 @@ def delete_group():
     return jsonify({"success": True})
 
 
-def _group_members(group_id):
-    """Distinct user ids with any membership row (IN or OUT) in a group -- its roster."""
-    rows = db.session.execute(
-        db.session.query(GroupUser.user_id).filter_by(group_id=group_id).distinct()
-    ).scalars()
-    return set(rows)
+def _pairwise_group_name(username_a, username_b):
+    a, b = sorted([username_a, username_b])
+    return f"{PAIRWISE_PREFIX}{a}__{b}"
 
 
-def _out_members(group_id):
-    """Distinct user ids currently able to read (OUT, enabled) a group's channel."""
-    rows = db.session.execute(
-        db.session.query(GroupUser.user_id).filter_by(
-            group_id=group_id, direction=Group.OUT, enabled=True
-        )
-    ).scalars()
-    return set(rows)
+def _get_or_create_pairwise_group(username_a, username_b):
+    name = _pairwise_group_name(username_a, username_b)
+    group = db.session.execute(db.session.query(Group).filter_by(name=name)).first()
+    if group:
+        return group[0]
+
+    group = Group()
+    group.name = name
+    group.type = Group.SYSTEM
+    group.description = "Auto-managed by the user visibility diagram. Do not edit directly."
+    db.session.add(group)
+    db.session.commit()
+    return group
 
 
-def _grant_out(user_ids, group_id):
-    for user_id in user_ids:
+def _set_membership(user_id, group_id, direction, present):
+    existing = db.session.execute(
+        db.session.query(GroupUser).filter_by(user_id=user_id, group_id=group_id, direction=direction)
+    ).first()
+    if present and not existing:
         membership = GroupUser()
         membership.user_id = user_id
         membership.group_id = group_id
-        membership.direction = Group.OUT
+        membership.direction = direction
         try:
             db.session.add(membership)
             db.session.commit()
         except sqlalchemy.exc.IntegrityError:
             db.session.rollback()
+    elif not present and existing:
+        db.session.delete(existing[0])
+        db.session.commit()
 
 
-def _revoke_out(user_ids, group_id):
-    if not user_ids:
-        return
-    GroupUser.query.filter(
-        GroupUser.group_id == group_id,
-        GroupUser.direction == Group.OUT,
-        GroupUser.user_id.in_(user_ids),
-    ).delete(synchronize_session=False)
-    db.session.commit()
-
-
-def _require_source_target_type(source_name, target_name, rel_type):
-    """Returns (source, target, None) on success, or (None, None, error_response) on failure."""
-    if not source_name or not target_name or rel_type not in ("solid", "dotted"):
-        return None, None, (
-            jsonify(
-                {
-                    "success": False,
-                    "error": gettext(
-                        "source, target, and a valid type (solid or dotted) are required"
-                    ),
-                }
-            ),
-            400,
-        )
-    if source_name == target_name:
-        return None, None, (
-            jsonify({"success": False, "error": gettext("A group can't connect to itself")}),
-            400,
-        )
-
-    source = db.session.execute(db.session.query(Group).filter_by(name=source_name)).first()
-    target = db.session.execute(db.session.query(Group).filter_by(name=target_name)).first()
-    if not source or not target:
-        return None, None, (jsonify({"success": False, "error": gettext("Group not found")}), 404)
-
-    return source[0], target[0], None
-
-
-@group_api.route("/api/groups/visibility", methods=["GET"])
+@group_api.route("/api/users/visibility", methods=["GET"])
 @roles_required("administrator")
-def get_group_visibility():
-    """Computes the current cross-group visibility diagram from real GroupUser rows.
+def get_user_visibility():
+    """Computes the current user-to-user visibility diagram.
 
-    A group's "members" are anyone with any membership row (IN or OUT) in it.
-    Two groups are drawn as connected when every member of one group can
-    currently read (OUT, enabled) the other's channel:
-      - both directions hold -> solid (mutual "see + message")
-      - only one direction holds -> dotted, pointing from the sender to the
-        group whose members receive its data
+    Each connected pair of users has its own auto-managed group (see
+    PAIRWISE_PREFIX). Per OpenTAKServer's group semantics, IN lets a user
+    send CoT to a group and OUT lets them receive CoT from it, so within a
+    pair's group:
+      - user A has IN and user B has OUT -> A's data reaches B
+      - both have IN and OUT -> solid, mutual "see + message"
+      - only one direction holds -> dotted, pointing at the receiver
 
-    :return: JSON array of {source, target, type} edges
+    :return: JSON array of {source, target, type} edges, source/target are
+        usernames
     """
     if app.config.get("RAVEN_ENABLE_LDAP"):
         return (
@@ -569,42 +573,55 @@ def get_group_visibility():
             400,
         )
 
-    groups = db.session.execute(db.session.query(Group)).scalars().all()
-    members_by_group = {g.id: _group_members(g.id) for g in groups}
-    out_by_group = {g.id: _out_members(g.id) for g in groups}
+    pairwise_groups = db.session.execute(
+        db.session.query(Group).filter(Group.name.startswith(PAIRWISE_PREFIX))
+    ).scalars().all()
 
     edges = []
-    for i, a in enumerate(groups):
-        members_a = members_by_group[a.id]
-        if not members_a:
+    for group in pairwise_groups:
+        rows = db.session.execute(
+            db.session.query(GroupUser).filter_by(group_id=group.id)
+        ).scalars().all()
+
+        directions_by_user = {}
+        for row in rows:
+            directions_by_user.setdefault(row.user_id, set()).add(row.direction)
+
+        user_ids = list(directions_by_user.keys())
+        if len(user_ids) != 2:
             continue
-        for b in groups[i + 1 :]:
-            members_b = members_by_group[b.id]
-            if not members_b:
-                continue
 
-            a_reads_b = members_a.issubset(out_by_group[b.id])
-            b_reads_a = members_b.issubset(out_by_group[a.id])
+        user_a = db.session.get(User, user_ids[0])
+        user_b = db.session.get(User, user_ids[1])
+        if not user_a or not user_b:
+            continue
 
-            if a_reads_b and b_reads_a:
-                edges.append({"source": a.name, "target": b.name, "type": "solid"})
-            elif a_reads_b:
-                # a's members can read b's channel -> b is the sender
-                edges.append({"source": b.name, "target": a.name, "type": "dotted"})
-            elif b_reads_a:
-                edges.append({"source": a.name, "target": b.name, "type": "dotted"})
+        a_sends = Group.IN in directions_by_user[user_a.id]
+        a_receives = Group.OUT in directions_by_user[user_a.id]
+        b_sends = Group.IN in directions_by_user[user_b.id]
+        b_receives = Group.OUT in directions_by_user[user_b.id]
+
+        a_to_b = a_sends and b_receives
+        b_to_a = b_sends and a_receives
+
+        if a_to_b and b_to_a:
+            edges.append({"source": user_a.username, "target": user_b.username, "type": "solid"})
+        elif a_to_b:
+            edges.append({"source": user_a.username, "target": user_b.username, "type": "dotted"})
+        elif b_to_a:
+            edges.append({"source": user_b.username, "target": user_a.username, "type": "dotted"})
 
     return jsonify(edges)
 
 
-@group_api.route("/api/groups/visibility", methods=["PUT"])
+@group_api.route("/api/users/visibility", methods=["PUT"])
 @roles_required("administrator")
-def set_group_visibility():
-    """Applies a drawn diagram connection to real group memberships.
+def set_user_visibility():
+    """Connects two users on the visibility diagram.
 
-    :parameter: source - group name (the sender, for a dotted connection)
-    :parameter: target - group name (the receiver, for a dotted connection)
-    :parameter: type - "solid" or "dotted"
+    :parameter: source - username (the sender, for a dotted connection)
+    :parameter: target - username (the receiver, for a dotted connection)
+    :parameter: type - "solid" (mutual) or "dotted" (one-way, source -> target)
     """
     if app.config.get("RAVEN_ENABLE_LDAP"):
         return (
@@ -623,33 +640,45 @@ def set_group_visibility():
     target_name = bleach.clean(request.json.get("target", ""))
     rel_type = bleach.clean(request.json.get("type", ""))
 
-    source, target, error = _require_source_target_type(source_name, target_name, rel_type)
-    if error:
-        return error
+    if not source_name or not target_name or rel_type not in ("solid", "dotted"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "source, target, and a valid type (solid or dotted) are required"
+                    ),
+                }
+            ),
+            400,
+        )
+    if source_name == target_name:
+        return jsonify({"success": False, "error": gettext("A user can't connect to themselves")}), 400
 
-    source_members = _group_members(source.id)
-    target_members = _group_members(target.id)
+    source = app.security.datastore.find_user(username=source_name)
+    target = app.security.datastore.find_user(username=target_name)
+    if not source or not target:
+        return jsonify({"success": False, "error": gettext("User not found")}), 404
 
-    # dotted source -> target: target's members receive source's data
-    _grant_out(target_members, source.id)
+    group = _get_or_create_pairwise_group(source_name, target_name)
+
+    # dotted source -> target: source sends (IN), target receives (OUT)
+    _set_membership(source.id, group.id, Group.IN, True)
+    _set_membership(target.id, group.id, Group.OUT, True)
     if rel_type == "solid":
-        _grant_out(source_members, target.id)
+        _set_membership(target.id, group.id, Group.IN, True)
+        _set_membership(source.id, group.id, Group.OUT, True)
 
     return jsonify({"success": True})
 
 
-@group_api.route("/api/groups/visibility", methods=["DELETE"])
+@group_api.route("/api/users/visibility", methods=["DELETE"])
 @roles_required("administrator")
-def remove_group_visibility():
-    """Removes a drawn diagram connection from real group memberships.
+def remove_user_visibility():
+    """Disconnects two users, removing their auto-managed pairwise group entirely.
 
-    Revokes exactly the OUT memberships that connection implies between the
-    two groups' *current* members -- it does not touch memberships that
-    predate or fall outside this specific source/target/type relationship.
-
-    :parameter: source - group name
-    :parameter: target - group name
-    :parameter: type - "solid" or "dotted"
+    :parameter: source - username
+    :parameter: target - username
     """
     if app.config.get("RAVEN_ENABLE_LDAP"):
         return (
@@ -666,17 +695,18 @@ def remove_group_visibility():
 
     source_name = bleach.clean(request.args.get("source", ""))
     target_name = bleach.clean(request.args.get("target", ""))
-    rel_type = bleach.clean(request.args.get("type", ""))
 
-    source, target, error = _require_source_target_type(source_name, target_name, rel_type)
-    if error:
-        return error
+    if not source_name or not target_name:
+        return jsonify({"success": False, "error": gettext("source and target are required")}), 400
 
-    source_members = _group_members(source.id)
-    target_members = _group_members(target.id)
+    name = _pairwise_group_name(source_name, target_name)
+    group = db.session.execute(db.session.query(Group).filter_by(name=name)).first()
+    if not group:
+        return jsonify({"success": True})
 
-    _revoke_out(target_members, source.id)
-    if rel_type == "solid":
-        _revoke_out(source_members, target.id)
+    group = group[0]
+    GroupUser.query.filter_by(group_id=group.id).delete()
+    db.session.delete(group)
+    db.session.commit()
 
     return jsonify({"success": True})
