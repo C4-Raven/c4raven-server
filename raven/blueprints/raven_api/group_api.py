@@ -470,3 +470,213 @@ def delete_group():
         )
 
     return jsonify({"success": True})
+
+
+def _group_members(group_id):
+    """Distinct user ids with any membership row (IN or OUT) in a group -- its roster."""
+    rows = db.session.execute(
+        db.session.query(GroupUser.user_id).filter_by(group_id=group_id).distinct()
+    ).scalars()
+    return set(rows)
+
+
+def _out_members(group_id):
+    """Distinct user ids currently able to read (OUT, enabled) a group's channel."""
+    rows = db.session.execute(
+        db.session.query(GroupUser.user_id).filter_by(
+            group_id=group_id, direction=Group.OUT, enabled=True
+        )
+    ).scalars()
+    return set(rows)
+
+
+def _grant_out(user_ids, group_id):
+    for user_id in user_ids:
+        membership = GroupUser()
+        membership.user_id = user_id
+        membership.group_id = group_id
+        membership.direction = Group.OUT
+        try:
+            db.session.add(membership)
+            db.session.commit()
+        except sqlalchemy.exc.IntegrityError:
+            db.session.rollback()
+
+
+def _revoke_out(user_ids, group_id):
+    if not user_ids:
+        return
+    GroupUser.query.filter(
+        GroupUser.group_id == group_id,
+        GroupUser.direction == Group.OUT,
+        GroupUser.user_id.in_(user_ids),
+    ).delete(synchronize_session=False)
+    db.session.commit()
+
+
+def _require_source_target_type(source_name, target_name, rel_type):
+    """Returns (source, target, None) on success, or (None, None, error_response) on failure."""
+    if not source_name or not target_name or rel_type not in ("solid", "dotted"):
+        return None, None, (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "source, target, and a valid type (solid or dotted) are required"
+                    ),
+                }
+            ),
+            400,
+        )
+    if source_name == target_name:
+        return None, None, (
+            jsonify({"success": False, "error": gettext("A group can't connect to itself")}),
+            400,
+        )
+
+    source = db.session.execute(db.session.query(Group).filter_by(name=source_name)).first()
+    target = db.session.execute(db.session.query(Group).filter_by(name=target_name)).first()
+    if not source or not target:
+        return None, None, (jsonify({"success": False, "error": gettext("Group not found")}), 404)
+
+    return source[0], target[0], None
+
+
+@group_api.route("/api/groups/visibility", methods=["GET"])
+@roles_required("administrator")
+def get_group_visibility():
+    """Computes the current cross-group visibility diagram from real GroupUser rows.
+
+    A group's "members" are anyone with any membership row (IN or OUT) in it.
+    Two groups are drawn as connected when every member of one group can
+    currently read (OUT, enabled) the other's channel:
+      - both directions hold -> solid (mutual "see + message")
+      - only one direction holds -> dotted, pointing from the sender to the
+        group whose members receive its data
+
+    :return: JSON array of {source, target, type} edges
+    """
+    if app.config.get("RAVEN_ENABLE_LDAP"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "LDAP is enabled. Please view and edit groups on your LDAP server"
+                    ),
+                }
+            ),
+            400,
+        )
+
+    groups = db.session.execute(db.session.query(Group)).scalars().all()
+    members_by_group = {g.id: _group_members(g.id) for g in groups}
+    out_by_group = {g.id: _out_members(g.id) for g in groups}
+
+    edges = []
+    for i, a in enumerate(groups):
+        members_a = members_by_group[a.id]
+        if not members_a:
+            continue
+        for b in groups[i + 1 :]:
+            members_b = members_by_group[b.id]
+            if not members_b:
+                continue
+
+            a_reads_b = members_a.issubset(out_by_group[b.id])
+            b_reads_a = members_b.issubset(out_by_group[a.id])
+
+            if a_reads_b and b_reads_a:
+                edges.append({"source": a.name, "target": b.name, "type": "solid"})
+            elif a_reads_b:
+                # a's members can read b's channel -> b is the sender
+                edges.append({"source": b.name, "target": a.name, "type": "dotted"})
+            elif b_reads_a:
+                edges.append({"source": a.name, "target": b.name, "type": "dotted"})
+
+    return jsonify(edges)
+
+
+@group_api.route("/api/groups/visibility", methods=["PUT"])
+@roles_required("administrator")
+def set_group_visibility():
+    """Applies a drawn diagram connection to real group memberships.
+
+    :parameter: source - group name (the sender, for a dotted connection)
+    :parameter: target - group name (the receiver, for a dotted connection)
+    :parameter: type - "solid" or "dotted"
+    """
+    if app.config.get("RAVEN_ENABLE_LDAP"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "LDAP is enabled. Please view and edit groups on your LDAP server"
+                    ),
+                }
+            ),
+            400,
+        )
+
+    source_name = bleach.clean(request.json.get("source", ""))
+    target_name = bleach.clean(request.json.get("target", ""))
+    rel_type = bleach.clean(request.json.get("type", ""))
+
+    source, target, error = _require_source_target_type(source_name, target_name, rel_type)
+    if error:
+        return error
+
+    source_members = _group_members(source.id)
+    target_members = _group_members(target.id)
+
+    # dotted source -> target: target's members receive source's data
+    _grant_out(target_members, source.id)
+    if rel_type == "solid":
+        _grant_out(source_members, target.id)
+
+    return jsonify({"success": True})
+
+
+@group_api.route("/api/groups/visibility", methods=["DELETE"])
+@roles_required("administrator")
+def remove_group_visibility():
+    """Removes a drawn diagram connection from real group memberships.
+
+    Revokes exactly the OUT memberships that connection implies between the
+    two groups' *current* members -- it does not touch memberships that
+    predate or fall outside this specific source/target/type relationship.
+
+    :parameter: source - group name
+    :parameter: target - group name
+    :parameter: type - "solid" or "dotted"
+    """
+    if app.config.get("RAVEN_ENABLE_LDAP"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "LDAP is enabled. Please view and edit groups on your LDAP server"
+                    ),
+                }
+            ),
+            400,
+        )
+
+    source_name = bleach.clean(request.args.get("source", ""))
+    target_name = bleach.clean(request.args.get("target", ""))
+    rel_type = bleach.clean(request.args.get("type", ""))
+
+    source, target, error = _require_source_target_type(source_name, target_name, rel_type)
+    if error:
+        return error
+
+    source_members = _group_members(source.id)
+    target_members = _group_members(target.id)
+
+    _revoke_out(target_members, source.id)
+    if rel_type == "solid":
+        _revoke_out(source_members, target.id)
+
+    return jsonify({"success": True})
