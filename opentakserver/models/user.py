@@ -15,6 +15,10 @@ from opentakserver.models.WebAuthn import WebAuthn
 @dataclass
 class User(db.Model, fsqla.FsUserMixin):
     email = db.Column(String(255), nullable=True)
+    site_access = db.Column(db.Boolean, nullable=False, default=True, server_default="true")
+    # CUSTOM: force_password_change patch -- when true, user is blocked from all
+    # API access except changing their password, until they do so.
+    force_password_change = db.Column(db.Boolean, nullable=False, default=False, server_default="false")
     video_streams = relationship("VideoStream", back_populates="user")
     euds = relationship("EUD", back_populates="user")
     data_packages = relationship("DataPackage", back_populates="user")
@@ -35,6 +39,7 @@ class User(db.Model, fsqla.FsUserMixin):
             "id": self.id,
             "username": self.username,
             "active": self.active,
+            "site_access": self.site_access,
             "last_login_at": self.last_login_at,
             "last_login_ip": self.last_login_ip,
             "current_login_at": self.current_login_at,

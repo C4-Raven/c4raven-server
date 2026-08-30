@@ -1,3 +1,5 @@
+import secrets
+import string
 import traceback
 
 import bleach
@@ -88,7 +90,12 @@ def create_user():
     if not app.security.datastore.find_user(username=username):
         logger.info("Creating user {}".format(username))
         app.security.datastore.create_user(
-            username=username, password=hash_password(password), roles=roles_cleaned
+            username=username,
+            password=hash_password(password),
+            roles=roles_cleaned,
+            # CUSTOM: force_password_change patch -- new users must change their
+            # admin-assigned password before doing anything else.
+            force_password_change=True,
         )
         db.session.commit()
         return jsonify({"success": True}), 200
@@ -201,6 +208,13 @@ def admin_reset_password():
     user = app.security.datastore.find_user(username=username)
     if user:
         admin_change_password(user, new_password, False)
+        # CUSTOM: force_password_change patch -- admin_change_password() above
+        # fires Flask-Security's password_changed signal, which our handler
+        # uses to CLEAR force_password_change when a user sets their own new
+        # password. An admin-issued reset is a temporary password too, so
+        # re-set the flag here, after that signal has already run.
+        user.force_password_change = True
+        db.session.add(user)
         db.session.commit()
         return jsonify({"success": True}), 200
     else:
@@ -213,6 +227,89 @@ def admin_reset_password():
             ),
             400,
         )
+
+
+# CUSTOM: force_password_change patch -- lets an admin flag an account so the
+# user is forced to set their own new password on next login, without the
+# admin ever having to choose or type a temporary password for them.
+@user_api_blueprint.route("/api/user/force_password_reset", methods=["POST"])
+@roles_accepted("administrator")
+def force_password_reset():
+    username = bleach.clean(request.json.get("username"))
+    if not username:
+        return jsonify({"success": False, "error": gettext("Please specify a username")}), 400
+
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Could not find user %(username)s", username=username),
+                }
+            ),
+            400,
+        )
+
+    user.force_password_change = True
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"success": True}), 200
+
+
+# CUSTOM: force_password_change patch -- for a user who has forgotten their
+# password entirely (so force_password_reset alone won't help, since they
+# can't log in with their old one to be prompted). Generates a random
+# temporary password server-side, sets it, and hands it back to the admin to
+# relay to the user. force_password_change is set so it must be changed
+# before anything else works.
+_TEMP_PASSWORD_ALPHABET = "".join(
+    c for c in (string.ascii_letters + string.digits) if c not in "0OoIl1"
+)
+
+
+def _generate_temp_password(length: int = 12) -> str:
+    return "".join(secrets.choice(_TEMP_PASSWORD_ALPHABET) for _ in range(length))
+
+
+@user_api_blueprint.route("/api/user/issue_temp_password", methods=["POST"])
+@roles_accepted("administrator")
+def issue_temp_password():
+    if app.config.get("OTS_ENABLE_LDAP"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "LDAP is enabled, please use your LDAP server to reset passwords"
+                    ),
+                }
+            ),
+            400,
+        )
+
+    username = bleach.clean(request.json.get("username"))
+    if not username:
+        return jsonify({"success": False, "error": gettext("Please specify a username")}), 400
+
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Could not find user %(username)s", username=username),
+                }
+            ),
+            400,
+        )
+
+    temp_password = _generate_temp_password()
+    admin_change_password(user, temp_password, False)
+    user.force_password_change = True
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"success": True, "password": temp_password}), 200
 
 
 @user_api_blueprint.route("/api/user/deactivate", methods=["POST"])
@@ -313,6 +410,74 @@ def activate_user():
                 "error": gettext("%(username)s is already activated", username=username),
             }
         )
+
+
+@user_api_blueprint.route("/api/user/site_access/grant", methods=["POST"])
+@roles_accepted("administrator")
+def grant_site_access():
+    username = bleach.clean(request.json.get("username", ""))
+    if not username:
+        return (
+            jsonify(
+                {"success": False, "error": gettext("Please specify the username to grant access to")}
+            ),
+            400,
+        )
+
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("User %(username)s does not exist", username=username),
+                }
+            ),
+            400,
+        )
+
+    user.site_access = True
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@user_api_blueprint.route("/api/user/site_access/revoke", methods=["POST"])
+@roles_accepted("administrator")
+def revoke_site_access():
+    username = bleach.clean(request.json.get("username", ""))
+    if not username:
+        return (
+            jsonify(
+                {"success": False, "error": gettext("Please specify the username to revoke access from")}
+            ),
+            400,
+        )
+
+    if username == current_user.username:
+        return (
+            jsonify(
+                {"success": False, "error": gettext("You can't revoke your own website access")}
+            ),
+            400,
+        )
+
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("User %(username)s does not exist", username=username),
+                }
+            ),
+            400,
+        )
+
+    user.site_access = False
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"success": True})
 
 
 @user_api_blueprint.route("/api/user/role", methods=["POST"])

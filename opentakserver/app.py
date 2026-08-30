@@ -39,6 +39,7 @@ from opentakserver.certificate_authority import CertificateAuthority
 from opentakserver.controllers.meshtastic_controller import MeshtasticController
 from opentakserver.defaultconfig import DefaultConfig
 from opentakserver.EmailValidator import EmailValidator
+from opentakserver.forms.SiteAccessLoginForm import SiteAccessLoginForm
 from opentakserver.extensions import apscheduler, babel, db, ldap_manager, logger, mail, socketio
 from opentakserver.models.Group import Group, GroupTypeEnum
 from opentakserver.models.Icon import Icon
@@ -193,6 +194,7 @@ def init_extensions(app):
         mail_util_cls=EmailValidator,
         password_util_cls=PasswordValidator,
         username_util_cls=UsernameValidator,
+        login_form=SiteAccessLoginForm,
     )
 
     mail.init_app(app)
@@ -288,6 +290,93 @@ def create_app(cli=True):
 
         init_extensions(app)
 
+        # CUSTOM: force_password_change patch -- new users (see user_api.create_user)
+        # are created with force_password_change=True. The Login page (see
+        # OpenTAKServer-UI src/pages/Login/Login.tsx) reads a force_password_change
+        # field on the login/tf-validate success response and shows an inline
+        # "set a new password" step when it's true, instead of navigating to the
+        # dashboard. Everything else stays hard-blocked server-side regardless of
+        # what the frontend does, as the actual enforcement boundary.
+        _force_pw_change_url = app.config.get("SECURITY_URL_PREFIX", "") + app.config.get(
+            "SECURITY_CHANGE_URL", "/password/change"
+        )
+        _force_pw_logout_url = app.config.get("SECURITY_URL_PREFIX", "") + app.config.get(
+            "SECURITY_LOGOUT_URL", "/logout"
+        )
+        _login_url = app.config.get("SECURITY_URL_PREFIX", "") + app.config.get(
+            "SECURITY_LOGIN_URL", "/login"
+        )
+        _tf_validate_url = app.config.get("SECURITY_URL_PREFIX", "") + app.config.get(
+            "SECURITY_TWO_FACTOR_TOKEN_VALIDATION_URL", "/tf-validate"
+        )
+
+        @app.after_request
+        def _force_password_change_hook(response):
+            import json as _json
+
+            from flask import request as _req
+            from flask_security import current_user as _current_user
+
+            path = _req.path
+
+            # Unconditional exemption: login/tf-validate/change-password/logout
+            # must never be blocked, regardless of what current_user resolves to.
+            # In particular, if the browser still carries a session cookie for a
+            # DIFFERENT, previously-logged-in flagged account (e.g. switching
+            # accounts without logging out first), current_user reflects that
+            # OLD identity until this request's own login_user() call replaces
+            # it -- which for an account requiring 2FA doesn't happen until
+            # tf-validate succeeds. Blocking here would wrongly refuse a brand
+            # new login attempt because of an unrelated stale session.
+            if path in (_login_url, _tf_validate_url, _force_pw_change_url, _force_pw_logout_url):
+                if path in (_login_url, _tf_validate_url) and response.status_code == 200 and response.is_json:
+                    try:
+                        if _current_user.is_authenticated:
+                            data = response.get_json()
+                            data.setdefault("response", {})["force_password_change"] = bool(
+                                getattr(_current_user, "force_password_change", False)
+                            )
+                            response.set_data(_json.dumps(data))
+                    except Exception:
+                        pass
+                return response
+
+            try:
+                authenticated = _current_user.is_authenticated
+            except Exception:
+                authenticated = False
+
+            flagged = authenticated and getattr(_current_user, "force_password_change", False)
+            if not flagged:
+                return response
+
+            response.set_data(
+                _json.dumps(
+                    {
+                        "meta": {"code": 403},
+                        "response": {
+                            "errors": [
+                                "You must change your password before continuing. "
+                                "Go to " + _force_pw_change_url + " to set a new one, "
+                                "then log in again."
+                            ]
+                        },
+                    }
+                )
+            )
+            response.status_code = 403
+            response.mimetype = "application/json"
+            return response
+
+        from flask_security.signals import password_changed as _password_changed_signal
+
+        @_password_changed_signal.connect_via(app)
+        def _clear_force_password_change(sender, user, **extra):
+            if getattr(user, "force_password_change", False):
+                user.force_password_change = False
+                db.session.add(user)
+                db.session.commit()
+
         from opentakserver.blueprints.marti_api import marti_blueprint
 
         app.register_blueprint(marti_blueprint)
@@ -336,6 +425,7 @@ def create_app(cli=True):
             mail_util_cls=EmailValidator,
             password_util_cls=PasswordValidator,
             username_util_cls=UsernameValidator,
+            login_form=SiteAccessLoginForm,
         )
 
         # Register blueprints to properly import all the DB models without circular imports
