@@ -549,16 +549,29 @@ def _set_membership(user_id, group_id, direction, present):
 def get_user_visibility():
     """Computes the current user-to-user visibility diagram.
 
-    Each connected pair of users has its own auto-managed group (see
-    PAIRWISE_PREFIX). Per OpenTAKServer's group semantics, IN lets a user
-    send CoT to a group and OUT lets them receive CoT from it, so within a
-    pair's group:
-      - user A has IN and user B has OUT -> A's data reaches B
-      - both have IN and OUT -> solid, mutual "see + message"
+    Per OpenTAKServer's group semantics, IN lets a user send CoT to a group
+    and OUT lets them receive CoT from it. Two users are connected here if
+    that holds true via ANY group they share -- a real named group (e.g. one
+    they were both added to on the Groups page) just as much as one of the
+    auto-managed pairwise groups this diagram itself creates (see
+    PAIRWISE_PREFIX). Without this, adding someone to a group's Access list
+    wouldn't show up here at all, and the two views would visibly disagree
+    about who can actually see whom.
+
+      - user A has IN and user B has OUT (on some shared group) -> A's data
+        reaches B
+      - true in both directions -> solid, mutual "see + message"
       - only one direction holds -> dotted, pointing at the receiver
 
-    :return: JSON array of {source, target, type} edges, source/target are
-        usernames
+    Each edge is also flagged "manual": true if a pairwise group
+    contributes to it, meaning it can be created/removed directly on this
+    diagram. An edge that's only true because of a shared *named* group
+    (manual: false) can't be removed here -- it has to be changed on that
+    group's own Access list, since it isn't a property of just this one
+    pair.
+
+    :return: JSON array of {source, target, type, manual} edges,
+        source/target are usernames
     """
     if app.config.get("RAVEN_ENABLE_LDAP"):
         return (
@@ -573,43 +586,58 @@ def get_user_visibility():
             400,
         )
 
-    pairwise_groups = db.session.execute(
-        db.session.query(Group).filter(Group.name.startswith(PAIRWISE_PREFIX))
-    ).scalars().all()
+    groups = db.session.execute(db.session.query(Group)).scalars().all()
+
+    # (sender_id, receiver_id) -> list of group names that grant it
+    send_pairs: dict[tuple[int, int], list[str]] = {}
+    for group in groups:
+        rows = db.session.execute(
+            db.session.query(GroupUser).filter_by(group_id=group.id, enabled=True)
+        ).scalars().all()
+        senders = {r.user_id for r in rows if r.direction == Group.IN}
+        receivers = {r.user_id for r in rows if r.direction == Group.OUT}
+        for sender_id in senders:
+            for receiver_id in receivers:
+                if sender_id == receiver_id:
+                    continue
+                send_pairs.setdefault((sender_id, receiver_id), []).append(group.name)
+
+    users_by_id = {u.id: u for u in db.session.execute(db.session.query(User)).scalars().all()}
 
     edges = []
-    for group in pairwise_groups:
-        rows = db.session.execute(
-            db.session.query(GroupUser).filter_by(group_id=group.id)
-        ).scalars().all()
+    seen = set()
+    for (a_id, b_id) in send_pairs:
+        pair_key = frozenset((a_id, b_id))
+        if pair_key in seen:
+            continue
+        seen.add(pair_key)
 
-        directions_by_user = {}
-        for row in rows:
-            directions_by_user.setdefault(row.user_id, set()).add(row.direction)
-
-        user_ids = list(directions_by_user.keys())
-        if len(user_ids) != 2:
+        a_to_b_groups = send_pairs.get((a_id, b_id), [])
+        b_to_a_groups = send_pairs.get((b_id, a_id), [])
+        if not a_to_b_groups and not b_to_a_groups:
             continue
 
-        user_a = db.session.get(User, user_ids[0])
-        user_b = db.session.get(User, user_ids[1])
+        user_a = users_by_id.get(a_id)
+        user_b = users_by_id.get(b_id)
         if not user_a or not user_b:
             continue
 
-        a_sends = Group.IN in directions_by_user[user_a.id]
-        a_receives = Group.OUT in directions_by_user[user_a.id]
-        b_sends = Group.IN in directions_by_user[user_b.id]
-        b_receives = Group.OUT in directions_by_user[user_b.id]
+        manual = any(
+            name.startswith(PAIRWISE_PREFIX) for name in a_to_b_groups + b_to_a_groups
+        )
 
-        a_to_b = a_sends and b_receives
-        b_to_a = b_sends and a_receives
-
-        if a_to_b and b_to_a:
-            edges.append({"source": user_a.username, "target": user_b.username, "type": "solid"})
-        elif a_to_b:
-            edges.append({"source": user_a.username, "target": user_b.username, "type": "dotted"})
-        elif b_to_a:
-            edges.append({"source": user_b.username, "target": user_a.username, "type": "dotted"})
+        if a_to_b_groups and b_to_a_groups:
+            edges.append(
+                {"source": user_a.username, "target": user_b.username, "type": "solid", "manual": manual}
+            )
+        elif a_to_b_groups:
+            edges.append(
+                {"source": user_a.username, "target": user_b.username, "type": "dotted", "manual": manual}
+            )
+        else:
+            edges.append(
+                {"source": user_b.username, "target": user_a.username, "type": "dotted", "manual": manual}
+            )
 
     return jsonify(edges)
 
@@ -677,6 +705,12 @@ def set_user_visibility():
 def remove_user_visibility():
     """Disconnects two users, removing their auto-managed pairwise group entirely.
 
+    If the two aren't connected through a pairwise group at all -- the
+    connection is only coming from a shared named group's own Access list
+    (see get_user_visibility's "manual" flag) -- there's nothing here to
+    remove, and this returns an error explaining that rather than silently
+    doing nothing.
+
     :parameter: source - username
     :parameter: target - username
     """
@@ -702,7 +736,18 @@ def remove_user_visibility():
     name = _pairwise_group_name(source_name, target_name)
     group = db.session.execute(db.session.query(Group).filter_by(name=name)).first()
     if not group:
-        return jsonify({"success": True})
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "This connection comes from a shared group's Access list, not a direct "
+                        "connection -- remove one of them from that group instead"
+                    ),
+                }
+            ),
+            400,
+        )
 
     group = group[0]
     GroupUser.query.filter_by(group_id=group.id).delete()
