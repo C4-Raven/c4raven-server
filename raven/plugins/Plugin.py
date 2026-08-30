@@ -23,7 +23,7 @@ class Plugin(BasePlugin):
         self.distro = ""
         self.routes = []
 
-    group = "raven.plugin"
+    group = "opentakserver.plugin"
     blueprint: Blueprint | None = None
 
     @abstractmethod

@@ -49,7 +49,7 @@ def issue_certificate(cn):
 def issue_server_certificate():
     ca = CertificateAuthority(logger, app)
     if ca.check_if_ca_exists():
-        ca.issue_certificate("raven", True)
+        ca.issue_certificate("opentakserver", True)
 
 
 @raven_cli.command()

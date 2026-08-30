@@ -287,7 +287,7 @@ def certificate():
         try:
             username = bleach.clean(request.json.get("username"))
             truststore_filename = os.path.join(
-                app.config.get("RAVEN_CA_FOLDER"), "certs", "raven", "truststore-root.p12"
+                app.config.get("RAVEN_CA_FOLDER"), "certs", "opentakserver", "truststore-root.p12"
             )
             user_filename = os.path.join(
                 app.config.get("RAVEN_CA_FOLDER"), "certs", username, "{}.p12".format(username)

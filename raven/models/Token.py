@@ -87,8 +87,8 @@ class Token(db.Model):
             os.path.join(
                 app.config.get("RAVEN_CA_FOLDER"),
                 "certs",
-                "raven",
-                "raven.nopass.key",
+                "opentakserver",
+                "opentakserver.nopass.key",
             ),
             "rb",
         ) as key:
@@ -99,7 +99,7 @@ class Token(db.Model):
     def verify_token(token: str) -> bool:
         with open(
             os.path.join(
-                app.config.get("RAVEN_CA_FOLDER"), "certs", "raven", "raven.pub"
+                app.config.get("RAVEN_CA_FOLDER"), "certs", "opentakserver", "opentakserver.pub"
             ),
             "r",
         ) as key:

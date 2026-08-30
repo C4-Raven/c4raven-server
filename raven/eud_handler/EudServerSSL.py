@@ -22,14 +22,14 @@ class EudServerSSL(EudServer):
             os.path.join(
                 self.app_context.config.get("RAVEN_CA_FOLDER"),
                 "certs",
-                "raven",
-                "raven.pem",
+                "opentakserver",
+                "opentakserver.pem",
             ),
             os.path.join(
                 self.app_context.config.get("RAVEN_CA_FOLDER"),
                 "certs",
-                "raven",
-                "raven.nopass.key",
+                "opentakserver",
+                "opentakserver.nopass.key",
             ),
         )
         ssl_context.load_verify_locations(

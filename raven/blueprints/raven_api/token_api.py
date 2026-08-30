@@ -58,7 +58,7 @@ def cloudtak_oauth_token():
 
     with open(
         os.path.join(
-            app.config.get("RAVEN_CA_FOLDER"), "certs", "raven", "raven.nopass.key"
+            app.config.get("RAVEN_CA_FOLDER"), "certs", "opentakserver", "opentakserver.nopass.key"
         ),
         "rb",
     ) as key:

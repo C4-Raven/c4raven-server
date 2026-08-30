@@ -111,7 +111,7 @@ class CertificateAuthority:
                 raise Exception("Failed to create crl. Exit code {}".format(exit_code))
 
             self.logger.debug("Creating server cert...")
-            self.issue_certificate("raven", True)
+            self.issue_certificate("opentakserver", True)
             self.logger.info(
                 "Certificate authority created successfully. You may need to restart nginx if it's proxying SSL requests."
             )

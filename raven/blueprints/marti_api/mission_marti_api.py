@@ -63,7 +63,7 @@ def verify_token() -> dict | bool:
 
     with open(
         os.path.join(
-            app.config.get("RAVEN_CA_FOLDER"), "certs", "raven", "raven.pub"
+            app.config.get("RAVEN_CA_FOLDER"), "certs", "opentakserver", "opentakserver.pub"
         ),
         "r",
     ) as key:
@@ -162,7 +162,7 @@ def generate_token(mission: Mission, eud_uid: str):
 
     server_key = open(
         os.path.join(
-            app.config.get("RAVEN_CA_FOLDER"), "certs", "raven", "raven.nopass.key"
+            app.config.get("RAVEN_CA_FOLDER"), "certs", "opentakserver", "opentakserver.nopass.key"
         ),
         "r",
     )
