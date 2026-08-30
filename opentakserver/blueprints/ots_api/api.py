@@ -236,6 +236,14 @@ def status():
         "percent": disk_usage.percent,
     }
 
+    net_io = psutil.net_io_counters()
+    network_dict = {
+        "bytes_sent": net_io.bytes_sent,
+        "bytes_recv": net_io.bytes_recv,
+        "packets_sent": net_io.packets_sent,
+        "packets_recv": net_io.packets_recv,
+    }
+
     try:
         os_release = platform.freedesktop_os_release()
     except:
@@ -262,6 +270,7 @@ def status():
         "load_avg": psutil.getloadavg(),
         "memory": vmem_dict,
         "disk_usage": disk_usage_dict,
+        "network": network_dict,
         "ots_version": version,
         "uname": uname,
         "os_release": os_release,
