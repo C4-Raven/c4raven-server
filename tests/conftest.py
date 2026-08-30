@@ -2,8 +2,8 @@ import pytest
 import sqlalchemy
 from flask_security import hash_password
 
-from opentakserver.app import create_app
-from opentakserver.extensions import db, logger
+from raven.app import create_app
+from raven.extensions import db, logger
 
 
 class AuthActions:

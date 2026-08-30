@@ -1,0 +1,400 @@
+import datetime
+import json
+import traceback
+from xml.etree.ElementTree import tostring
+
+import adsbxcot
+import aiscot
+import pika
+import requests
+from bs4 import BeautifulSoup
+from flask import Blueprint
+from flask import current_app as app
+from sqlalchemy import delete
+
+from raven.extensions import apscheduler, db, logger
+from raven.functions import (
+    datetime_from_iso8601_string,
+    generate_delete_cot,
+    iso8601_string_from_datetime,
+)
+from raven.models.Alert import Alert
+from raven.models.CasEvac import CasEvac
+from raven.models.Certificate import Certificate
+from raven.models.Chatrooms import Chatroom
+from raven.models.ChatroomsUids import ChatroomsUids
+from raven.models.CoT import CoT
+from raven.models.DataPackage import DataPackage
+from raven.models.EUD import EUD
+from raven.models.GeoChat import GeoChat
+from raven.models.Group import Group
+from raven.models.Marker import Marker
+from raven.models.Mission import Mission
+from raven.models.MissionChange import MissionChange
+from raven.models.MissionContentMission import MissionContentMission
+from raven.models.MissionInvitation import MissionInvitation
+from raven.models.MissionRole import MissionRole
+from raven.models.MissionUID import MissionUID
+from raven.models.Point import Point
+from raven.models.RBLine import RBLine
+from raven.models.Team import Team
+from raven.models.VideoRecording import VideoRecording
+from raven.models.VideoStream import VideoStream
+from raven.models.ZMIST import ZMIST
+
+scheduler_blueprint = Blueprint("scheduler_blueprint", __name__)
+
+
+def get_adsb_data():
+    with apscheduler.app.app_context():
+        try:
+            headers = {}
+            if app.config.get("RAVEN_ADSB_API_KEY"):
+                headers["api-auth"] = app.config["RAVEN_ADSB_API_KEY"]
+
+            adsb_api_url = app.config.get("RAVEN_ADSB_API_URL")
+            adsb_lat = app.config.get("RAVEN_ADSB_LAT")
+            adsb_lon = app.config.get("RAVEN_ADSB_LON")
+            adsb_radius = app.config.get("RAVEN_ADSB_RADIUS")
+
+            r = requests.get(f"{adsb_api_url}/{adsb_lat}/{adsb_lon}/{adsb_radius}", headers=headers)
+
+            logger.debug(r.text)
+            logger.debug(r.status_code)
+            logger.debug(r.request.headers)
+            logger.debug(r.request.url)
+
+            if r.status_code == 200:
+                rabbit_credentials = pika.PlainCredentials(
+                    app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
+                )
+                rabbit_host = app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS")
+                rabbit_connection = pika.BlockingConnection(
+                    pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
+                )
+                channel = rabbit_connection.channel()
+                channel.exchange_declare(
+                    exchange=app.config.get("RAVEN_ADSB_GROUP"), exchange_type="fanout"
+                )
+
+                for craft in r.json()["ac"]:
+                    try:
+                        event = adsbxcot.adsbx_to_cot(craft, known_craft=None)
+
+                    except ValueError as e:
+                        logger.error(f"Failed to parse adsb data: {e}")
+                        continue
+
+                    # noinspection PyTypeChecker
+                    channel.basic_publish(
+                        exchange="cot_parser",
+                        routing_key="cot_parser",
+                        body=json.dumps(
+                            {
+                                "cot": str(BeautifulSoup(event, "xml")),
+                                "uid": app.config["RAVEN_NODE_ID"],
+                            }
+                        ),
+                        properties=pika.BasicProperties(
+                            expiration=app.config.get("RAVEN_RABBITMQ_TTL")
+                        ),
+                    )
+                    # noinspection PyTypeChecker
+                    channel.basic_publish(
+                        exchange="groups",
+                        routing_key=f"{app.config.get('RAVEN_ADSB_GROUP')}.OUT",
+                        body=json.dumps(
+                            {
+                                "cot": str(BeautifulSoup(event, "xml")),
+                                "uid": app.config["RAVEN_NODE_ID"],
+                            }
+                        ),
+                        properties=pika.BasicProperties(
+                            expiration=app.config.get("RAVEN_RABBITMQ_TTL")
+                        ),
+                    )
+                    # noinspection PyTypeChecker
+                    channel.basic_publish(
+                        exchange="firehose",
+                        routing_key="",
+                        body=json.dumps(
+                            {
+                                "cot": str(BeautifulSoup(event, "xml")),
+                                "uid": app.config["RAVEN_NODE_ID"],
+                            }
+                        ),
+                        properties=pika.BasicProperties(
+                            expiration=app.config.get("RAVEN_RABBITMQ_TTL")
+                        ),
+                    )
+
+                channel.close()
+                rabbit_connection.close()
+            else:
+                logger.error("Failed to get airplanes.live: {}".format(r.text))
+        except BaseException as e:
+            logger.error("Failed to get airplanes.live: {}".format(e))
+            logger.error(traceback.format_exc())
+
+
+def delete_video_recordings():
+    with apscheduler.app.app_context():
+        VideoRecording.query.delete()
+        db.session.commit()
+
+        try:
+            r = requests.get(
+                "{}/v3/recordings/list".format(app.config.get("RAVEN_MEDIAMTX_API_ADDRESS"))
+            )
+            if r.status_code == 200:
+                recordings = r.json()
+                for path in recordings["items"]:
+                    for recording in path["segments"]:
+                        r = requests.delete(
+                            "{}/v3/recordings/deletesegment".format(
+                                app.config.get("RAVEN_MEDIAMTX_API_ADDRESS"),
+                            ),
+                            params={"start": recording["start"], "path": path["name"]},
+                        )
+                        if r.status_code != 200:
+                            logger.error(
+                                "Failed to delete {} from {}: {}".format(
+                                    recording["start"], path["name"], r.text
+                                )
+                            )
+        except BaseException as e:
+            logger.error("Failed to delete recordings: {}".format(e))
+
+
+def purge_data():
+    # These are in a specific order to properly handle foreign key relationships
+    delete_video_recordings()
+    ZMIST.query.delete()
+    VideoStream.query.delete()
+    Alert.query.delete()
+    CasEvac.query.delete()
+    Certificate.query.delete()
+    ChatroomsUids.query.delete()
+    DataPackage.query.delete()
+    Marker.query.delete()
+    GeoChat.query.delete()
+    Point.query.delete()
+    RBLine.query.delete()
+    Chatroom.query.delete()
+    CoT.query.delete()
+    MissionRole.query.delete()
+    MissionContentMission.query.delete()
+    MissionUID.query.delete()
+    MissionChange.query.delete()
+    Mission.query.delete()
+    EUD.query.delete()
+    Team.query.delete()
+    db.session.commit()
+    logger.info("Purged all data")
+
+
+def get_aishub_data():
+    with apscheduler.app.app_context():
+
+        if not app.config.get("RAVEN_AISHUB_USERNAME"):
+            logger.error("Please set your AISHub username")
+            return
+
+        try:
+            params = {
+                "username": app.config.get("RAVEN_AISHUB_USERNAME"),
+                "format": 1,
+                "output": "json",
+            }
+            if app.config.get("RAVEN_AISHUB_SOUTH_LAT"):
+                params["latmin"] = app.config.get("RAVEN_AISHUB_SOUTH_LAT")
+            if app.config.get("RAVEN_AISHUB_WEST_LON"):
+                params["lonmin"] = app.config.get("RAVEN_AISHUB_WEST_LON")
+            if app.config.get("RAVEN_AISHUB_NORTH_LAT"):
+                params["latmax"] = app.config.get("RAVEN_AISHUB_NORTH_LAT")
+            if app.config.get("RAVEN_AISHUB_EAST_LON"):
+                params["lonmax"] = app.config.get("RAVEN_AISHUB_EAST_LON")
+            if app.config.get("RAVEN_AISHUB_MMSI_LIST"):
+                params["mmsi"] = app.config.get("RAVEN_AISHUB_MMSI_LIST")
+            if app.config.get("RAVEN_AISHUB_IMO_LIST"):
+                params["imo"] = app.config.get("RAVEN_AISHUB_IMO_LIST")
+            r = requests.get("https://data.aishub.net/ws.php", params=params)
+
+            if r.status_code != 200:
+                logger.error(f"Failed to get AIS data: {r.text}")
+                return
+
+            rabbit_credentials = pika.PlainCredentials(
+                app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
+            )
+            rabbit_host = app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS")
+            rabbit_connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
+            )
+            channel = rabbit_connection.channel()
+            channel.exchange_declare(
+                exchange=app.config.get("RAVEN_AIS_GROUP"), exchange_type="fanout"
+            )
+
+            for vessel in r.json()[1]:
+                event = aiscot.ais_to_cot(vessel, None, None)
+                # noinspection PyTypeChecker
+                channel.basic_publish(
+                    exchange="cot_parser",
+                    routing_key="cot_parser",
+                    body=json.dumps(
+                        {"cot": str(BeautifulSoup(event, "xml")), "uid": app.config["RAVEN_NODE_ID"]}
+                    ),
+                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
+                )
+                # noinspection PyTypeChecker
+                channel.basic_publish(
+                    exchange="groups",
+                    routing_key=f"{app.config.get('RAVEN_ADSB_GROUP')}.OUT",
+                    body=json.dumps(
+                        {"cot": str(BeautifulSoup(event, "xml")), "uid": app.config["RAVEN_NODE_ID"]}
+                    ),
+                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
+                )
+                channel.basic_publish(
+                    exchange="firehose",
+                    routing_key="",
+                    body=json.dumps(
+                        {"cot": str(BeautifulSoup(event, "xml")), "uid": app.config["RAVEN_NODE_ID"]}
+                    ),
+                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
+                )
+
+            channel.close()
+            rabbit_connection.close()
+        except BaseException as e:
+            logger.error(f"Failed to get AIS data: {e}")
+            logger.debug(traceback.format_exc())
+
+
+def delete_old_data():
+    with apscheduler.app.app_context():
+        timestamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            seconds=app.config.get("RAVEN_DELETE_OLD_DATA_SECONDS"),
+            minutes=app.config.get("RAVEN_DELETE_OLD_DATA_MINUTES"),
+            hours=app.config.get("RAVEN_DELETE_OLD_DATA_HOURS"),
+            days=app.config.get("RAVEN_DELETE_OLD_DATA_DAYS"),
+            weeks=app.config.get("RAVEN_DELETE_OLD_DATA_WEEKS"),
+        )
+
+        rabbit_credentials = pika.PlainCredentials(
+            app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
+        )
+        rabbit_host = app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS")
+        rabbit_connection = pika.BlockingConnection(
+            pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
+        )
+        channel = rabbit_connection.channel()
+
+        # I wish I hadn't made the marker's timestamp field a string...
+        markers = db.session.execute(db.session.query(Marker)).all()
+        groups = db.session.execute(db.session.query(Group)).scalars()
+        for marker in markers:
+            marker = marker[0]
+            if datetime_from_iso8601_string(marker.production_time) <= timestamp:
+                cot = generate_delete_cot(marker.uid, marker.cot.type)
+                for group in groups:
+                    channel.basic_publish(
+                        exchange="groups",
+                        routing_key=f"{group.name}.{Group.OUT}",
+                        body=json.dumps(
+                            {"cot": tostring(cot).decode("utf-8"), "uid": app.config["RAVEN_NODE_ID"]}
+                        ),
+                        properties=pika.BasicProperties(
+                            expiration=app.config.get("RAVEN_RABBITMQ_TTL")
+                        ),
+                    )
+                    channel.basic_publish(
+                        exchange="firehose",
+                        routing_key="",
+                        body=json.dumps(
+                            {"cot": tostring(cot).decode("utf-8"), "uid": app.config["RAVEN_NODE_ID"]}
+                        ),
+                        properties=pika.BasicProperties(
+                            expiration=app.config.get("RAVEN_RABBITMQ_TTL")
+                        ),
+                    )
+                db.session.delete(marker)
+
+        alerts = db.session.execute(
+            db.session.query(Alert).where(Alert.start_time <= timestamp)
+        ).all()
+        for alert in alerts:
+            alert = alert[0]
+            cot = generate_delete_cot(alert.uid, alert.cot.type)
+            for group in groups:
+                channel.basic_publish(
+                    exchange="groups",
+                    routing_key=f"{group.name}.{Group.OUT}",
+                    body=json.dumps(
+                        {"cot": tostring(cot).decode("utf-8"), "uid": app.config["RAVEN_NODE_ID"]}
+                    ),
+                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
+                )
+                channel.basic_publish(
+                    exchange="firehose",
+                    routing_key="",
+                    body=json.dumps(
+                        {"cot": tostring(cot).decode("utf-8"), "uid": app.config["RAVEN_NODE_ID"]}
+                    ),
+                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
+                )
+            db.session.delete(alert)
+
+        rb_lines = db.session.execute(
+            db.session.query(RBLine).where(RBLine.timestamp <= timestamp)
+        ).all()
+        for rb_line in rb_lines:
+            rb_line = rb_line[0]
+            cot = generate_delete_cot(rb_line.uid, rb_line.cot.type)
+            for group in groups:
+                channel.basic_publish(
+                    exchange="groups",
+                    routing_key=f"{group.name}.{Group.OUT}",
+                    body=json.dumps(
+                        {"cot": tostring(cot).decode("utf-8"), "uid": app.config["RAVEN_NODE_ID"]}
+                    ),
+                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
+                )
+                channel.basic_publish(
+                    exchange="firehose",
+                    routing_key="",
+                    body=json.dumps(
+                        {"cot": tostring(cot).decode("utf-8"), "uid": app.config["RAVEN_NODE_ID"]}
+                    ),
+                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
+                )
+            db.session.delete(rb_line)
+
+        db.session.execute(delete(GeoChat).where(GeoChat.timestamp <= timestamp))
+
+        timestamp = datetime.datetime.now() - datetime.timedelta(
+            seconds=app.config.get("RAVEN_DELETE_OLD_DATA_SECONDS"),
+            minutes=app.config.get("RAVEN_DELETE_OLD_DATA_MINUTES"),
+            hours=app.config.get("RAVEN_DELETE_OLD_DATA_HOURS"),
+            days=app.config.get("RAVEN_DELETE_OLD_DATA_DAYS"),
+            weeks=app.config.get("RAVEN_DELETE_OLD_DATA_WEEKS"),
+        )
+
+        db.session.execute(delete(MissionRole).where(MissionRole.createTime <= timestamp))
+        db.session.execute(delete(MissionUID).where(MissionUID.timestamp <= timestamp))
+        db.session.execute(delete(MissionChange).where(MissionChange.timestamp <= timestamp))
+        db.session.execute(delete(EUD).where(EUD.last_event_time <= timestamp))
+        db.session.execute(delete(Point).where(Point.timestamp <= timestamp))
+        db.session.execute(delete(CoT).where(CoT.timestamp <= timestamp))
+        db.session.commit()
+
+        channel.close()
+        rabbit_connection.close()
+
+        logger.info(f"Deleted data older than {iso8601_string_from_datetime(timestamp)}")
+
+
+# This function is to prevent errors caused by changing get_airplanes_live_data() to get_adsb_data
+def get_airplanes_live_data():
+    return

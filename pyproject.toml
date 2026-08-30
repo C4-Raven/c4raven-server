@@ -1,13 +1,13 @@
 [tool.poetry]
-name = "OpenTAKServer"
+name = "Raven"
 version = "0.0.0"
 description = "A server for ATAK, WinTAK, and iTAK"
-authors = ["OpenTAKServer <opentakserver@gmail.com>"]
+authors = ["C4 Raven <support@c4raven.net>"]
 readme = "README.md"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/brian7704/OpenTAKServer"
-documentation = "https://docs.opentakserver.io"
-include = [{path = "opentakserver/translations/**/*", format = ["sdist", "wheel"]}]
+repository = "https://github.com/C4Raven/c4raven-server"
+documentation = "https://github.com/C4Raven/c4raven-server"
+include = [{path = "raven/translations/**/*", format = ["sdist", "wheel"]}]
 
 [tool.poetry.dependencies]
 adsbxcot = "6.0.4"
@@ -77,7 +77,7 @@ style = "semver"
 dirty = false
 pattern = "((?P<epoch>\\d+)!)?(?P<base>\\d+(\\.\\d+)*)"
 
-[tool.poetry-dynamic-versioning.files."opentakserver/__init__.py"]
+[tool.poetry-dynamic-versioning.files."raven/__init__.py"]
 persistent-substitution = true
 initial-content = """
   # These version placeholders will be replaced later during substitution.
@@ -90,17 +90,17 @@ requires = ["poetry-core>=1.0.0", "poetry-dynamic-versioning>=1.0.0,<2.0.0"]
 build-backend = "poetry_dynamic_versioning.backend"
 
 [tool.poetry.scripts]
-opentakserver = "opentakserver.app:start"
-eud_handler = "opentakserver.eud_handler.eud_handler:main"
-cot_parser = "opentakserver.cot_parser.cot_parser:main"
+raven = "raven.app:start"
+eud_handler = "raven.eud_handler.eud_handler:main"
+cot_parser = "raven.cot_parser.cot_parser:main"
 
 [tool.black]
 line_length = 100
 target-version = ["py311"]
-src = ["opentakserver/", "tests/"]
+src = ["raven/", "tests/"]
 
 [tool.isort]
-known_first_party = "opentakserver"
+known_first_party = "raven"
 profile = "black"
 line_length = 100
 multi_line_output = 3
@@ -125,7 +125,7 @@ extend-ignore = [
 testpaths = ["tests"]
 addopts = [
     "--verbose",
-    "--cov=opentakserver",
+    "--cov=raven",
     "--cov-report=term-missing",
     "--cov-report=term",
     "--cov-report=html",
@@ -133,7 +133,7 @@ addopts = [
 ]
 
 [tool.coverage.run]
-source = ["opentakserver"]
+source = ["raven"]
 omit = [
     "*/tests/*",
     "*/test_*",
@@ -159,7 +159,7 @@ check_untyped_defs = true
 show_error_codes = true
 pretty = true
 ignore_missing_imports = true
-files = ["opentakserver/", "tests/"]
+files = ["raven/", "tests/"]
 exclude = [
     "__pycache__",
     ".pytest_cache",

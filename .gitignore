@@ -1,4 +1,4 @@
-opentakserver/secret_key.py
+raven/secret_key.py
 scripts/
 ### Python template
 # Byte-compiled / optimized / DLL files

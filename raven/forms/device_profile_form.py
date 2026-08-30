@@ -1,0 +1,16 @@
+from flask_wtf import FlaskForm
+from wtforms import BooleanField, StringField
+from wtforms.validators import Optional
+
+from raven.functions import false_values
+
+
+class DeviceProfileForm(FlaskForm):
+    preference_key = StringField(validators=[Optional()])
+    preference_value = StringField(validators=[Optional()])
+    value_class = StringField(validators=[Optional()])
+    enrollment = BooleanField(false_values=false_values)
+    connection = BooleanField(false_values=false_values)
+    tool = StringField(validators=[Optional()])
+    active = BooleanField(false_values=false_values)
+    eud_uid = StringField(validators=[Optional()])

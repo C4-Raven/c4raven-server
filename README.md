@@ -1,20 +1,16 @@
-# OpenTAKServer
+# Raven
 
-![PyPI - Downloads](https://img.shields.io/pypi/dm/opentakserver)
-![PyPI - Version](https://img.shields.io/pypi/v/opentakserver)
-![Discord](https://img.shields.io/discord/1183578214459777164?logo=discord&label=Discord&link=https%3A%2F%2Fdiscord.gg%2F6uaVHjtfXN)
-![GitHub Release Date](https://img.shields.io/github/release-date/brian7704/OpenTAKServer)
-
-
-OpenTAKServer (OTS) is yet another open source TAK Server for ATAK, iTAK, and WinTAK. OTS's goal is to be easy to install and use, and to run on both servers and SBCs (ie Raspberry Pi).
-
-Join us on our [Discord server](https://discord.gg/6uaVHjtfXN)
+Raven is the TAK (Team Awareness Kit) server behind [C4 Raven](https://tak.c4raven.net) —
+a security-hardened fork of [OpenTAKServer](https://github.com/brian7704/OpenTAKServer),
+paired with the [Raven UI](https://github.com/C4Raven/c4raven-ui) frontend.
 
 ## Current Features
+
 - Connect via TCP from ATAK, WinTAK, iTAK, TAKAware, TAKX, CloudTAK, and PyTAK
 - SSL
-- Authentication
-- [WebUI with a live map](https://github.com/brian7704/OpenTAKServer-UI)
+- Authentication, including mandatory 2FA, forced password resets, and
+  per-account web UI access revocation
+- [WebUI with a live map](https://github.com/C4Raven/c4raven-ui)
 - Client certificate enrollment
 - Groups/Channels
 - LDAP/Active Directory
@@ -29,43 +25,28 @@ Join us on our [Discord server](https://discord.gg/6uaVHjtfXN)
 - Alerts
 - CasEvac
 - Optional Mumble server authentication
-  - Use your OpenTAKServer username and password to log into your Mumble server
+  - Use your Raven username and password to log into your Mumble server
 - Video Streaming
 - Mission API
   - Data Sync plugin
   - Fire Area Survey plugin
 
-## Planned Features
-- Federation
-
 ## Requirements
+
 - RabbitMQ
-- MediaMTX (Only required for video streaming)
+- MediaMTX (only required for video streaming)
 - openssl
 - nginx
 
 ## Installation
 
-### Ubuntu
+See [c4raven-server-setup](https://github.com/C4Raven/c4raven-server-setup)
+for a fresh install, or [c4raven-updater](https://github.com/C4Raven/c4raven-updater)
+to update an existing one in place.
 
-`curl https://i.opentakserver.io/ubuntu_installer -Ls | bash -`
+## Credits
 
-### Raspberry Pi
-
-`curl https://i.opentakserver.io/raspberry_pi_installer -Ls | bash -`
-
-### Windows
-
-OTS can be installed on Windows using WSL and the Ubuntu installer script
-
-## Documentation
-
-https://docs.opentakserver.io
-
-## Supported Languages
-
-![Supported Languages](https://weblate.opentakserver.io/widget/opentakserver/multi-auto.svg)
-
-## Supporting the project
-
-If you would like to support the project you can do so [here](https://buymeacoffee.com/opentakserver)
+Raven is a fork of [OpenTAKServer](https://github.com/brian7704/OpenTAKServer)
+by Brian (brian7704) and contributors, licensed GPL-3.0-or-later. The upstream
+project's [Discord server](https://discord.gg/6uaVHjtfXN) is a good place for
+general OpenTAKServer/TAK questions not specific to this fork.
