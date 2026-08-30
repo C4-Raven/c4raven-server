@@ -1,5 +1,7 @@
 import os
 import re
+import threading
+import time
 import traceback
 from datetime import datetime, timezone
 
@@ -19,39 +21,66 @@ tak_gov_link_blueprint = Blueprint("tak_gov_link_blueprint", __name__)
 
 HEADERS = {"User-Agent": f"Raven {version}"}
 
+# tak.gov's refresh tokens are single-use/rotating: exchanging one for a new
+# access token invalidates it and issues a new refresh token in its place.
+# Any two concurrent callers both refreshing (e.g. one page load kicking off
+# several plugin-list requests at once) race each other for the single valid
+# refresh token -- the loser's attempt fails, and has been observed to
+# invalidate the whole tak.gov session, not just that one request. Cache the
+# access token and serialize refreshes through a lock so concurrent callers
+# share one token instead of each rotating it themselves.
+_token_lock = threading.Lock()
+_token_cache = {"access_token": None, "expires_at": 0.0}
+
 
 def get_new_access_token():
-    try:
-        client = httpx.Client(http2=True)
-        refresh_payload = {
-            "client_id": "tak-gov-eud",
-            "grant_type": "refresh_token",
-            "refresh_token": app.config.get("RAVEN_TAK_GOV_REFRESH_TOKEN"),
-        }
-        response = client.post(
-            "https://auth.tak.gov/auth/realms/TPC/protocol/openid-connect/token",
-            data=refresh_payload,
-            headers=HEADERS,
-        )
+    with _token_lock:
+        now = time.monotonic()
+        if _token_cache["access_token"] and now < _token_cache["expires_at"]:
+            return {
+                "success": True,
+                "access_token": _token_cache["access_token"],
+                "expires_in": _token_cache["expires_at"] - now,
+            }
 
-        if response.status_code != 200:
-            logger.error(
-                {"success": False, "error": f"Failed to get new access token: {response.text}"}
+        try:
+            client = httpx.Client(http2=True)
+            refresh_payload = {
+                "client_id": "tak-gov-eud",
+                "grant_type": "refresh_token",
+                "refresh_token": app.config.get("RAVEN_TAK_GOV_REFRESH_TOKEN"),
+            }
+            response = client.post(
+                "https://auth.tak.gov/auth/realms/TPC/protocol/openid-connect/token",
+                data=refresh_payload,
+                headers=HEADERS,
             )
-            return {"success": False, "error": f"Failed to get new access token: {response.text}"}
 
-        response_data = response.json()
-        access_token = response_data["access_token"]
-        refresh_token = response_data["refresh_token"]
-        expires_in = response_data["expires_in"]
-        change_config_setting("RAVEN_TAK_GOV_REFRESH_TOKEN", refresh_token)
-        app.config["RAVEN_TAK_GOV_REFRESH_TOKEN"] = refresh_token
+            if response.status_code != 200:
+                logger.error(
+                    {"success": False, "error": f"Failed to get new access token: {response.text}"}
+                )
+                return {
+                    "success": False,
+                    "error": f"Failed to get new access token: {response.text}",
+                }
 
-        return {"success": True, "access_token": access_token, "expires_in": expires_in}
-    except BaseException as e:
-        logger.error(f"Failed to get new access token: {e}")
-        logger.debug(traceback.format_exc())
-        return {"success": False, "error": f"Failed to get new access token: {e}"}
+            response_data = response.json()
+            access_token = response_data["access_token"]
+            refresh_token = response_data["refresh_token"]
+            expires_in = response_data["expires_in"]
+            change_config_setting("RAVEN_TAK_GOV_REFRESH_TOKEN", refresh_token)
+            app.config["RAVEN_TAK_GOV_REFRESH_TOKEN"] = refresh_token
+
+            # Refresh a bit early (10s margin) rather than exactly at expiry.
+            _token_cache["access_token"] = access_token
+            _token_cache["expires_at"] = now + max(expires_in - 10, 0)
+
+            return {"success": True, "access_token": access_token, "expires_in": expires_in}
+        except BaseException as e:
+            logger.error(f"Failed to get new access token: {e}")
+            logger.debug(traceback.format_exc())
+            return {"success": False, "error": f"Failed to get new access token: {e}"}
 
 
 @tak_gov_link_blueprint.route("/api/takgov/link")
@@ -193,12 +222,12 @@ def get_plugins_list():
         return jsonify(token), 500
 
     client = httpx.Client(http2=True)
-    HEADERS["Authorization"] = f"Bearer {token['access_token']}"
+    headers = {**HEADERS, "Authorization": f"Bearer {token['access_token']}"}
     params = {"product": product, "product_version": product_version}
 
     try:
         response = client.get(
-            "https://tak.gov/eud_api/software/v1/plugins", params=params, headers=HEADERS
+            "https://tak.gov/eud_api/software/v1/plugins", params=params, headers=headers
         )
         return jsonify(response.json())
     except BaseException as e:
@@ -248,8 +277,8 @@ def get_plugin_icon():
         return jsonify(token), 500
 
     client = httpx.Client(http2=True)
-    HEADERS["Authorization"] = f"Bearer {token['access_token']}"
-    response = client.get(icon_url, headers=HEADERS)
+    headers = {**HEADERS, "Authorization": f"Bearer {token['access_token']}"}
+    response = client.get(icon_url, headers=headers)
     logger.warning(response.content)
     logger.warning(response.text)
     logger.warning(response.headers)
@@ -294,8 +323,8 @@ def download_plugin():
     if not token["success"]:
         return jsonify(token), 500
 
-    HEADERS["Authorization"] = f"Bearer {token['access_token']}"
-    response = client.get(apk_url, headers=HEADERS, follow_redirects=True)
+    headers = {**HEADERS, "Authorization": f"Bearer {token['access_token']}"}
+    response = client.get(apk_url, headers=headers, follow_redirects=True)
     if response.status_code != 200:
         return jsonify(response.content), response.status_code
 
@@ -307,7 +336,7 @@ def download_plugin():
 
     icon = None
     icon_filename = None
-    icon_response = client.get(request.json.get("icon_url"), headers=HEADERS, follow_redirects=True)
+    icon_response = client.get(request.json.get("icon_url"), headers=headers, follow_redirects=True)
     # Some plugins don't have icons and will return a 404
     if icon_response.status_code == 200:
         icon = icon_response.content
