@@ -350,6 +350,9 @@ def get_missions():
 
     username = cert.get_subject().commonName
     user = app.security.datastore.find_user(username=username)
+    if not user:
+        logger.warning(f"/Marti/api/missions: no account matches certificate CN {username!r}")
+        return jsonify({"success": False, "error": gettext("Unknown user certificate")}), 403
 
     password_protected = request.args.get("passwordProtected", False)
 
@@ -455,6 +458,9 @@ def put_mission(mission_name: str):
 
     username = cert.get_subject().commonName
     user = app.security.datastore.find_user(username=username)
+    if not user:
+        logger.warning(f"/Marti/api/missions/{mission_name}: no account matches certificate CN {username!r}")
+        return jsonify({"success": False, "error": gettext("Unknown user certificate")}), 403
 
     new_mission = True
 
@@ -1347,6 +1353,9 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
     cert = verify_client_cert()
     username = cert.get_subject().commonName
     user = app.security.datastore.find_user(username=username)
+    if not user:
+        logger.warning(f"/Marti/api/missions/.../subscription: no account matches certificate CN {username!r}")
+        return jsonify({"success": False, "error": gettext("Unknown user certificate")}), 403
 
     if mission_name:
         mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()

@@ -62,6 +62,7 @@ from raven.models.Team import Team
 from raven.models.VideoRecording import VideoRecording
 from raven.models.VideoStream import VideoStream
 from raven.models.WebAuthn import WebAuthn
+from raven.models.CITrap import CITrap
 from raven.models.ZMIST import ZMIST
 
 

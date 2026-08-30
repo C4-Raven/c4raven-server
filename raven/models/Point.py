@@ -42,6 +42,7 @@ class Point(db.Model):
     alert = relationship("Alert", cascade="all", back_populates="point")
     marker: Mapped["Marker"] = relationship(cascade="all, delete", back_populates="point")
     rb_line = relationship("RBLine", cascade="all", back_populates="point")
+    citrap = relationship("CITrap", cascade="all", back_populates="point")
 
     def from_wtform(self, form: PointForm):
         self.uid = str(uuid.uuid4())

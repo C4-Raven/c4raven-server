@@ -53,9 +53,13 @@ def get_all_groups():
 
     if not app.config.get("RAVEN_ENABLE_LDAP"):
         user = app.security.datastore.find_user(username=username)
-        groups = db.session.execute(
-            db.session.query(GroupUser).filter_by(user_id=user.id)
-        ).scalars()
+        if not user:
+            logger.warning(f"/Marti/api/groups/all: no account matches certificate CN {username!r}")
+        groups = (
+            db.session.execute(db.session.query(GroupUser).filter_by(user_id=user.id)).scalars()
+            if user
+            else []
+        )
 
         number_of_groups = 0
 
@@ -241,6 +245,9 @@ def put_active_groups():
     cert = verify_client_cert()
     username = cert.get_subject().commonName
     user = app.security.datastore.find_user(username=username)
+    if not user:
+        logger.warning(f"/Marti/api/groups/active: no account matches certificate CN {username!r}")
+        return jsonify({"success": False, "error": gettext("Unknown user certificate")}), 403
 
     uids = []
 

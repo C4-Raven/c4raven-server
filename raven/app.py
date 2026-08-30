@@ -45,6 +45,7 @@ from raven.models.Group import Group, GroupTypeEnum
 from raven.models.Icon import Icon
 from raven.models.role import Role
 from raven.models.WebAuthn import WebAuthn
+from raven.models.CITrap import CITrap
 from raven.PasswordValidator import PasswordValidator
 from raven.plugins.Plugin import Plugin
 from raven.plugins.PluginManager import PluginManager

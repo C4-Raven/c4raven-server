@@ -61,6 +61,7 @@ from raven.models.VideoRecording import VideoRecording
 from raven.models.VideoStream import VideoStream
 from raven.models.WebAuthn import WebAuthn
 from raven.models.ZMIST import ZMIST
+from raven.models.CITrap import CITrap
 from raven.proto import atak_pb2
 
 
