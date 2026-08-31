@@ -65,6 +65,25 @@ class DefaultConfig:
     RAVEN_MEDIAMTX_ENABLE = os.getenv("RAVEN_MEDIAMTX_ENABLE", "True").lower() in ["true", "1", "yes"]
     RAVEN_MEDIAMTX_API_ADDRESS = os.getenv("RAVEN_MEDIAMTX_API_ADDRESS", "http://localhost:9997")
     RAVEN_MEDIAMTX_TOKEN = os.getenv("RAVEN_MEDIAMTX_TOKEN", secrets.token_urlsafe(30 * 3 // 4))
+
+    # Federation Hub admin API. Raven authenticates to it with a dedicated mTLS
+    # client cert (fedhub-admin) rather than a user-facing login, so browsers
+    # never need that cert installed -- Raven proxies the calls.
+    RAVEN_FEDHUB_ENABLE = os.getenv("RAVEN_FEDHUB_ENABLE", "True").lower() in ["true", "1", "yes"]
+    # Must be the hostname the Federation Hub server cert was issued for
+    # (tak.c4raven.net) -- 127.0.0.1 fails TLS hostname verification.
+    RAVEN_FEDHUB_API_ADDRESS = os.getenv("RAVEN_FEDHUB_API_ADDRESS", "https://tak.c4raven.net:9100/api")
+    RAVEN_FEDHUB_CLIENT_CERT = os.getenv(
+        "RAVEN_FEDHUB_CLIENT_CERT", "/opt/tak/federation-hub/certs/files/fedhub-admin.pem"
+    )
+    RAVEN_FEDHUB_CLIENT_KEY = os.getenv(
+        "RAVEN_FEDHUB_CLIENT_KEY", "/opt/tak/federation-hub/certs/files/fedhub-admin-unencrypted.key"
+    )
+    # Federation Hub's UI (port 9100) now presents a public Let's Encrypt cert
+    # rather than the private C4Raven-FedHub-CA (the broker on 9101/9102 still
+    # uses the private CA -- unaffected), so trust the system's default CA
+    # bundle here instead of pinning to that private CA's file.
+    RAVEN_FEDHUB_CA_BUNDLE = os.getenv("RAVEN_FEDHUB_CA_BUNDLE") or True
     RAVEN_SSL_VERIFICATION_MODE = int(os.getenv("RAVEN_SSL_VERIFICATION_MODE", 2))
     RAVEN_SSL_CERT_HEADER = os.getenv("RAVEN_SSL_CERT_HEADER", "X-Ssl-Cert")
     RAVEN_NODE_ID = os.getenv(
