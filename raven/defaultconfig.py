@@ -90,6 +90,11 @@ class DefaultConfig:
         "RAVEN_NODE_ID", "".join(random.choices(string.ascii_lowercase + string.digits, k=32))
     )
 
+    # Usernames of system/service accounts (e.g. the "Server" account used to send
+    # files) that admins can't deactivate, delete, change the role/groups/password of,
+    # or revoke site access from via the API, regardless of who's logged in.
+    RAVEN_PROTECTED_USERNAMES = os.getenv("RAVEN_PROTECTED_USERNAMES", "Server").split(",")
+
     # Certificate Authority Settings
     RAVEN_CA_NAME = os.getenv("RAVEN_CA_NAME", "Raven-CA")
     RAVEN_CA_FOLDER = os.getenv("RAVEN_CA_FOLDER", os.path.join(RAVEN_DATA_FOLDER, "ca"))

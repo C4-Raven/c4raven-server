@@ -199,6 +199,20 @@ def remove_user_from_group():
     group_name = bleach.clean(group_name)
     direction = bleach.clean(direction)
 
+    if username in app.config.get("RAVEN_PROTECTED_USERNAMES", []):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "%(username)s is a protected system account and can't be modified",
+                        username=username,
+                    ),
+                }
+            ),
+            403,
+        )
+
     if direction != Group.IN and direction != Group.OUT:
         return (
             jsonify(

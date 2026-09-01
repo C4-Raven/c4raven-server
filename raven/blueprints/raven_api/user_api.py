@@ -1,8 +1,15 @@
+import datetime
+import json
+import os
 import secrets
 import string
 import traceback
+import uuid
+from urllib.parse import urlparse
+from xml.etree.ElementTree import Element, SubElement, tostring
 
 import bleach
+import pika
 import sqlalchemy
 from flask import Blueprint
 from flask import current_app as app
@@ -15,9 +22,16 @@ from flask_security import (
     hash_password,
     roles_accepted,
 )
+from werkzeug.utils import secure_filename
 
+from raven.blueprints.marti_api.data_package_marti_api import (
+    create_data_package_zip,
+    save_data_package_file,
+)
 from raven.blueprints.raven_api.api import paginate, search
 from raven.extensions import db, ldap_manager, logger
+from raven.functions import iso8601_string_from_datetime
+from raven.models.DataPackage import DataPackage
 from raven.models.EUD import EUD
 from raven.models.Group import Group
 from raven.models.GroupUser import GroupUser
@@ -25,6 +39,25 @@ from raven.models.user import User
 from raven.UsernameValidator import UsernameValidator
 
 user_api_blueprint = Blueprint("user_api_blueprint", __name__)
+
+
+def _protected_user_response(username: str):
+    """Returns a 403 response if username is a protected system/service account
+    (see RAVEN_PROTECTED_USERNAMES), otherwise None."""
+    if username in app.config.get("RAVEN_PROTECTED_USERNAMES", []):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "%(username)s is a protected system account and can't be modified",
+                        username=username,
+                    ),
+                }
+            ),
+            403,
+        )
+    return None
 
 
 @user_api_blueprint.route("/api/user/add", methods=["POST"])
@@ -136,6 +169,10 @@ def delete_user():
             400,
         )
 
+    protected_response = _protected_user_response(username)
+    if protected_response:
+        return protected_response
+
     logger.info("Deleting user {}".format(username))
 
     try:
@@ -205,6 +242,10 @@ def admin_reset_password():
             400,
         )
 
+    protected_response = _protected_user_response(username)
+    if protected_response:
+        return protected_response
+
     user = app.security.datastore.find_user(username=username)
     if user:
         admin_change_password(user, new_password, False)
@@ -238,6 +279,10 @@ def force_password_reset():
     username = bleach.clean(request.json.get("username"))
     if not username:
         return jsonify({"success": False, "error": gettext("Please specify a username")}), 400
+
+    protected_response = _protected_user_response(username)
+    if protected_response:
+        return protected_response
 
     user = app.security.datastore.find_user(username=username)
     if not user:
@@ -292,6 +337,10 @@ def issue_temp_password():
     if not username:
         return jsonify({"success": False, "error": gettext("Please specify a username")}), 400
 
+    protected_response = _protected_user_response(username)
+    if protected_response:
+        return protected_response
+
     user = app.security.datastore.find_user(username=username)
     if not user:
         return (
@@ -336,6 +385,10 @@ def deactivate_user():
             ),
             400,
         )
+
+    protected_response = _protected_user_response(username)
+    if protected_response:
+        return protected_response
 
     user = app.security.datastore.find_user(username=username)
     if not user:
@@ -462,6 +515,10 @@ def revoke_site_access():
             400,
         )
 
+    protected_response = _protected_user_response(username)
+    if protected_response:
+        return protected_response
+
     user = app.security.datastore.find_user(username=username)
     if not user:
         return (
@@ -505,6 +562,10 @@ def set_user_role():
             jsonify({"success": False, "error": gettext("Please specify a username and roles")}),
             400,
         )
+
+    protected_response = _protected_user_response(username)
+    if protected_response:
+        return protected_response
 
     for role in roles:
         role = bleach.clean(role)
@@ -602,6 +663,196 @@ def assign_eud_to_user():
         return jsonify({"success": True})
 
 
+def _generate_fileshare_cot(
+    data_package: DataPackage,
+    sender_uid: str,
+    sender_callsign: str,
+    download_url: str,
+    dest_callsign: str,
+) -> Element:
+    """Builds a Mission Package / file-share (b-f-t-r) CoT. The two earlier attempts at
+    this used the wrong sha256sum attribute name (should be sha256) and were missing the
+    <ackrequest> and <marti><dest> elements — found by checking FreeTAKServer's own
+    working implementation of the same push (FreeTAKServer/core/services/RestAPI.py),
+    since neither this server nor upstream OpenTAKServer has ever implemented this.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    event = Element(
+        "event",
+        {
+            "type": "b-f-t-r",
+            "how": "h-e",
+            "version": "2.0",
+            "uid": str(uuid.uuid4()),
+            "start": iso8601_string_from_datetime(now),
+            "time": iso8601_string_from_datetime(now),
+            "stale": iso8601_string_from_datetime(now + datetime.timedelta(hours=1)),
+        },
+    )
+    SubElement(
+        event, "point", {"ce": "9999999", "le": "9999999", "hae": "0", "lat": "0", "lon": "0"}
+    )
+    detail = SubElement(event, "detail")
+    SubElement(
+        detail,
+        "fileshare",
+        {
+            "filename": data_package.filename,
+            "senderUrl": download_url,
+            "sizeInBytes": str(data_package.size),
+            "sha256": data_package.hash,
+            "senderUid": sender_uid,
+            "senderCallsign": sender_callsign,
+            "name": data_package.filename,
+        },
+    )
+    SubElement(
+        detail,
+        "ackrequest",
+        {"uid": str(uuid.uuid4()), "ackrequested": "true", "tag": data_package.filename},
+    )
+    marti = SubElement(detail, "marti")
+    SubElement(marti, "dest", {"callsign": dest_callsign})
+
+    return event
+
+
+@user_api_blueprint.route("/api/user/send_file", methods=["POST"])
+@roles_accepted("administrator")
+def send_file_to_user():
+    """Uploads a file as a data package and sends a GeoChat message containing the
+    download link to every EUD belonging to the target user, so it shows up as a chat
+    notification in their TAK client.
+    """
+    username = bleach.clean(request.form.get("username", ""))
+    if not username:
+        return jsonify({"success": False, "error": gettext("Please specify a username")}), 400
+
+    if "file" not in request.files:
+        return jsonify({"success": False, "error": gettext("Please provide a file")}), 400
+
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("User %(username)s does not exist", username=username),
+                }
+            ),
+            404,
+        )
+
+    euds = db.session.execute(db.session.query(EUD).filter_by(user_id=user.id)).all()
+    euds = [eud[0] for eud in euds]
+    if not euds:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "%(username)s has no devices enrolled to receive a file",
+                        username=username,
+                    ),
+                }
+            ),
+            400,
+        )
+
+    file = request.files["file"]
+    name, extension = os.path.splitext(file.filename)
+    extension = extension.replace(".", "")
+    if not extension and "zip" in file.mimetype:
+        extension = "zip"
+
+    if extension.lower() not in app.config.get("ALLOWED_EXTENSIONS"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "Invalid file extension: %(extension)s", extension=extension
+                    ),
+                }
+            ),
+            400,
+        )
+
+    # Data package filenames must be globally unique, so resending a file that was
+    # already sent before (by anyone) reuses the existing package instead of trying
+    # to create a second one with a colliding name.
+    safe_filename = "{}.zip".format(os.path.splitext(secure_filename(file.filename))[0])
+    data_package = db.session.execute(
+        db.session.query(DataPackage).filter_by(filename=safe_filename)
+    ).first()
+
+    if data_package:
+        data_package = data_package[0]
+    else:
+        if extension.lower() != "zip":
+            file_hash = create_data_package_zip(file)
+        else:
+            file_hash = save_data_package_file(file, username=current_user.username)
+
+        data_package = db.session.execute(
+            db.session.query(DataPackage).filter_by(hash=file_hash)
+        ).first()
+        if not data_package:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": gettext("Failed to save the uploaded file"),
+                    }
+                ),
+                500,
+            )
+        data_package = data_package[0]
+
+    url = urlparse(request.url_root)
+    metadata_url = "https://{}:{}/Marti/api/sync/metadata/{}/tool".format(
+        url.hostname, app.config.get("RAVEN_MARTI_HTTPS_PORT"), data_package.hash
+    )
+
+    rabbit_credentials = pika.PlainCredentials(
+        app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
+    )
+    rabbit_connection = pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS"), credentials=rabbit_credentials
+        )
+    )
+    channel = rabbit_connection.channel()
+    for eud in euds:
+        fileshare_event = _generate_fileshare_cot(
+            data_package,
+            app.config.get("RAVEN_SERVER_SENDER_UID", "server-uid"),
+            app.config.get("RAVEN_SERVER_SENDER_CALLSIGN", "Server"),
+            metadata_url,
+            eud.callsign,
+        )
+        channel.basic_publish(
+            exchange="dms",
+            routing_key=eud.uid,
+            body=json.dumps(
+                {
+                    "uid": app.config.get("RAVEN_NODE_ID"),
+                    "cot": tostring(fileshare_event).decode("utf-8"),
+                }
+            ),
+        )
+    channel.close()
+    rabbit_connection.close()
+
+    logger.info(
+        "{} sent file {} to {} ({} device(s))".format(
+            current_user.username, data_package.filename, username, len(euds)
+        )
+    )
+
+    return jsonify({"success": True})
+
+
 @user_api_blueprint.route("/api/users")
 @roles_accepted("administrator")
 def get_users():
@@ -620,6 +871,15 @@ def get_users():
 
     query = db.session.query(User)
     query = search(query, User, "username")
+
+    # Pin protected system accounts (e.g. "Server") to the top of the list,
+    # regardless of the requested sort column/direction, which paginate()
+    # applies afterward as the secondary sort.
+    protected_usernames = app.config.get("RAVEN_PROTECTED_USERNAMES", [])
+    if protected_usernames:
+        query = query.order_by(
+            sqlalchemy.case((User.username.in_(protected_usernames), 0), else_=1)
+        )
 
     return paginate(query, User)
 
@@ -750,6 +1010,10 @@ def add_user_to_groups():
 
     if direction != "IN" and direction != "OUT":
         return jsonify({"success": False, "error": gettext("Direction must be IN or OUT")}), 400
+
+    protected_response = _protected_user_response(username)
+    if protected_response:
+        return protected_response
 
     user = app.security.datastore.find_user(username=username)
     if not user:
