@@ -10,6 +10,7 @@ import sys
 import traceback
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
+from urllib.parse import quote
 
 import colorlog
 import flask_wtf
@@ -150,7 +151,11 @@ def init_extensions(app):
         app,
         logger=socketio_logger,
         ping_timeout=1,
-        message_queue="amqp://" + app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS"),
+        message_queue="amqp://{}:{}@{}".format(
+            quote(app.config.get("RAVEN_RABBITMQ_USERNAME"), safe=""),
+            quote(app.config.get("RAVEN_RABBITMQ_PASSWORD"), safe=""),
+            app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS"),
+        ),
     )
 
     rabbit_credentials = pika.PlainCredentials(

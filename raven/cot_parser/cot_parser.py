@@ -9,6 +9,7 @@ import sys
 import time
 import traceback
 import uuid
+from urllib.parse import quote
 from logging.handlers import TimedRotatingFileHandler
 
 import bleach
@@ -1370,7 +1371,13 @@ def status():
 
 
 def main():
-    sio = SocketIO(message_queue="amqp://" + app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS"))
+    sio = SocketIO(
+        message_queue="amqp://{}:{}@{}".format(
+            quote(app.config.get("RAVEN_RABBITMQ_USERNAME"), safe=""),
+            quote(app.config.get("RAVEN_RABBITMQ_PASSWORD"), safe=""),
+            app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS"),
+        )
+    )
 
     processes = 0
     while processes < app.config.get("RAVEN_COT_PARSER_PROCESSES"):
