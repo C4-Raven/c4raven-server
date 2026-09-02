@@ -95,6 +95,14 @@ class DefaultConfig:
     # or revoke site access from via the API, regardless of who's logged in.
     RAVEN_PROTECTED_USERNAMES = os.getenv("RAVEN_PROTECTED_USERNAMES", "Server").split(",")
 
+    # Cloudflare Turnstile ("I'm human" checkbox) on the web login form.
+    # Get a site key + secret key from the Cloudflare dashboard under
+    # Turnstile, then set these three (site key is not secret and is safe to
+    # ship to the browser; the secret key must never leave the server).
+    RAVEN_TURNSTILE_ENABLE = os.getenv("RAVEN_TURNSTILE_ENABLE", "False").lower() in ["true", "1", "yes"]
+    RAVEN_TURNSTILE_SITE_KEY = os.getenv("RAVEN_TURNSTILE_SITE_KEY", "")
+    RAVEN_TURNSTILE_SECRET_KEY = os.getenv("RAVEN_TURNSTILE_SECRET_KEY", "")
+
     # Certificate Authority Settings
     RAVEN_CA_NAME = os.getenv("RAVEN_CA_NAME", "Raven-CA")
     RAVEN_CA_FOLDER = os.getenv("RAVEN_CA_FOLDER", os.path.join(RAVEN_DATA_FOLDER, "ca"))

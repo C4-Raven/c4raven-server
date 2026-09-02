@@ -8,6 +8,7 @@ from werkzeug.datastructures import ImmutableMultiDict
 
 from raven.extensions import ldap_manager, logger
 from raven.models.user import User
+from raven.turnstile import turnstile_passed
 
 ldap_blueprint = Blueprint("ldap_blueprint", __name__)
 
@@ -59,6 +60,10 @@ def save_user(dn: str, username: str, data, groups):
 @ldap_blueprint.route("/api/ldap_login", methods=["POST"])
 def ldap_login():
     form = LDAPLoginForm(formdata=ImmutableMultiDict(request.json))
+
+    if not turnstile_passed((request.json or {}).get("turnstile_token")):
+        form.username.errors.append("Please complete the human verification challenge")
+        return base_render_json(form)
 
     # LDAPLoginForm.validate() will call save_user()
     if form.validate():

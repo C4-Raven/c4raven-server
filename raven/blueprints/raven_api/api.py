@@ -201,6 +201,23 @@ def health():
     return jsonify({"status": "healthy"})
 
 
+@api_blueprint.route("/api/turnstile")
+def turnstile_config():
+    """Public, unauthenticated - tells the login page whether to render the
+    Cloudflare Turnstile widget and which site key to render it with. The
+    site key is not secret; only the server-side secret key is.
+
+    .. code-block:: json
+        {"enabled": true, "site_key": "0x4AAA..."}
+    """
+    return jsonify(
+        {
+            "enabled": bool(app.config.get("RAVEN_TURNSTILE_ENABLE")),
+            "site_key": app.config.get("RAVEN_TURNSTILE_SITE_KEY", ""),
+        }
+    )
+
+
 @api_blueprint.route("/api/status")
 @auth_required()
 def status():
