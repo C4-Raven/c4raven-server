@@ -37,6 +37,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 import raven
 from raven.certificate_authority import CertificateAuthority
+from raven.controllers.federation_hub_controller import FigFederateClient
 from raven.controllers.meshtastic_controller import MeshtasticController
 from raven.defaultconfig import DefaultConfig
 from raven.EmailValidator import EmailValidator
@@ -589,6 +590,19 @@ def main(app):
             logger.error(traceback.format_exc())
     else:
         logger.info("Mumble authentication handler disabled")
+
+    if app.config.get("RAVEN_FEDHUB_ENABLE") and app.config.get("RAVEN_FEDHUB_FEDERATE_ENABLE"):
+        try:
+            logger.info("Starting Federation Hub bridge")
+            fedhub_thread = FigFederateClient(app.app_context())
+            fedhub_thread.daemon = True
+            fedhub_thread.start()
+            app.fedhub_thread = fedhub_thread
+        except BaseException as e:
+            logger.error(f"Failed to start Federation Hub bridge: {e}")
+            logger.error(traceback.format_exc())
+    else:
+        logger.info("Federation Hub bridge disabled")
 
     if app.config.get("RAVEN_ENABLE_PLUGINS"):
         try:

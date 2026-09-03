@@ -84,6 +84,42 @@ class DefaultConfig:
     # uses the private CA -- unaffected), so trust the system's default CA
     # bundle here instead of pinning to that private CA's file.
     RAVEN_FEDHUB_CA_BUNDLE = os.getenv("RAVEN_FEDHUB_CA_BUNDLE") or True
+
+    # Federation Hub data plane (FIG protocol, gRPC over mTLS on the broker's
+    # v2 port). This is separate from the admin-API integration above -- it's
+    # what actually moves CoT across the hub-to-hub link so remote clients
+    # show up locally, rather than just letting admins manage the hub's
+    # policy/CA graph from Raven's UI.
+    RAVEN_FEDHUB_FEDERATE_ENABLE = os.getenv("RAVEN_FEDHUB_FEDERATE_ENABLE", "True").lower() in [
+        "true",
+        "1",
+        "yes",
+    ]
+    # Must match the broker's server cert SAN (its keystore is issued for
+    # this hostname) -- connecting via 127.0.0.1/localhost fails TLS hostname
+    # verification the same way the admin API does.
+    RAVEN_FEDHUB_BROKER_ADDRESS = os.getenv("RAVEN_FEDHUB_BROKER_ADDRESS", "tak.c4raven.net:9102")
+    # A dedicated client cert signed by *this hub's own CA* (not fedhub-admin,
+    # which only authenticates to the admin REST API on port 9100). Issue one
+    # with: cd /opt/tak/federation-hub/certs && ./makeCert.sh client raven-federate
+    RAVEN_FEDHUB_FEDERATE_CERT = os.getenv(
+        "RAVEN_FEDHUB_FEDERATE_CERT", "/opt/tak/federation-hub/certs/files/raven-federate.pem"
+    )
+    RAVEN_FEDHUB_FEDERATE_KEY = os.getenv(
+        "RAVEN_FEDHUB_FEDERATE_KEY",
+        "/opt/tak/federation-hub/certs/files/raven-federate-unencrypted.key",
+    )
+    RAVEN_FEDHUB_FEDERATE_CA = os.getenv(
+        "RAVEN_FEDHUB_FEDERATE_CA", "/opt/tak/federation-hub/certs/files/ca.pem"
+    )
+    # Name of the Raven Group whose OUT traffic gets pushed to the hub, and
+    # under which federated events coming back from the hub are published
+    # locally. Must exist as a Group in Raven (Admin -> Groups) and be
+    # referenced the same way in Federation Hub's own group-set config, so
+    # the policy on both ends can route it consistently.
+    RAVEN_FEDHUB_FEDERATE_GROUP = os.getenv("RAVEN_FEDHUB_FEDERATE_GROUP", "Fed group")
+    RAVEN_FEDHUB_FEDERATE_UID = os.getenv("RAVEN_FEDHUB_FEDERATE_UID", "raven-federate")
+
     RAVEN_SSL_VERIFICATION_MODE = int(os.getenv("RAVEN_SSL_VERIFICATION_MODE", 2))
     RAVEN_SSL_CERT_HEADER = os.getenv("RAVEN_SSL_CERT_HEADER", "X-Ssl-Cert")
     RAVEN_NODE_ID = os.getenv(
