@@ -5,6 +5,7 @@ import traceback
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring
 
+import gevent
 import grpc
 from bs4 import BeautifulSoup
 from flask import Flask
@@ -161,27 +162,40 @@ def _bs4_to_etree(tag) -> Element:
     return element
 
 
-class FigFederateClient(RabbitMQClient, threading.Thread):
+class FigFederateClient(RabbitMQClient):
     """Bridges Raven's local CoT bus (RabbitMQ `groups` exchange) to
     Federation Hub's FIG protocol (gRPC over mTLS on the broker's v2 port),
     so members of RAVEN_FEDHUB_FEDERATE_GROUP are visible across whatever
     Federation Hub already has federated -- the piece that was missing
     entirely before this: Federation Hub only relays what a federate
     actually hands it, and nothing in Raven was doing that.
+
+    app.py's gevent.monkey.patch_all() makes ordinary threading.Thread a
+    cooperative greenlet sharing one real OS thread with the rest of the
+    process (including the HTTP/socketio listener). grpc's Python stub calls
+    block at the C level and don't cooperate with that scheduler, so every
+    blocking gRPC call here is dispatched through gevent's own native
+    threadpool instead -- the one thing in a gevent process that's actually
+    safe to block synchronously on. Do not call self._stub methods directly
+    from a greenlet; always go through self._threadpool.
     """
 
     def __init__(self, context: Flask):
-        threading.Thread.__init__(self)
-        self.daemon = True
         RabbitMQClient.__init__(self, context)
 
         self.group_name = context.app.config.get("RAVEN_FEDHUB_FEDERATE_GROUP")
         self.self_uid = context.app.config.get("RAVEN_FEDHUB_FEDERATE_UID")
         self._recently_injected = {}
         self._recently_injected_lock = threading.Lock()
+        self._threadpool = gevent.get_hub().threadpool
 
         self._channel = self._build_grpc_channel(context)
         self._stub = fig_pb2_grpc.FederatedChannelStub(self._channel)
+
+    def start(self):
+        # Runs the whole blocking stream-read loop on a real OS thread, kept
+        # alive for the life of the process -- not a one-off spawn().
+        self._threadpool.spawn(self._grpc_loop)
 
     def _build_grpc_channel(self, context: Flask) -> grpc.Channel:
         cfg = context.app.config
@@ -224,10 +238,16 @@ class FigFederateClient(RabbitMQClient, threading.Thread):
             # We just injected this uid from the hub -- don't hand it straight back.
             return
 
+        geo = cot_xml_to_geoevent(message.get("cot", ""))
+        if geo is None:
+            return
+        # on_message runs on the pika greenlet -- calling the (blocking) gRPC
+        # stub here directly would stall it, so hand the call to the real
+        # threadpool instead of running it inline.
+        self._threadpool.spawn(self._send_one_event, uid, geo)
+
+    def _send_one_event(self, uid: str, geo: fig_pb2.GeoEvent):
         try:
-            geo = cot_xml_to_geoevent(message.get("cot", ""))
-            if geo is None:
-                return
             self._stub.SendOneEvent(
                 fig_pb2.FederatedEvent(event=geo, federateGroups=[self.group_name]), timeout=10
             )
@@ -238,7 +258,7 @@ class FigFederateClient(RabbitMQClient, threading.Thread):
 
     # -- inbound: Federation Hub -> local group ------------------------------
 
-    def run(self):
+    def _grpc_loop(self):
         subscription = fig_pb2.Subscription(
             identity=fig_pb2.Identity(
                 name=self.self_uid,

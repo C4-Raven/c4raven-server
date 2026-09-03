@@ -595,7 +595,6 @@ def main(app):
         try:
             logger.info("Starting Federation Hub bridge")
             fedhub_thread = FigFederateClient(app.app_context())
-            fedhub_thread.daemon = True
             fedhub_thread.start()
             app.fedhub_thread = fedhub_thread
         except BaseException as e:
