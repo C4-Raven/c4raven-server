@@ -399,7 +399,16 @@ def create_app(cli=True):
 
         app.register_blueprint(scheduler_blueprint)
 
-        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1)
+        # x_proto=1 is this werkzeug version's default already, but pinned
+        # explicitly since request.url_root (and everything built from it,
+        # e.g. VideoStream.to_json()'s webrtc_link/hls_link) depends on
+        # nginx's X-Forwarded-Proto being honored here -- a site block that
+        # doesn't set that header makes every such URL come out http:// on
+        # an https:// page, which the browser silently blocks as mixed
+        # content. (The actual bug hitting that today was a missing
+        # X-Forwarded-Proto in nginx itself, not here -- see the certbot
+        # site block for tak.c4raven.net.)
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1, x_proto=1)
 
     else:
         from raven.blueprints.cli import raven_cli, translate
