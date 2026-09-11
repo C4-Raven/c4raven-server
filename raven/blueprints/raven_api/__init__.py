@@ -1,0 +1,47 @@
+from flask import Blueprint
+from flask import current_app as app
+from flask import jsonify, request
+
+from raven.blueprints.raven_api.api import api_blueprint
+from raven.blueprints.raven_api.casevac_api import casevac_api_blueprint
+from raven.blueprints.raven_api.data_package_api import data_package_api
+from raven.blueprints.raven_api.device_profile_api import device_profile_api_blueprint
+from raven.blueprints.raven_api.eud_stats_api import eud_stats_blueprint
+from raven.blueprints.raven_api.federation_hub_api import federation_hub_api
+from raven.blueprints.raven_api.group_api import group_api
+from raven.blueprints.raven_api.marker_api import marker_api_blueprint
+from raven.blueprints.raven_api.mediamtx_api import mediamtx_api_blueprint
+from raven.blueprints.raven_api.meshtastic_api import meshtastic_api_blueprint
+from raven.blueprints.raven_api.mission_api import data_sync_api
+from raven.blueprints.raven_api.package_api import packages_blueprint
+from raven.blueprints.raven_api.plugin_api import plugin_blueprint
+from raven.blueprints.raven_api.scheduler_api import scheduler_api_blueprint
+from raven.blueprints.raven_api.token_api import token_api_blueprint
+from raven.blueprints.raven_api.user_api import user_api_blueprint
+from raven.blueprints.raven_api.video_api import video_api_blueprint
+
+from .language_api import language_api
+from .ldap_api import ldap_blueprint
+from .tak_gov_link_api import tak_gov_link_blueprint
+
+raven_api = Blueprint("raven_api", __name__)
+raven_api.register_blueprint(api_blueprint)
+raven_api.register_blueprint(casevac_api_blueprint)
+raven_api.register_blueprint(data_package_api)
+raven_api.register_blueprint(device_profile_api_blueprint)
+raven_api.register_blueprint(marker_api_blueprint)
+raven_api.register_blueprint(mediamtx_api_blueprint)
+raven_api.register_blueprint(meshtastic_api_blueprint)
+raven_api.register_blueprint(packages_blueprint)
+raven_api.register_blueprint(scheduler_api_blueprint)
+raven_api.register_blueprint(user_api_blueprint)
+raven_api.register_blueprint(video_api_blueprint)
+raven_api.register_blueprint(data_sync_api)
+raven_api.register_blueprint(group_api)
+raven_api.register_blueprint(federation_hub_api)
+raven_api.register_blueprint(eud_stats_blueprint)
+raven_api.register_blueprint(plugin_blueprint)
+raven_api.register_blueprint(token_api_blueprint)
+raven_api.register_blueprint(ldap_blueprint)
+raven_api.register_blueprint(tak_gov_link_blueprint)
+raven_api.register_blueprint(language_api)

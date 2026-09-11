@@ -1,0 +1,170 @@
+[tool.poetry]
+name = "Raven"
+version = "0.0.0"
+description = "A server for ATAK, WinTAK, and iTAK"
+authors = ["C4 Raven <support@c4raven.net>"]
+readme = "README.md"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/C4Raven/c4raven-server"
+documentation = "https://github.com/C4Raven/c4raven-server"
+include = [{path = "raven/translations/**/*", format = ["sdist", "wheel"]}]
+
+[tool.poetry.dependencies]
+adsbxcot = "6.0.4"
+androguard = "4.1.3"
+aiscot = "7.0.10"
+beautifulsoup4 = "4.14.2"
+colorlog = "6.10.1"
+datetime = "5.5"
+# Keep dulwich at 0.24.1 or run into dependency hell with lastversion
+dulwich = "0.24.1"
+eventlet = "0.40.3"
+flask = "3.1.2"
+flask-apscheduler = "1.13.1"
+flask-babel = "4.0.0"
+flask-cors = "6.0.1"
+flask-ldap3-login = "1.0.2"
+flask-mailman = "1.1.1"
+flask-migrate = "4.1.0"
+Flask-Security-Too = {version="5.7.1", extras=["common", "mfa"]}
+flask-socketio = "5.5.1"
+flask-sqlalchemy = "3.1.1"
+gevent = "25.5.1"
+grpcio = "1.83.1"
+httpx = {version = "0.28.1", extras = ["http2"]}
+kombu = "5.6.0"
+lastversion = "*"
+lxml = "6.0.2"
+meshtastic = "2.7.6"
+pika = "1.3.2"
+poetry = "2.2.1"
+poetry-dynamic-versioning = {version = "1.9.1", extras = ["plugin"]}
+protobuf = "6.33.1"
+psutil = "7.1.3"
+psycopg = "3.2.12"
+pyfiglet = "1.0.2"
+pygc = "2.0.0"
+PyJWT = "2.10.0"
+pytak = "7.0.2"
+python = ">=3.10, <3.15"
+python-ffmpeg = "2.0.12"
+python-socketio = {extras = ["client", "websocket_client", "asyncio_client"], version = "5.14.3"}
+pyOpenSSL = "25.3.0"
+pyotp = "2.9.0"
+PyYAML = "6.0.3"
+semver = "3.0.4"
+sqlalchemy = "2.0.44"
+simplekml = "1.3.6"
+sqlalchemy-utils = "0.42.0"
+tldextract = "5.3.0"
+unishox2-py3 = "1.0.0"
+yt-dlp = "*"
+# Keep zope-event at 5.1.1, DO NOT UPGRADE
+zope-event = "5.1.1"
+zope-interface = "8.1.1"
+
+[tool.poetry.group.dev.dependencies]
+isort = "^7.0.0"
+black = "^26.0.0"
+flake8 = "^7.3.0"
+flake8-pyproject = "^1.2.4"
+pytest = "^9.0.0"
+pytest-cov = "^7.0.0"
+
+[tool.poetry-dynamic-versioning]
+enable = true
+vcs = "git"
+style = "semver"
+dirty = false
+pattern = "((?P<epoch>\\d+)!)?(?P<base>\\d+(\\.\\d+)*)"
+
+[tool.poetry-dynamic-versioning.files."raven/__init__.py"]
+persistent-substitution = true
+initial-content = """
+  # These version placeholders will be replaced later during substitution.
+  __version__ = "0.0.0"
+  __version_tuple__ = (0, 0, 0)
+"""
+
+[build-system]
+requires = ["poetry-core>=1.0.0", "poetry-dynamic-versioning>=1.0.0,<2.0.0"]
+build-backend = "poetry_dynamic_versioning.backend"
+
+[tool.poetry.scripts]
+raven = "raven.app:start"
+eud_handler = "raven.eud_handler.eud_handler:main"
+cot_parser = "raven.cot_parser.cot_parser:main"
+fedhub_bridge = "raven.controllers.federation_hub_daemon:main"
+
+[tool.black]
+line_length = 100
+target-version = ["py311"]
+src = ["raven/", "tests/"]
+
+[tool.isort]
+known_first_party = "raven"
+profile = "black"
+line_length = 100
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+combine_as_imports = false
+skip = [".git", "venv"]
+
+[tool.flake8]
+max-line-length = 100
+extend-ignore = [
+    "E203",  # whitespace before ':'
+    "E266",  # too many leading '#' for block comment
+    "E501",  # line too long (handled by black)
+    "W503",  # line break before binary operator
+    "W504",  # line break after binary operator
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--verbose",
+    "--cov=raven",
+    "--cov-report=term-missing",
+    "--cov-report=term",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+
+[tool.coverage.run]
+source = ["raven"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+]
+branch = true
+parallel = true
+relative_files = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: nocover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+    "pass",
+]
+
+[tool.mypy]
+check_untyped_defs = true
+show_error_codes = true
+pretty = true
+ignore_missing_imports = true
+files = ["raven/", "tests/"]
+exclude = [
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "htmlcov",
+]

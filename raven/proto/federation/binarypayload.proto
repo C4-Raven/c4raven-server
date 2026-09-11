@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package gov.tak.cop.proto.v1;
+
+
+message BinaryPayload {
+  string type = 1;
+  string version = 2;
+  bytes data = 3;
+  int64 timestamp = 4;
+  string uuid = 5;
+}
+

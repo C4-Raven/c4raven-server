@@ -1,0 +1,111 @@
+{# djlint:off H030,H031 #}
+{# CUSTOM: Raven-branded override of flask_security/templates/security/base.html.
+   Applies to every Flask-Security fallback page (change password, forgot
+   password, etc.) that isn't handled by the React SPA, so they don't look
+   like a bare, unstyled default form. #}
+{% block doc -%}
+<!DOCTYPE html>
+<html{% block html_attribs %}{% endblock html_attribs %}>
+  {%- block html %}
+  <head>
+    {%- block head %}
+    <title>{% block title %}{{ title|default }}{% endblock title %}</title>
+
+      {%- block metas %}
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+      {%- endblock metas %}
+
+      {%- block head_scripts %}
+      {%- endblock head_scripts %}
+
+      {%- block styles %}
+        <style>
+          :root { color-scheme: dark; }
+          body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px 16px;
+            background: rgb(35, 37, 41);
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+          }
+          .fs-card {
+            width: 100%;
+            max-width: 420px;
+            background:
+              radial-gradient(ellipse 55% 50% at 15% 0%, rgba(255, 255, 255, 0.08), transparent 60%),
+              radial-gradient(ellipse 65% 55% at 100% 25%, rgba(0, 0, 0, 0.25), transparent 60%),
+              radial-gradient(ellipse 75% 60% at 25% 115%, rgba(0, 0, 0, 0.3), transparent 60%),
+              #373a40;
+            border-radius: 16px;
+            padding: 32px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+          }
+          .fs-card img.fs-logo { display: block; height: 80px; width: auto; margin: 0 auto 24px; }
+          .fs-card h1 { font-size: 1.3rem; text-align: center; margin: 0 0 20px; }
+          .fs-card h3 { font-size: 1rem; font-weight: 400; text-align: center; color: rgba(255, 255, 255, 0.75); }
+          .fs-div { margin-bottom: 14px; }
+          .fs-div label { display: block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; color: rgba(255, 255, 255, 0.55); margin-bottom: 6px; }
+          .fs-div input[type="text"],
+          .fs-div input[type="email"],
+          .fs-div input[type="password"],
+          .fs-div input[type="tel"] {
+            width: 100%;
+            box-sizing: border-box;
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            border-radius: 8px;
+            padding: 10px 12px;
+            color: #fff;
+            font-size: 0.95rem;
+          }
+          .fs-div input:focus { outline: none; border-color: rgba(255, 255, 255, 0.7); }
+          input[type="submit"], button[type="submit"] {
+            width: 100%;
+            background: #fff;
+            color: rgb(35, 37, 41);
+            border: none;
+            border-radius: 8px;
+            padding: 11px 12px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            font-size: 0.9rem;
+            cursor: pointer;
+            margin-top: 6px;
+          }
+          input[type="submit"]:hover, button[type="submit"]:hover { opacity: 0.9; }
+          .fs-error-msg { color: #ff8787; font-size: 0.85rem; }
+          #fs-form-errors ul { list-style: none; padding: 0; margin: 6px 0 0; }
+          .fs-div ul { list-style: none; padding: 0; margin: 6px 0 0; }
+          .fs-card hr { border: none; border-top: 1px solid rgba(255, 255, 255, 0.15); margin: 24px 0 12px; }
+          .fs-card h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; color: rgba(255, 255, 255, 0.5); text-align: center; margin: 0 0 10px; font-weight: 600; }
+          .fs-card > ul, .fs-card ul ul { list-style: none; padding: 0; margin: 0; text-align: center; }
+          .fs-card > ul li { margin-bottom: 8px; font-size: 0.85rem; }
+          .fs-card a { color: rgba(255, 255, 255, 0.65); text-decoration: none; }
+          .fs-card a:hover { color: #fff; text-decoration: underline; }
+        </style>
+      {%- endblock styles %}
+    {%- endblock head %}
+  </head>
+  <body{% block body_attribs %}{% endblock body_attribs %}>
+    {% block body -%}
+      {% block navbar %}
+      {%- endblock navbar %}
+      <div class="fs-card">
+        <img class="fs-logo" src="/raven-logo.png" alt="C4 Raven">
+        {% block content -%}
+        {%- endblock content %}
+      </div>
+
+      {% block scripts %}
+      {%- endblock scripts %}
+    {%- endblock body %}
+  </body>
+  {%- endblock html %}
+</html>
+{% endblock doc -%}
