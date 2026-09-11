@@ -42,8 +42,6 @@ from raven.models.ZMIST import ZMIST
 
 api_blueprint = Blueprint("api_blueprint", __name__)
 
-p = psutil.Process()
-
 
 def search(query, model, field):
     arg = request.args.get(field)
@@ -283,7 +281,11 @@ def status():
         "ots_start_time": app.start_time.strftime("%Y-%m-%d %H:%M:%SZ"),
         "ots_uptime": ots_uptime.total_seconds(),
         "cpu_time": cpu_time_dict,
-        "cpu_percent": p.cpu_percent(),
+        # System-wide, like every other stat in this response (memory, disk,
+        # network) -- this used to be psutil.Process().cpu_percent(), which
+        # only measured the raven web process itself, not the server the
+        # dashboard's "CPU Usage" tile claims to show.
+        "cpu_percent": psutil.cpu_percent(),
         "load_avg": psutil.getloadavg(),
         "memory": vmem_dict,
         "disk_usage": disk_usage_dict,
