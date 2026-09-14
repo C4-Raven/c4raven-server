@@ -2470,13 +2470,26 @@ def add_content(mission_name):
     # MissionChange, not Mission -- returning to_marti_json() here made it
     # try to read Mission's array-typed "externalData" as MissionChange's
     # object-typed one and blow up with a Jackson MismatchedInputException.
-    return jsonify(
-        {
-            "version": "3",
-            "type": "MissionChange",
-            "data": changes_json,
-            "nodeId": app.config.get("RAVEN_NODE_ID"),
-        }
+    #
+    # Status matters here too: mission_subscribe() and create_log_entry()
+    # (the other two "create something" endpoints in this file, both
+    # confirmed working against real TAK clients via nginx's access log)
+    # both return 201, unconditionally, even when the thing being created
+    # already existed. This endpoint returned the Flask-default 200 --
+    # inconsistent with that established precedent, and with genuinely
+    # correct MissionChange/MissionUID data now going out, an HTTP-level
+    # mismatch a Feign-generated client validates is the remaining
+    # plausible cause of "incompatibilities" that isn't a JSON parse error.
+    return (
+        jsonify(
+            {
+                "version": "3",
+                "type": "MissionChange",
+                "data": changes_json,
+                "nodeId": app.config.get("RAVEN_NODE_ID"),
+            }
+        ),
+        201,
     )
 
 
