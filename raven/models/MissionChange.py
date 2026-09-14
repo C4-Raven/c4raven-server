@@ -66,7 +66,7 @@ class MissionChange(db.Model):
             "timestamp": iso8601_string_from_datetime(self.timestamp),
             "creatorUid": self.creator_uid if self.creator_uid else "",
             "serverTime": iso8601_string_from_datetime(self.server_time),
-            "missionGuid": self.mission_uid,
+            "missionGuid": self.mission.guid if self.mission else None,
         }
 
         if self.content_resource:
