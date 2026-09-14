@@ -2216,11 +2216,122 @@ def delete_content(mission_name: str | None = None, mission_guid: str | None = N
     "/Marti/api/missions/<mission_name>/contents/missionpackage", methods=["PUT"]
 )
 def add_content(mission_name):
-    client_uid = request.args.get("clientUid")
-    if "Authorization" not in request.headers or not verify_token():
-        return jsonify({"success": False, "error": gettext("Missing or invalid token")}), 401
+    """Used by the Data Sync plugin to upload and attach a mission package
+    (a zip of CoT/attachments) to a mission in one call -- unlike
+    /Marti/sync/upload + PUT .../contents, which do those two steps
+    separately by content hash.
 
-    return "", 200
+    This previously required an Authorization bearer token and never saved
+    anything even when that check passed -- every real client we've seen
+    hit this (TAKX included) authenticates with its mTLS client cert like
+    every other Marti API call, never sends that token, and always got a
+    401 here.
+    """
+    cert = verify_client_cert()
+    if not cert:
+        return jsonify({"success": False, "error": gettext("Missing or invalid certificate")}), 400
+
+    username = cert.get_subject().commonName
+    creator_uid = request.args.get("creatorUid") or request.args.get("clientUid")
+
+    mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
+    if not mission:
+        return (
+            jsonify(
+                {"success": False, "error": gettext("No such mission: %(mission_name)s", mission_name=mission_name)}
+            ),
+            404,
+        )
+    mission = mission[0]
+
+    file = request.data
+    sha256 = hashlib.sha256()
+    sha256.update(file)
+    file_hash = sha256.hexdigest()
+
+    content = db.session.execute(
+        db.session.query(MissionContent).filter_by(hash=file_hash)
+    ).first()
+    if not content:
+        content = MissionContent()
+        content.mime_type = request.content_type or "application/x-zip-compressed"
+        content.filename = f"{mission_name}_{uuid.uuid4().hex}.zip"
+        content.submission_time = datetime.datetime.now(datetime.timezone.utc)
+        content.submitter = username or "anonymous"
+        content.uid = str(uuid.uuid4())
+        content.creator_uid = creator_uid
+        content.size = request.content_length
+        content.expiration = -1
+        content.keywords = []
+        content.hash = file_hash
+        db.session.execute(insert(MissionContent).values(**content.serialize()))
+        db.session.commit()
+        content = db.session.execute(
+            db.session.query(MissionContent).filter_by(hash=file_hash)
+        ).first()[0]
+    else:
+        content = content[0]
+
+    os.makedirs(os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "missions"), exist_ok=True)
+    with open(
+        os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "missions", content.filename), "wb"
+    ) as f:
+        f.write(file)
+        f.flush()
+
+    mission_content_mission = db.session.execute(
+        db.session.query(MissionContentMission).filter_by(
+            mission_content_id=content.id, mission_name=mission_name
+        )
+    ).first()
+    if not mission_content_mission:
+        mission_content_mission = MissionContentMission()
+        mission_content_mission.mission_name = mission_name
+        mission_content_mission.mission_content_id = content.id
+        db.session.add(mission_content_mission)
+
+    mission_change = db.session.execute(
+        db.session.query(MissionChange).filter_by(content_uid=content.uid, mission_name=mission_name)
+    ).first()
+    if not mission_change:
+        mission_change = MissionChange()
+        mission_change.isFederatedChange = False
+        mission_change.change_type = MissionChange.ADD_CONTENT
+        mission_change.content_uid = content.uid
+        mission_change.mission_name = mission_name
+        mission_change.timestamp = datetime.datetime.now(datetime.timezone.utc)
+        mission_change.creator_uid = creator_uid
+        mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)
+        db.session.add(mission_change)
+        db.session.commit()
+
+        event = generate_mission_change_cot(mission_name, mission, mission_change, content=content)
+        rabbit_body = json.dumps(
+            {"uid": mission_change.creator_uid, "cot": tostring(event).decode("utf-8")}
+        )
+        rabbit_credentials = pika.PlainCredentials(
+            app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
+        )
+        rabbit_connection = pika.BlockingConnection(
+            pika.ConnectionParameters(
+                host=app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS"), credentials=rabbit_credentials
+            )
+        )
+        channel = rabbit_connection.channel()
+        channel.basic_publish("missions", routing_key=f"missions.{mission_name}", body=rabbit_body)
+        channel.close()
+        rabbit_connection.close()
+
+    db.session.commit()
+
+    return jsonify(
+        {
+            "version": "3",
+            "type": "Mission",
+            "data": [mission.to_marti_json()],
+            "nodeId": app.config.get("RAVEN_NODE_ID"),
+        }
+    )
 
 
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/cot")
