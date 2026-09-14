@@ -2321,14 +2321,20 @@ def add_content(mission_name):
         channel.basic_publish("missions", routing_key=f"missions.{mission_name}", body=rabbit_body)
         channel.close()
         rabbit_connection.close()
+    else:
+        mission_change = mission_change[0]
 
     db.session.commit()
 
+    # TAKX's Feign client deserializes this endpoint's "data" as a list of
+    # MissionChange, not Mission -- returning to_marti_json() here made it
+    # try to read Mission's array-typed "externalData" as MissionChange's
+    # object-typed one and blow up with a Jackson MismatchedInputException.
     return jsonify(
         {
             "version": "3",
-            "type": "Mission",
-            "data": [mission.to_marti_json()],
+            "type": "MissionChange",
+            "data": [mission_change.to_json()],
             "nodeId": app.config.get("RAVEN_NODE_ID"),
         }
     )
