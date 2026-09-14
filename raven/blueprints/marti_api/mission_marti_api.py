@@ -1453,7 +1453,7 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
             "token": request.headers.get("Authorization").replace("Bearer ", ""),
             "clientUid": token["sub"],
             "username": role.username,
-            "createTime": role.createTime,
+            "createTime": iso8601_string_from_datetime(role.createTime),
             "role": role.to_json()["role"],
         }
 
@@ -1498,7 +1498,7 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
             "clientUid": uid,
             "mission": mission.to_marti_json(),
             "username": role.username,
-            "createTime": role.createTime,
+            "createTime": iso8601_string_from_datetime(role.createTime),
             "role": role.to_json()["role"],
         }
 
