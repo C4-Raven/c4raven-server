@@ -61,7 +61,15 @@ class MissionChange(db.Model):
         json = {
             "isFederatedChange": self.isFederatedChange,
             "type": self.change_type,
-            "contentUid": self.content_uid,
+            # A change adds either a file (content_uid) or a dropped marker
+            # (mission_uid) -- generate_mission_change_cot() already reuses
+            # the same "contentUid" tag name for both cases (see its line
+            # setting <contentUid> from mission_change.mission_uid). The
+            # client checks this field against the item UID it just
+            # submitted, so leaving it null for marker changes reads back
+            # as an "incompatibilities" rejection even though the change
+            # itself was recorded correctly.
+            "contentUid": self.content_uid or self.mission_uid,
             "missionName": self.mission_name,
             "timestamp": iso8601_string_from_datetime(self.timestamp),
             "creatorUid": self.creator_uid if self.creator_uid else "",
