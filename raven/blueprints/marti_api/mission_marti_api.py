@@ -1,10 +1,12 @@
 import datetime
 import hashlib
+import io
 import json
 import os
 import time
 import traceback
 import uuid
+import zipfile
 from urllib.parse import urlparse
 from xml.etree.ElementTree import Element, SubElement, fromstring, tostring
 
@@ -2212,20 +2214,91 @@ def delete_content(mission_name: str | None = None, mission_guid: str | None = N
     )
 
 
+def _publish_mission_change_cot(mission_name: str, event: Element, creator_uid: str | None):
+    rabbit_body = json.dumps({"uid": creator_uid, "cot": tostring(event).decode("utf-8")})
+    rabbit_credentials = pika.PlainCredentials(
+        app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
+    )
+    rabbit_connection = pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS"), credentials=rabbit_credentials
+        )
+    )
+    channel = rabbit_connection.channel()
+    channel.basic_publish("missions", routing_key=f"missions.{mission_name}", body=rabbit_body)
+    channel.close()
+    rabbit_connection.close()
+
+
+def _parse_mission_package_map_items(file: bytes) -> tuple[str | None, list]:
+    """A Data Sync "mission package" upload is a Data Package zip: a
+    MANIFEST/manifest.xml declaring the package's own UID plus one or more
+    <Content zipEntry="..."> entries, each usually a map-items/.../<uid>.cot
+    file (the actual marker/point being synced). Returns (manifest_uid,
+    [(item_uid, BeautifulSoup event), ...]) -- manifest_uid is None and the
+    list is empty for anything that isn't a manifest zip (e.g. a plain
+    photo/file upload), so callers can fall back to opaque-content handling.
+    """
+    manifest_uid = None
+    map_items = []
+
+    try:
+        package = zipfile.ZipFile(io.BytesIO(file))
+    except zipfile.BadZipFile:
+        return None, []
+
+    with package:
+        manifest_entry = next(
+            (name for name in package.namelist() if name.endswith("manifest.xml")), None
+        )
+        if not manifest_entry:
+            return None, []
+
+        manifest = BeautifulSoup(package.read(manifest_entry), "xml")
+        for param in manifest.find_all("Parameter"):
+            if param.attrs.get("name") == "uid":
+                manifest_uid = param.attrs.get("value")
+                break
+
+        for content_tag in manifest.find_all("Content"):
+            if content_tag.attrs.get("ignore") == "true":
+                continue
+            zip_entry = content_tag.attrs.get("zipEntry")
+            if not zip_entry or not zip_entry.lower().endswith(".cot"):
+                continue
+            try:
+                cot_bytes = package.read(zip_entry)
+            except KeyError:
+                continue
+            event = BeautifulSoup(cot_bytes, "xml").find("event")
+            if event and event.attrs.get("uid"):
+                map_items.append((event.attrs["uid"], event))
+
+    return manifest_uid, map_items
+
+
 @mission_marti_api.route(
     "/Marti/api/missions/<mission_name>/contents/missionpackage", methods=["PUT"]
 )
 def add_content(mission_name):
     """Used by the Data Sync plugin to upload and attach a mission package
-    (a zip of CoT/attachments) to a mission in one call -- unlike
-    /Marti/sync/upload + PUT .../contents, which do those two steps
-    separately by content hash.
+    to a mission in one call -- unlike /Marti/sync/upload + PUT .../contents,
+    which do that in two steps by content hash.
 
-    This previously required an Authorization bearer token and never saved
-    anything even when that check passed -- every real client we've seen
-    hit this (TAKX included) authenticates with its mTLS client cert like
-    every other Marti API call, never sends that token, and always got a
-    401 here.
+    A "mission package" here is a Data Package zip (MANIFEST/manifest.xml +
+    map-items/.../<uid>.cot) -- this is how TAKX (and other TAK clients)
+    sync a dropped marker to Data Sync, not a raw CoT with <dest mission>.
+    The client checks the server's response against the item UID(s) it
+    declared in its own manifest, so acknowledging the upload with a made-up
+    content UID (the previous version of this fix) always reads back as
+    "incompatible" even though the upload itself succeeds -- it has to
+    actually parse the manifest and report a change for the UID(s) in it.
+
+    This previously also required an Authorization bearer token and never
+    saved anything even when that check passed -- every real client we've
+    seen hit this (TAKX included) authenticates with its mTLS client cert
+    like every other Marti API call, never sends that token, and always
+    got a 401 here.
     """
     cert = verify_client_cert()
     if not cert:
@@ -2249,6 +2322,8 @@ def add_content(mission_name):
     sha256.update(file)
     file_hash = sha256.hexdigest()
 
+    manifest_uid, map_items = _parse_mission_package_map_items(file)
+
     content = db.session.execute(
         db.session.query(MissionContent).filter_by(hash=file_hash)
     ).first()
@@ -2258,7 +2333,7 @@ def add_content(mission_name):
         content.filename = f"{mission_name}_{uuid.uuid4().hex}.zip"
         content.submission_time = datetime.datetime.now(datetime.timezone.utc)
         content.submitter = username or "anonymous"
-        content.uid = str(uuid.uuid4())
+        content.uid = manifest_uid or str(uuid.uuid4())
         content.creator_uid = creator_uid
         content.size = request.content_length
         content.expiration = -1
@@ -2289,40 +2364,105 @@ def add_content(mission_name):
         mission_content_mission.mission_name = mission_name
         mission_content_mission.mission_content_id = content.id
         db.session.add(mission_content_mission)
-
-    mission_change = db.session.execute(
-        db.session.query(MissionChange).filter_by(content_uid=content.uid, mission_name=mission_name)
-    ).first()
-    if not mission_change:
-        mission_change = MissionChange()
-        mission_change.isFederatedChange = False
-        mission_change.change_type = MissionChange.ADD_CONTENT
-        mission_change.content_uid = content.uid
-        mission_change.mission_name = mission_name
-        mission_change.timestamp = datetime.datetime.now(datetime.timezone.utc)
-        mission_change.creator_uid = creator_uid
-        mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)
-        db.session.add(mission_change)
         db.session.commit()
 
-        event = generate_mission_change_cot(mission_name, mission, mission_change, content=content)
-        rabbit_body = json.dumps(
-            {"uid": mission_change.creator_uid, "cot": tostring(event).decode("utf-8")}
-        )
-        rabbit_credentials = pika.PlainCredentials(
-            app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
-        )
-        rabbit_connection = pika.BlockingConnection(
-            pika.ConnectionParameters(
-                host=app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS"), credentials=rabbit_credentials
-            )
-        )
-        channel = rabbit_connection.channel()
-        channel.basic_publish("missions", routing_key=f"missions.{mission_name}", body=rabbit_body)
-        channel.close()
-        rabbit_connection.close()
+    changes_json = []
+
+    if map_items:
+        # Register each map-item the manifest declared as a mission UID
+        # (marker), the same way mission_contents()'s "uids" branch does
+        # for a CoT already sitting in our own database -- just sourced
+        # from the zip's embedded CoT XML instead of a DB row.
+        for item_uid, event in map_items:
+            mission_uid = db.session.execute(
+                db.session.query(MissionUID).filter_by(uid=item_uid, mission_name=mission_name)
+            ).first()
+            mission_uid = mission_uid[0] if mission_uid else MissionUID()
+            mission_uid.uid = item_uid
+            mission_uid.mission_name = mission_name
+            mission_uid.timestamp = datetime.datetime.now(datetime.timezone.utc)
+            mission_uid.creator_uid = creator_uid
+            mission_uid.cot_type = event.attrs.get("type")
+
+            point = event.find("point")
+            if point:
+                mission_uid.latitude = float(point.attrs["lat"])
+                mission_uid.longitude = float(point.attrs["lon"])
+
+            usericon = event.find("usericon")
+            if usericon and "iconsetpath" in usericon.attrs:
+                mission_uid.iconset_path = usericon.attrs["iconsetpath"]
+            elif usericon and "iconsetPath" in usericon.attrs:
+                mission_uid.iconset_path = usericon.attrs["iconsetPath"]
+
+            color = event.find("color")
+            if color and "argb" in color.attrs:
+                mission_uid.color = color.attrs["argb"]
+            if color and "value" in color.attrs:
+                mission_uid.color = color.attrs["value"]
+
+            contact = event.find("contact")
+            if contact and "callsign" in contact.attrs:
+                mission_uid.callsign = contact.attrs["callsign"]
+
+            try:
+                db.session.add(mission_uid)
+                db.session.commit()
+            except sqlalchemy.exc.IntegrityError:
+                db.session.rollback()
+                db.session.execute(
+                    update(MissionUID).where(MissionUID.uid == item_uid).values(**mission_uid.serialize())
+                )
+                db.session.commit()
+
+            mission_change = db.session.execute(
+                db.session.query(MissionChange).filter_by(mission_uid=item_uid, mission_name=mission_name)
+            ).first()
+            if not mission_change:
+                mission_change = MissionChange()
+                mission_change.isFederatedChange = False
+                mission_change.change_type = MissionChange.ADD_CONTENT
+                mission_change.mission_uid = item_uid
+                mission_change.mission_name = mission_name
+                mission_change.timestamp = datetime.datetime.now(datetime.timezone.utc)
+                mission_change.creator_uid = creator_uid
+                mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)
+                db.session.add(mission_change)
+                db.session.commit()
+
+                change_cot = generate_mission_change_cot(
+                    mission_name, mission, mission_change, mission_uid=mission_uid
+                )
+                _publish_mission_change_cot(mission_name, change_cot, creator_uid)
+            else:
+                mission_change = mission_change[0]
+
+            changes_json.append(mission_change.to_json())
     else:
-        mission_change = mission_change[0]
+        # No manifest/map-items found (e.g. a plain file, not a marker
+        # package) -- fall back to treating the whole upload as one opaque
+        # content item, keyed by its own hash-derived content UID.
+        mission_change = db.session.execute(
+            db.session.query(MissionChange).filter_by(content_uid=content.uid, mission_name=mission_name)
+        ).first()
+        if not mission_change:
+            mission_change = MissionChange()
+            mission_change.isFederatedChange = False
+            mission_change.change_type = MissionChange.ADD_CONTENT
+            mission_change.content_uid = content.uid
+            mission_change.mission_name = mission_name
+            mission_change.timestamp = datetime.datetime.now(datetime.timezone.utc)
+            mission_change.creator_uid = creator_uid
+            mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)
+            db.session.add(mission_change)
+            db.session.commit()
+
+            change_cot = generate_mission_change_cot(mission_name, mission, mission_change, content=content)
+            _publish_mission_change_cot(mission_name, change_cot, creator_uid)
+        else:
+            mission_change = mission_change[0]
+
+        changes_json.append(mission_change.to_json())
 
     db.session.commit()
 
@@ -2334,7 +2474,7 @@ def add_content(mission_name):
         {
             "version": "3",
             "type": "MissionChange",
-            "data": [mission_change.to_json()],
+            "data": changes_json,
             "nodeId": app.config.get("RAVEN_NODE_ID"),
         }
     )
