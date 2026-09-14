@@ -43,7 +43,13 @@ user_api_blueprint = Blueprint("user_api_blueprint", __name__)
 
 def _protected_user_response(username: str):
     """Returns a 403 response if username is a protected system/service account
-    (see RAVEN_PROTECTED_USERNAMES), otherwise None."""
+    (see RAVEN_PROTECTED_USERNAMES) being acted on by someone other than itself,
+    otherwise None. A protected account can still manage itself -- e.g. "Admin"
+    is a super-admin nobody else can touch, but Admin can still edit Admin --
+    the caller-vs-self checks each route already has (can't delete/deactivate
+    yourself, etc.) still apply on top of this."""
+    if username == current_user.username:
+        return None
     if username in app.config.get("RAVEN_PROTECTED_USERNAMES", []):
         return (
             jsonify(
