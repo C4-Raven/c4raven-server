@@ -133,9 +133,10 @@ class DefaultConfig:
     )
 
     # Usernames of system/service accounts (e.g. the "Server" account used to send
-    # files) that admins can't deactivate, delete, change the role/groups/password of,
-    # or revoke site access from via the API, regardless of who's logged in.
-    RAVEN_PROTECTED_USERNAMES = os.getenv("RAVEN_PROTECTED_USERNAMES", "Server").split(",")
+    # files) and protected admin accounts (e.g. "Admin") that no one -- including
+    # other administrators -- can deactivate, delete, change the role/groups/password
+    # of, or revoke site access from via the API, regardless of who's logged in.
+    RAVEN_PROTECTED_USERNAMES = os.getenv("RAVEN_PROTECTED_USERNAMES", "Server,Admin").split(",")
 
     # Cloudflare Turnstile ("I'm human" checkbox) on the web login form.
     # Get a site key + secret key from the Cloudflare dashboard under
