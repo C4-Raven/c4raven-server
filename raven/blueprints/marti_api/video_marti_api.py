@@ -1,8 +1,10 @@
 import json
 import traceback
+import uuid
 from urllib.parse import urlparse
 from xml.etree.ElementTree import Element, fromstring, tostring
 
+import requests
 import sqlalchemy
 from bs4 import BeautifulSoup
 from flask import Blueprint
@@ -19,6 +21,7 @@ from raven.forms.MediaMTXPathConfig import MediaMTXPathConfig
 from raven.functions import iso8601_string_from_datetime
 from raven.models.EUD import EUD
 from raven.models.user import User
+from raven.models.VideoRecording import VideoRecording
 from raven.models.VideoStream import VideoStream
 
 video_marti_api = Blueprint("video_marti_api", __name__)
@@ -29,8 +32,10 @@ def video():
     if request.method == "POST":
         soup = BeautifulSoup(request.data, "xml")
         video_connections = soup.find("videoConnections")
+        if not video_connections or not video_connections.find("path"):
+            return jsonify({"success": False, "error": gettext("Invalid video connection")}), 400
 
-        path = video_connections.find("path").text
+        path = video_connections.find("path").text or ""
         if path.startswith("/"):
             path = path[1:]
 
@@ -151,6 +156,16 @@ def get_videos():
             break
 
     user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("User %(username)s not found", username=username),
+                }
+            ),
+            401,
+        )
     videos = db.session.execute(db.select(VideoStream)).scalars()
 
     video_connections = {"videoConnections": []}
@@ -163,25 +178,65 @@ def get_videos():
 @video_marti_api.route("/Marti/api/video", methods=["POST"])
 def add_video():
     cert = verify_client_cert()
+    if not cert:
+        return jsonify({"success": False, "error": gettext("Invalid Certificate")}), 400
     username = None
     for a in cert.get_subject().get_components():
         if a[0].decode("UTF-8") == "CN":
             username = a[1].decode("UTF-8")
             break
 
-    videos = request.json
+    videos = request.json or {}
 
-    for video in videos["videoConnections"]:
-        feeds = video.get("feeds")
+    for video in videos.get("videoConnections") or []:
+        for feed in video.get("feeds") or []:
+            source = feed.get("url") or ""
+            alias = feed.get("alias") or video.get("alias") or ""
+            feed_uid = feed.get("uuid") or video.get("uuid")
 
-        for feed in feeds:
-            data = ImmutableMultiDict({"path": feed["alias"], "source": feed["url"]})
-            mediamtx_config = MediaMTXPathConfig(formdata=data, csrf_enabled=False)
+            # Clients re-post the list they were given (carrying the uuid we
+            # issued), so resolve by uid first and only then treat the alias
+            # as a new MediaMTX path. Previously every POST was a blind INSERT
+            # keyed on the alias, so re-posting an existing feed 500'd on the
+            # primary key and nothing was ever updated.
+            video_stream = None
+            if feed_uid:
+                video_stream = (
+                    db.session.execute(db.select(VideoStream).filter_by(uid=feed_uid))
+                    .scalars()
+                    .first()
+                )
+            if not video_stream and alias:
+                video_stream = (
+                    db.session.execute(db.select(VideoStream).filter_by(path=alias.lstrip("/")))
+                    .scalars()
+                    .first()
+                )
 
+            if video_stream:
+                if alias:
+                    video_stream.alias = alias
+                db.session.commit()
+                continue
+
+            path = alias.lstrip("/")
+            if not path:
+                continue
+
+            data = ImmutableMultiDict({"path": path, "source": source})
+            mediamtx_config = MediaMTXPathConfig(formdata=data, csrf_enabled=False).serialize()
+            # MediaMTX rejects sourceOnDemand without a source (a feed the
+            # client intends to publish into rather than have us pull)
+            if not source:
+                mediamtx_config["sourceOnDemand"] = False
+
+            scheme = urlparse(source).scheme
             video_stream = VideoStream()
-            video_stream.path = feed["alias"]
-            video_stream.uid = video["uuid"]
-            video_stream.mediamtx_settings = json.dumps(mediamtx_config.serialize())
+            video_stream.path = path
+            video_stream.alias = alias
+            video_stream.uid = feed_uid or str(uuid.uuid4())
+            video_stream.protocol = "hls" if scheme in ("http", "https") else (scheme or "rtsp")
+            video_stream.mediamtx_settings = json.dumps(mediamtx_config)
             video_stream.username = username
             video_stream.rover_port = -1
             video_stream.ignore_embedded_klv = False
@@ -191,6 +246,26 @@ def add_video():
             video_stream.generate_xml(urlparse(request.url_root).hostname)
             db.session.add(video_stream)
             db.session.commit()
+
+            # Register the path with MediaMTX now. Previously the row was only
+            # written to the database and MediaMTX learned of it on its next
+            # restart (the "startup" webhook), so a client-added feed couldn't
+            # be watched through the server until then.
+            try:
+                r = requests.post(
+                    "{}/v3/config/paths/add/{}".format(
+                        app.config.get("RAVEN_MEDIAMTX_API_ADDRESS"), path
+                    ),
+                    json=mediamtx_config,
+                )
+                if r.status_code != 200:
+                    logger.error(
+                        "Failed to add path {} to mediamtx. Status code {} {}".format(
+                            path, r.status_code, r.text
+                        )
+                    )
+            except requests.exceptions.RequestException:
+                logger.error(traceback.format_exc())
 
     return "", 200
 
@@ -204,7 +279,7 @@ def get_video(uid):
             username = a[1].decode("UTF-8")
             break
 
-    video = db.session.query(VideoStream).filter_by(uid=uid).scalar()
+    video = db.session.execute(db.select(VideoStream).filter_by(uid=uid)).scalars().first()
     if not video:
         return jsonify({"success": False, "error": gettext("Video not found")}), 404
     user = db.session.execute(db.session.query(User).filter_by(username=username)).first()
@@ -224,7 +299,14 @@ def get_video(uid):
 
 @video_marti_api.route("/Marti/api/video/<uid>", methods=["DELETE"])
 def delete_video(uid):
-    video_stream = db.session.execute(db.session.query(VideoStream).filter_by(uid=uid))
+    cert = verify_client_cert()
+    if not cert:
+        return jsonify({"success": False, "error": gettext("Invalid Certificate")}), 400
+
+    # The old code tested the raw Result object for truthiness (always True)
+    # and then indexed it, so a real uid raised TypeError (500) and an unknown
+    # uid never reached the 404 branch.
+    video_stream = db.session.execute(db.select(VideoStream).filter_by(uid=uid)).scalars().first()
     if not video_stream:
         return (
             jsonify(
@@ -236,7 +318,23 @@ def delete_video(uid):
             404,
         )
 
-    video_stream = video_stream[0]
+    try:
+        requests.delete(
+            "{}/v3/config/paths/delete/{}".format(
+                app.config.get("RAVEN_MEDIAMTX_API_ADDRESS"), video_stream.path
+            )
+        )
+    except requests.exceptions.RequestException:
+        logger.error(traceback.format_exc())
+
+    # video_recordings.path -> video_streams.path has no cascade, so the
+    # recording rows have to go first or this raises a ForeignKeyViolation.
+    # The files themselves are deliberately left on disk: this is a TAK
+    # client removing a feed from its list, not an admin purging recordings.
+    for recording in db.session.execute(
+        db.select(VideoRecording).filter_by(path=video_stream.path)
+    ).scalars():
+        db.session.delete(recording)
 
     db.session.delete(video_stream)
     db.session.commit()

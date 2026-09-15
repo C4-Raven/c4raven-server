@@ -20,7 +20,11 @@ class VideoStream(db.Model):
     protocol: Mapped[str] = mapped_column(String(255), default="rtsp")
     port: Mapped[int] = mapped_column(Integer, default=8554)
     network_timeout: Mapped[int] = mapped_column(Integer, default=10000)
-    uid: Mapped[str] = mapped_column(String(255), nullable=True, default=str(uuid.uuid4()))
+    # Callable default: a bare str(uuid.uuid4()) is evaluated once at import,
+    # so every row that relied on the column default shared the same uid.
+    uid: Mapped[str] = mapped_column(
+        String(255), nullable=True, default=lambda: str(uuid.uuid4())
+    )
     buffer_time: Mapped[int] = mapped_column(Integer, nullable=True)
     rover_port: Mapped[int] = mapped_column(Integer, nullable=True)
     rtsp_reliable: Mapped[int] = mapped_column(Integer, nullable=True, default=1)
@@ -98,36 +102,57 @@ class VideoStream(db.Model):
             }
 
     def to_marti_json(self, user):
+        # /Marti/api/video is only reachable through nginx's client-cert TLS
+        # port, whose /Marti location doesn't forward X-Forwarded-Proto, so
+        # request.url_root is http://host:80/ here even though the client is
+        # on TLS. The HLS proxy lives on the web UI's TLS port, so build the
+        # stream URL as https against the host the client connected with
+        # (keeping a forwarded port only when nginx actually passed one)
+        # instead of echoing the request's bogus scheme/port -- previously
+        # this was http://host:80/hls/..., which only worked because nginx
+        # 301'd it to https and the client's player happened to follow.
         url = urlparse(request.url_root)
-        protocol = url.scheme
         hostname = url.hostname
-        port = url.port
-        if not port and protocol == "https":
-            port = 443
-        elif not port and protocol == "http":
-            port = 80
+        if url.scheme == "https" and url.port and url.port != 443:
+            hostname = f"{hostname}:{url.port}"
+        stream_url = f"https://{hostname}/hls/{self.path}/index.m3u8"
 
-        video_uuid = str(uuid.uuid4())
+        # Must be stable across calls: TAK clients key their synced feed list
+        # on this uuid and fetch/delete via /Marti/api/video/<uuid>, which
+        # looks the row up by VideoStream.uid. A fresh uuid4() on every
+        # request (the previous behaviour) made each poll look like a brand
+        # new feed and made the per-uid endpoints 404 for the very uuid the
+        # client had just been handed.
+        video_uuid = self.uid or str(uuid.uuid4())
+
+        # Numeric feed settings go out as strings (TAK Server's own Feed
+        # shape, which TAKX/WinTAK parse), but never as the Python repr of
+        # None -- "None" isn't a number and a strict deserializer rejects the
+        # whole feed list on it. -1 is TAK's "use the client default".
+        buffer_time = self.buffer_time if self.buffer_time is not None else -1
+        rover_port = self.rover_port if self.rover_port is not None else -1
+        network_timeout = self.network_timeout if self.network_timeout is not None else 10000
+        rtsp_reliable = self.rtsp_reliable if self.rtsp_reliable is not None else 1
 
         return {
             "active": True,
-            "alias": self.path,
+            "alias": self.alias or self.path,
             "thumbnail": "",
             "classification": "",
             "feeds": [
                 {
                     "uuid": video_uuid,
                     "active": True,
-                    "alias": self.path,
-                    "url": f"{protocol}://{hostname}:{port}/hls/{self.path}/index.m3u8?jwt={user.get_auth_token()}",
+                    "alias": self.alias or self.path,
+                    "url": f"{stream_url}?jwt={user.get_auth_token()}",
                     "order": 0,
                     "macAddress": self.preferred_mac_address,
-                    "roverPort": str(self.rover_port),
-                    "ignoreEmbeddedKLV": str(self.ignore_embedded_klv),
-                    "source": f"{protocol}://{hostname}:{port}/hls/{self.path}/index.m3u8",
-                    "networkTimeout": str(self.network_timeout),
-                    "bufferTime": str(self.buffer_time),
-                    "rtspReliable": str(self.rtsp_reliable),
+                    "roverPort": str(rover_port),
+                    "ignoreEmbeddedKLV": "true" if self.ignore_embedded_klv else "false",
+                    "source": stream_url,
+                    "networkTimeout": str(network_timeout),
+                    "bufferTime": str(buffer_time),
+                    "rtspReliable": str(rtsp_reliable),
                     "thumbnail": "",
                     "classification": "",
                     "latitude": "",
@@ -153,7 +178,9 @@ class VideoStream(db.Model):
         SubElement(feed, "address").text = hostname
         SubElement(feed, "port").text = str(self.port) if self.port else "8554"
         SubElement(feed, "roverPort").text = str(self.rover_port)
-        SubElement(feed, "ignoreEmbeddedKLV").text = self.ignore_embedded_klv
+        # .text must be a string: a bool True made ElementTree's tostring()
+        # raise "cannot serialize True (type bool)".
+        SubElement(feed, "ignoreEmbeddedKLV").text = "true" if self.ignore_embedded_klv else "false"
         SubElement(feed, "preferredMacAddress").text = self.preferred_mac_address
         SubElement(feed, "preferredInterfaceAddress").text = self.preferred_interface_address
         SubElement(feed, "path").text = self.path if self.path else self.alias
