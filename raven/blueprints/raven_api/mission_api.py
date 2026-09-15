@@ -39,7 +39,7 @@ from raven.models.GroupUser import GroupUser
 from raven.models.Mission import Mission
 from raven.models.MissionChange import MissionChange
 from raven.models.MissionContentMission import MissionContentMission
-from raven.models.MissionInvitation import MissionInvitation
+from raven.models.MissionInvitation import InvitationTypeEnum, MissionInvitation
 from raven.models.MissionLogEntry import MissionLogEntry
 from raven.models.MissionRole import MissionRole
 from raven.models.MissionUID import MissionUID
@@ -166,6 +166,10 @@ def create_edit_mission():
                 )
 
         mission.password_protected = mission.password != "" and mission.password is not None
+        # Data Sync clients (ATAK/WinTAK/TAKX) only act on missions and invitations whose tool is
+        # "public"; the web UI's create dialog submits tool as "" so default it here.
+        mission.tool = mission.tool or "public"
+        mission.default_role = mission.default_role or MissionRole.MISSION_SUBSCRIBER
 
         role = MissionRole()
         role.clientUid = creator_uid
@@ -179,6 +183,7 @@ def create_edit_mission():
         invitation.client_uid = creator_uid
         invitation.creator_uid = creator_uid
         invitation.role = MissionRole.MISSION_OWNER
+        invitation.type = InvitationTypeEnum.clientUid
 
         try:
             db.session.add(mission)
@@ -209,7 +214,7 @@ def create_edit_mission():
         channel = rabbit_connection.channel()
 
         for group in groups or []:
-            logger.error(f"Publishing to {group.group.name}.{group.direction}")
+            logger.debug(f"Publishing to {group.group.name}.{group.direction}")
             channel.basic_publish(
                 exchange="groups",
                 routing_key=f"{group.group.name}.{group.direction}",
@@ -221,12 +226,15 @@ def create_edit_mission():
                 ),
             )
 
+        # EudHandler.on_message() drops messages whose "uid" equals the receiving EUD's own uid (echo
+        # suppression), so the owner invite must be stamped with the server's node id -- stamping it
+        # with creator_uid meant the creator's own device never received its owner invitation.
         channel.basic_publish(
             exchange="dms",
             routing_key=creator_uid,
             body=json.dumps(
                 {
-                    "uid": creator_uid,
+                    "uid": app.config.get("RAVEN_NODE_ID"),
                     "cot": tostring(generate_invitation_cot(mission, creator_uid)).decode("utf-8"),
                 }
             ),
@@ -281,6 +289,9 @@ def create_edit_mission():
             setattr(mission, key, request.json.get(key))
         else:
             return jsonify({"success": False, "error": gettext("Invalid property: %(key)s")}), 400
+
+    # Same as on create: an edit from the web UI can blank the tool, which hides the mission from Data Sync clients
+    mission.tool = mission.tool or "public"
 
     db.session.execute(
         sqlalchemy.update(Mission)
@@ -414,4 +425,4 @@ def invite_eud():
     ):
         return jsonify({"success": False, "error": gettext("Invalid password")}), 401
 
-    return invite(mission_name, "clientuid", eud_uid)
+    return invite(mission_name=mission_name, invitation_type="clientuid", invitee=eud_uid)

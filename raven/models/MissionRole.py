@@ -23,6 +23,9 @@ class MissionRole(db.Model):
     MISSION_OWNER = "MISSION_OWNER"
     MISSION_SUBSCRIBER = "MISSION_SUBSCRIBER"
     MISSION_READ_ONLY = "MISSION_READ_ONLY"
+    # TAK Server's wire name for the read-only role (com.bbn.marti.sync.model.MissionRole.Role). Rows keep
+    # storing MISSION_READ_ONLY; this is what clients send in ?role= and expect back in "type".
+    MISSION_READONLY_SUBSCRIBER = "MISSION_READONLY_SUBSCRIBER"
 
     OWNER_ROLE = {"type": MISSION_OWNER, "permissions": []}
     OWNER_ROLE["permissions"].append(MISSION_MANAGE_FEEDS)
@@ -38,7 +41,7 @@ class MissionRole(db.Model):
     SUBSCRIBER_ROLE["permissions"].append(MISSION_READ)
     SUBSCRIBER_ROLE["permissions"].append(MISSION_WRITE)
 
-    READ_ONLY_ROLE = {"type": MISSION_READ_ONLY, "permissions": []}
+    READ_ONLY_ROLE = {"type": MISSION_READONLY_SUBSCRIBER, "permissions": []}
     READ_ONLY_ROLE["permissions"].append(MISSION_READ)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -49,6 +52,13 @@ class MissionRole(db.Model):
     mission_name: Mapped[str] = mapped_column(String(255), ForeignKey("missions.name"), nullable=True)
     mission_guid: Mapped[str] = mapped_column(String(255), nullable=True)
     mission = relationship("Mission", back_populates="roles", uselist=False)
+
+    @classmethod
+    def normalize_role_type(cls, role_type: str | None) -> str | None:
+        """Map TAK Server's MISSION_READONLY_SUBSCRIBER onto the value stored in role_type/default_role"""
+        if role_type == cls.MISSION_READONLY_SUBSCRIBER:
+            return cls.MISSION_READ_ONLY
+        return role_type or None
 
     def serialize(self):
         return {

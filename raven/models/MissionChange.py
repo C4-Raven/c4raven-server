@@ -136,8 +136,10 @@ def generate_mission_change_cot(
         detail,
         "mission",
         {
-            "type": str(mission_change.change_type),
-            "tool": "public",
+            # TAK Server stamps every change notification type="CHANGE" (like CREATE/DELETE/INVITE on the
+            # other t-x-m-* messages); the ADD_CONTENT/REMOVE_CONTENT kind is the <type> element below
+            "type": Mission.CHANGE,
+            "tool": mission.tool or "public",
             "name": mission_name,
             "guid": str(mission.guid),
             "authorUid": str(mission_change.creator_uid),
