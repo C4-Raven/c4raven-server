@@ -2410,8 +2410,15 @@ def add_content(mission_name):
                 db.session.commit()
             except sqlalchemy.exc.IntegrityError:
                 db.session.rollback()
+                # uid is MissionUID's sole primary key (not scoped per-mission), so
+                # the row this collided with may belong to a different mission than
+                # the one we're syncing to -- serialize() doesn't include
+                # mission_name, so pass it explicitly or this update would silently
+                # leave the row attached to its original mission.
                 db.session.execute(
-                    update(MissionUID).where(MissionUID.uid == item_uid).values(**mission_uid.serialize())
+                    update(MissionUID)
+                    .where(MissionUID.uid == item_uid)
+                    .values(**mission_uid.serialize(), mission_name=mission_name)
                 )
                 db.session.commit()
 
@@ -2430,18 +2437,24 @@ def add_content(mission_name):
                 # marker's own details.
                 mission_change.content_uid = content.uid
                 mission_change.mission_name = mission_name
-                mission_change.timestamp = datetime.datetime.now(datetime.timezone.utc)
                 mission_change.creator_uid = creator_uid
-                mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)
                 db.session.add(mission_change)
-                db.session.commit()
-
-                change_cot = generate_mission_change_cot(
-                    mission_name, mission, mission_change, mission_uid=mission_uid
-                )
-                _publish_mission_change_cot(mission_name, change_cot, creator_uid)
             else:
                 mission_change = mission_change[0]
+
+            # Always refresh the timestamp and republish, even on a re-upload of
+            # the same UID (e.g. the marker was moved and Data Sync re-synced it)
+            # -- otherwise only the very first upload for a given UID would ever
+            # notify subscribers, and every later position/detail update would
+            # update the DB row silently with no change/CoT broadcast.
+            mission_change.timestamp = datetime.datetime.now(datetime.timezone.utc)
+            mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)
+            db.session.commit()
+
+            change_cot = generate_mission_change_cot(
+                mission_name, mission, mission_change, mission_uid=mission_uid
+            )
+            _publish_mission_change_cot(mission_name, change_cot, creator_uid)
 
             changes_json.append(mission_change.to_json())
     else:
