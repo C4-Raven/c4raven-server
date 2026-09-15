@@ -1,4 +1,5 @@
 import json
+import re
 import traceback
 import uuid
 from urllib.parse import urlparse
@@ -27,6 +28,15 @@ from raven.models.VideoStream import VideoStream
 video_marti_api = Blueprint("video_marti_api", __name__)
 
 
+def mediamtx_path_from_alias(alias):
+    """Derive a MediaMTX path name from a feed alias.
+
+    MediaMTX only accepts alphanumerics, '_', '-', '.', '~' and '/' in path
+    names; anything else (e.g. the spaces in "Front Gate Cam") becomes '_'.
+    """
+    return re.sub(r"[^A-Za-z0-9_\-.~/]", "_", (alias or "").lstrip("/"))
+
+
 @video_marti_api.route("/Marti/vcm", methods=["GET", "POST"])
 def video():
     if request.method == "POST":
@@ -40,31 +50,44 @@ def video():
             path = path[1:]
 
         if video_connections:
+
+            def tag_text(name):
+                # Optional tags (buffer, timeout, rtspReliable, preferred*) are
+                # not always sent; a missing tag used to AttributeError on .text
+                tag = video_connections.find(name)
+                return tag.text if tag is not None else None
+
+            def apply_fields(v):
+                v.protocol = tag_text("protocol") or "rtsp"
+                v.alias = tag_text("alias")
+                v.uid = tag_text("uid") or v.uid or str(uuid.uuid4())
+                v.port = tag_text("port") or 8554
+                v.rover_port = tag_text("roverPort")
+                v.ignore_embedded_klv = (tag_text("ignoreEmbeddedKLV") or "").lower() == "true"
+                v.preferred_mac_address = tag_text("preferredMacAddress")
+                v.preferred_interface_address = tag_text("preferredInterfaceAddress")
+                # Always the stripped path: assigning the raw "/cam" here used
+                # to rewrite the primary key of the existing "cam" row.
+                v.path = path
+                v.buffer_time = tag_text("buffer")
+                v.network_timeout = tag_text("timeout") or 10000
+                v.rtsp_reliable = tag_text("rtspReliable")
+
+            def sanitized_feed_xml():
+                # Discard username and password for security. Replace only the
+                # tag's text node; replacing the tag itself dropped <address>.
+                feed = soup.find("feed")
+                address_tag = feed.find("address") if feed is not None else None
+                if address_tag is not None and address_tag.string is not None:
+                    address_tag.string.replace_with(address_tag.string.split("@")[-1])
+                return str(feed)
+
             v = VideoStream()
-            v.protocol = video_connections.find("protocol").text
-            v.alias = video_connections.find("alias").text
-            v.uid = video_connections.find("uid").text
-            v.port = video_connections.find("port").text
-            v.rover_port = video_connections.find("roverPort").text
-            v.ignore_embedded_klv = (
-                video_connections.find("ignoreEmbeddedKLV").text.lower() == "true"
-            )
-            v.preferred_mac_address = video_connections.find("preferredMacAddress").text
-            v.preferred_interface_address = video_connections.find("preferredInterfaceAddress").text
-            v.path = path
-            v.buffer_time = video_connections.find("buffer").text
-            v.network_timeout = video_connections.find("timeout").text
-            v.rtsp_reliable = video_connections.find("rtspReliable").text
+            apply_fields(v)
             path_config = MediaMTXPathConfig(None).serialize()
             path_config["sourceOnDemand"] = False
             v.mediamtx_settings = json.dumps(path_config)
-
-            # Discard username and password for security
-            feed = soup.find("feed")
-            address = feed.find("address").text
-            feed.find("address").string.replace_with(address.split("@")[-1])
-
-            v.xml = str(feed)
+            v.xml = sanitized_feed_xml()
 
             with app.app_context():
                 try:
@@ -74,29 +97,10 @@ def video():
                 except sqlalchemy.exc.IntegrityError as e:
                     db.session.rollback()
                     v = db.session.execute(
-                        db.select(VideoStream).filter_by(path=v.path)
+                        db.select(VideoStream).filter_by(path=path)
                     ).scalar_one()
-                    v.protocol = video_connections.find("protocol").text
-                    v.alias = video_connections.find("alias").text
-                    v.uid = video_connections.find("uid").text
-                    v.port = video_connections.find("port").text
-                    v.rover_port = video_connections.find("roverPort").text
-                    v.ignore_embedded_klv = (
-                        video_connections.find("ignoreEmbeddedKLV").text.lower() == "true"
-                    )
-                    v.preferred_mac_address = video_connections.find("preferredMacAddress").text
-                    v.preferred_interface_address = video_connections.find(
-                        "preferredInterfaceAddress"
-                    ).text
-                    v.path = video_connections.find("path").text
-                    v.buffer_time = video_connections.find("buffer").text
-                    v.network_timeout = video_connections.find("timeout").text
-                    v.rtsp_reliable = video_connections.find("rtspReliable").text
-                    feed = soup.find("feed")
-                    address = feed.find("address").text
-                    feed.find("address").replace_with(address.split("@")[-1])
-
-                    v.xml = str(feed)
+                    apply_fields(v)
+                    v.xml = sanitized_feed_xml()
 
                     db.session.commit()
                     logger.debug("Updated video")
@@ -186,6 +190,20 @@ def add_video():
             username = a[1].decode("UTF-8")
             break
 
+    # video_streams.username is a FK to user.username and a cert CN isn't
+    # guaranteed to be a user, so an unknown CN used to IntegrityError (500)
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("User %(username)s not found", username=username),
+                }
+            ),
+            401,
+        )
+
     videos = request.json or {}
 
     for video in videos.get("videoConnections") or []:
@@ -206,9 +224,13 @@ def add_video():
                     .scalars()
                     .first()
                 )
-            if not video_stream and alias:
+            # MediaMTX path names may only contain alphanumerics, _ - . ~ and /,
+            # so "Front Gate Cam" becomes "Front_Gate_Cam"; the original alias
+            # is kept in video_stream.alias.
+            path = mediamtx_path_from_alias(alias)
+            if not video_stream and path:
                 video_stream = (
-                    db.session.execute(db.select(VideoStream).filter_by(path=alias.lstrip("/")))
+                    db.session.execute(db.select(VideoStream).filter_by(path=path))
                     .scalars()
                     .first()
                 )
@@ -219,7 +241,6 @@ def add_video():
                 db.session.commit()
                 continue
 
-            path = alias.lstrip("/")
             if not path:
                 continue
 
@@ -273,6 +294,8 @@ def add_video():
 @video_marti_api.route("/Marti/api/video/<uid>")
 def get_video(uid):
     cert = verify_client_cert()
+    if not cert:
+        return jsonify({"success": False, "error": gettext("Invalid Certificate")}), 400
     username = None
     for a in cert.get_subject().get_components():
         if a[0].decode("UTF-8") == "CN":

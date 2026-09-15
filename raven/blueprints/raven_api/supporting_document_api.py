@@ -1,4 +1,5 @@
 import os
+import traceback
 import uuid
 from datetime import datetime, timezone
 
@@ -41,21 +42,51 @@ def upload_supporting_document():
 
     file = request.files["file"]
     filename = secure_filename(file.filename)
-    stored_filename = f"{uuid.uuid4().hex}_{filename}"
 
-    file.save(os.path.join(supporting_documents_folder(), stored_filename))
-    size = os.path.getsize(os.path.join(supporting_documents_folder(), stored_filename))
+    # secure_filename() strips everything non-ASCII, so "文档.pdf" or "..."
+    # come back as "" (or "pdf" once the leading dot goes too); fall back to
+    # a generic stem plus whatever extension survives sanitising.
+    orig_stem, orig_ext = os.path.splitext(file.filename)
+    if not secure_filename(orig_stem):
+        safe_ext = secure_filename(orig_ext.lstrip("."))
+        filename = "document" + (f".{safe_ext}" if safe_ext else "")
+
+    # stored_filename is a 255-char column and a filesystem name: the
+    # uuid hex prefix takes 33 chars, so cap the sanitized name to fit
+    # while keeping the extension.
+    prefix = f"{uuid.uuid4().hex}_"
+    max_name_len = 255 - len(prefix)
+    if len(filename) > max_name_len:
+        stem, ext = os.path.splitext(filename)
+        ext = ext[:max_name_len]
+        filename = stem[: max_name_len - len(ext)] + ext
+    stored_filename = prefix + filename
+
+    mime_type = (file.mimetype or "")[:255] or None
+
+    stored_path = os.path.join(supporting_documents_folder(), stored_filename)
+    file.save(stored_path)
+    size = os.path.getsize(stored_path)
 
     document = SupportingDocument(
         filename=filename,
         stored_filename=stored_filename,
-        mime_type=file.mimetype,
+        mime_type=mime_type,
         size=size,
         uploaded_at=datetime.now(timezone.utc),
         uploaded_by_id=current_user.id,
     )
-    db.session.add(document)
-    db.session.commit()
+    try:
+        db.session.add(document)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logger.error(traceback.format_exc())
+        try:
+            os.remove(stored_path)
+        except OSError:
+            pass
+        return jsonify({"success": False, "error": gettext("Failed to save document")}), 500
 
     return jsonify({"success": True, "document": document.to_json()})
 

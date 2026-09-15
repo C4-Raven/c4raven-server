@@ -67,6 +67,10 @@ from raven.models.VideoStream import VideoStream
 from raven.models.WebAuthn import WebAuthn
 from raven.models.ZMIST import ZMIST
 from raven.models.CITrap import CITrap
+
+# Needed so User.supporting_documents (a string relationship target) resolves in this
+# standalone process -- see the same import in eud_handler.py.
+from raven.models.SupportingDocument import SupportingDocument  # noqa: F401
 from raven.proto import atak_pb2
 
 
@@ -1086,6 +1090,27 @@ class CoTController:
                 elif color and "value" in color.attrs:
                     cot_color = color.attrs["value"]
 
+                # Mirror parse_point(): a missing <point>, a point without lat/lon, or the
+                # 9999999.0 no-fix sentinel means "no location from this event" -- pass None
+                # so upsert_mission_uid_and_change() leaves any known position alone.
+                latitude = None
+                longitude = None
+                if point:
+                    lat_attr = point.attrs.get("lat")
+                    lon_attr = point.attrs.get("lon")
+                    if (
+                        lat_attr is not None
+                        and lon_attr is not None
+                        and not str(lat_attr).startswith("999")
+                        and not str(lon_attr).startswith("999")
+                    ):
+                        try:
+                            latitude = float(lat_attr)
+                            longitude = float(lon_attr)
+                        except (TypeError, ValueError):
+                            latitude = None
+                            longitude = None
+
                 _mission_uid, _mission_change, change_cot = upsert_mission_uid_and_change(
                     mission_name,
                     mission,
@@ -1093,11 +1118,11 @@ class CoTController:
                     uid,
                     datetime_from_iso8601_string(event.attrs["start"]),
                     cot_type=event.attrs.get("type"),
-                    callsign=contact.attrs["callsign"] if contact and "callsign" in contact.attrs else None,
+                    callsign=contact.attrs.get("callsign") if contact else None,
                     iconset_path=iconset_path,
                     color=cot_color,
-                    latitude=float(point.attrs["lat"]) if point else None,
-                    longitude=float(point.attrs["lon"]) if point else None,
+                    latitude=latitude,
+                    longitude=longitude,
                 )
 
                 self.rabbit_channel.basic_publish(

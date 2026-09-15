@@ -25,6 +25,7 @@ class User(db.Model, fsqla.FsUserMixin):
     certificate = relationship("Certificate", back_populates="user")
     mission_invitations = relationship("MissionInvitation", back_populates="user")
     tokens = relationship("Token", back_populates="user")
+    supporting_documents = relationship("SupportingDocument", back_populates="uploaded_by")
     groups = relationship(
         "Group",
         secondary="groups_users",

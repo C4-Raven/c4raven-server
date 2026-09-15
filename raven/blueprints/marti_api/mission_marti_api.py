@@ -100,24 +100,32 @@ def verify_token() -> dict | bool:
 def verify_itak_certificate(
     mission_name: str = None, mission_guid: str = None
 ) -> MissionRole | flask.Response:
+    # Every error path must return a real flask.Response (not a (jsonify, status) tuple): all callers
+    # test `isinstance(result, flask.Response)`, so a tuple would silently grant access.
     # Get the username from the client cert forwarded by nginx
     cert = verify_client_cert()
+    if not cert:
+        return flask.make_response(
+            jsonify({"success": False, "error": "Missing or invalid client certificate"}), 401
+        )
     username = cert.get_subject().commonName
 
     # Check that the user exists
     user = db.session.execute(db.session.query(User).filter_by(username=username)).first()
     if not user:
-        return jsonify({"success": False, "error": f"User {username} not found"}), 401
+        return flask.make_response(
+            jsonify({"success": False, "error": f"User {username} not found"}), 401
+        )
     user = user[0]
 
     # Check that the user owns this EUD
     eud_uid = request.args.get("creatorUid")
     if not eud_uid:
-        return jsonify({"success": False, "error": "Invalid creatorUid"}), 400
+        return flask.make_response(jsonify({"success": False, "error": "Invalid creatorUid"}), 400)
 
     eud = db.session.execute(db.session.query(EUD).filter_by(uid=eud_uid, user_id=user.id)).first()
     if not eud:
-        return (
+        return flask.make_response(
             jsonify({"success": False, "error": f"User {username} does not own EUD {eud_uid}"}),
             401,
         )
@@ -126,7 +134,7 @@ def verify_itak_certificate(
     if not mission_name and mission_guid:
         mission = db.session.execute(db.session.query(Mission).filter_by(guid=mission_guid)).first()
         if not mission:
-            return (
+            return flask.make_response(
                 jsonify({"success": False, "error": f"Invalid mission GUID: {mission_guid}"}),
                 404,
             )
@@ -140,18 +148,23 @@ def verify_itak_certificate(
     ).first()
     if not mission_role:
         logger.error(f"Access denied {username} {mission_name} {eud_uid}")
-        return jsonify({"success": False, "error": "Access Denied"}), 403
+        return flask.make_response(jsonify({"success": False, "error": "Access Denied"}), 403)
 
-    return mission_role
+    return mission_role[0]
 
 
-def check_permission(mission_name: str = None, mission_guid: str = None):
+def check_permission(mission_name: str = None, mission_guid: str = None) -> bool | flask.Response:
+    """Returns True when access is granted, otherwise a flask.Response (never a tuple: callers use isinstance)."""
     if "iTAK" not in request.user_agent.string:
         token = verify_token()
-        if mission_name and (not token or token["MISSION_NAME"] != mission_name):
-            return jsonify({"success": False, "error": "Missing or invalid token"}), 401
-        elif mission_guid and (not token or token["MISSION_GUID"] != mission_guid):
-            return jsonify({"success": False, "error": "Missing or invalid token"}), 401
+        if mission_name and (not token or token.get("MISSION_NAME") != mission_name):
+            return flask.make_response(
+                jsonify({"success": False, "error": "Missing or invalid token"}), 401
+            )
+        elif mission_guid and (not token or token.get("MISSION_GUID") != mission_guid):
+            return flask.make_response(
+                jsonify({"success": False, "error": "Missing or invalid token"}), 401
+            )
     else:
         cert_is_valid = verify_itak_certificate(mission_name, mission_guid)
         if isinstance(cert_is_valid, flask.Response):
@@ -465,10 +478,37 @@ def get_missions():
 @mission_marti_api.route("/Marti/api/missions/all/invitations", methods=["GET"])
 @mission_marti_api.route("/Marti/api/missions/invitations", methods=["GET"])
 def all_invitations(mission_name: str | None = None, mission_guid: str | None = None):
+    # Each returned invitation carries a mission token minted for clientUid, so the caller must
+    # hold a client cert for the user that owns that EUD (or be an administrator).
+    cert = verify_client_cert()
+    if not cert:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Missions are only supported on SSL connections"),
+                }
+            ),
+            400,
+        )
+    username = cert.get_subject().commonName
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        logger.warning(f"/Marti/api/missions/.../invitations: no account matches certificate CN {username!r}")
+        return jsonify({"success": False, "error": gettext("Unknown user certificate")}), 403
+
     if "clientUid" in request.args and request.args.get("clientUid"):
         client_uid = bleach.clean(request.args.get("clientUid"))
     else:
         client_uid = None
+
+    if client_uid and not user.has_role("administrator"):
+        eud = db.session.execute(
+            db.session.query(EUD).filter_by(uid=client_uid, user_id=user.id)
+        ).first()
+        if not eud:
+            logger.warning(f"{username} asked for the invitations/tokens of EUD {client_uid} it does not own")
+            return jsonify({"success": False, "error": gettext("Access Denied")}), 403
 
     response = {
         "version": "3",
@@ -592,6 +632,8 @@ def put_mission(mission_name: str):
                     db.session.query(Group).filter_by(name=group_name)
                 ).scalar()
                 if not group:
+                    # Drop the GroupMission rows already staged for this request
+                    db.session.rollback()
                     return (
                         jsonify(
                             {
@@ -603,16 +645,28 @@ def put_mission(mission_name: str):
                         ),
                         404,
                     )
-                group_mission = GroupMission()
-                group_mission.group_id = group.id
-                group_mission.mission_name = mission.name
-                db.session.add(group_mission)
+                # (group_id, mission_name) is the composite PK; updating an existing mission must not
+                # re-insert it or the IntegrityError below would turn the whole request into a no-op
+                existing = db.session.execute(
+                    db.session.query(GroupMission).filter_by(
+                        group_id=group.id, mission_name=mission.name
+                    )
+                ).first()
+                if not existing:
+                    group_mission = GroupMission()
+                    group_mission.group_id = group.id
+                    group_mission.mission_name = mission.name
+                    db.session.add(group_mission)
         else:
             # Default to the __ANON__ group
-            group_mission = GroupMission()
-            group_mission.group_id = 1
-            group_mission.mission_name = mission.name
-            db.session.add(group_mission)
+            existing = db.session.execute(
+                db.session.query(GroupMission).filter_by(group_id=1, mission_name=mission.name)
+            ).first()
+            if not existing:
+                group_mission = GroupMission()
+                group_mission.group_id = 1
+                group_mission.mission_name = mission.name
+                db.session.add(group_mission)
 
         db.session.commit()
 
@@ -911,55 +965,37 @@ def set_password(mission_name: str = None, mission_guid: str = None):
     return jsonify({"success": True})
 
 
-@mission_marti_api.route(
-    "/Marti/api/missions/<mission_name>/invite/<invitation_type>/<invitee>", methods=["PUT"]
-)
-@mission_marti_api.route(
-    "/Marti/api/missions/guid/<mission_guid>/invite/<invitation_type>/<invitee>", methods=["PUT"]
-)
-def invite(
-    mission_name: str = None,
-    invitation_type: str = None,
-    invitee: str = None,
-    mission_guid: str = None,
-):
-    # Keep mission_name first: the web UI's /api/missions/invite calls this in-process as
-    # invite(mission_name, "clientuid", eud_uid). Flask passes URL variables as keywords, so the
-    # by-guid route is unaffected by the order.
-    mission_name = _resolve_mission_name(mission_name, mission_guid)
-    if not mission_name:
-        return _mission_not_found(mission_guid)
-    permission_granted = check_permission(mission_name)
-    if isinstance(permission_granted, flask.Response):
-        return permission_granted
-
-    mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
-    if not mission:
+def _build_invitation(
+    mission: Mission,
+    invitation_type: str,
+    invitee: str,
+    role: str | None,
+    creator_uid: str | None,
+) -> MissionInvitation | tuple:
+    """
+    Validate the invitee and return an un-persisted MissionInvitation, or a (jsonify, status)
+    error tuple. Shared by the PUT .../invite/<type>/<invitee> route, the POST .../invite JSON
+    route and the web UI so every path validates the same way (the FK columns on
+    mission_invitations would otherwise raise IntegrityError -> 500 for unknown invitees).
+    """
+    if not invitation_type or not invitee:
         return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": gettext(
-                        "Mission %(mission_name)s not found", mission_name=mission_name
-                    ),
-                }
-            ),
-            404,
+            jsonify({"success": False, "error": gettext("Invalid invitation type")}),
+            400,
         )
-
-    mission = mission[0]
+    invitation_type = invitation_type.lower()
 
     invitation = MissionInvitation()
-    invitation.mission_name = mission_name
-    invitation.creator_uid = request.args.get("creatorUid") or mission.creator_uid
+    invitation.mission_name = mission.name
+    invitation.creator_uid = creator_uid or mission.creator_uid
     # TAK Server lets the inviter choose the granted role (?role=MISSION_OWNER|MISSION_SUBSCRIBER|MISSION_READONLY_SUBSCRIBER)
     invitation.role = (
-        MissionRole.normalize_role_type(request.args.get("role"))
+        MissionRole.normalize_role_type(role)
         or mission.default_role
         or MissionRole.MISSION_SUBSCRIBER
     )
 
-    if invitation_type.lower() == "clientuid":
+    if invitation_type == "clientuid":
         eud = db.session.execute(db.session.query(EUD).filter_by(uid=invitee)).first()
         if not eud:
             return (
@@ -989,9 +1025,9 @@ def invite(
         invitation.callsign = invitee
         invitation.type = InvitationTypeEnum.callsign
 
-    elif invitation_type.lower() == "username":
-        eud = db.session.execute(db.session.query(User).filter_by(username=invitee)).first()
-        if not eud:
+    elif invitation_type == "username":
+        user = db.session.execute(db.session.query(User).filter_by(username=invitee)).first()
+        if not user:
             return (
                 jsonify(
                     {
@@ -1007,7 +1043,7 @@ def invite(
         invitation.type = InvitationTypeEnum.userName
 
     elif invitation_type == "group":
-        group = db.session.execute(db.session.query(Group).filter_by(group_name=invitee)).first()
+        group = db.session.execute(db.session.query(Group).filter_by(name=invitee)).first()
         if not group:
             return (
                 jsonify(
@@ -1036,18 +1072,27 @@ def invite(
         invitation.team_name = invitee
         invitation.type = InvitationTypeEnum.team
 
-    db.session.add(invitation)
-    db.session.commit()
+    else:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "Invalid invitation type: %(invitation_type)s",
+                        invitation_type=invitation_type,
+                    ),
+                }
+            ),
+            400,
+        )
 
-    event = generate_invitation_cot(mission, invitee, role=invitation.role)
-    rabbit_credentials = pika.PlainCredentials(
-        app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
-    )
-    rabbit_host = app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS")
-    rabbit_connection = pika.BlockingConnection(
-        pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
-    )
-    channel = rabbit_connection.channel()
+    return invitation
+
+
+def _publish_invitation(channel, mission: Mission, invitee: str, role: str) -> None:
+    """Send the t-x-m-i invitation CoT to the invitee over the dms exchange on an open channel."""
+    event = generate_invitation_cot(mission, invitee, role=role)
+    logger.debug(f"Sending invitation to mission {mission.name} to {invitee}")
     channel.basic_publish(
         exchange="dms",
         routing_key=invitee,
@@ -1055,8 +1100,99 @@ def invite(
             {"uid": app.config.get("RAVEN_NODE_ID"), "cot": tostring(event).decode("utf-8")}
         ),
     )
-    channel.close()
-    rabbit_connection.close()
+
+
+def _create_invitation(
+    mission: Mission,
+    invitation_type: str,
+    invitee: str,
+    role: str | None = None,
+    creator_uid: str | None = None,
+    channel=None,
+) -> tuple | None:
+    """
+    Validate the invitee, persist the MissionInvitation and publish the invitation CoT.
+    Returns None on success or a (jsonify, status) error tuple. Callers must already have
+    checked that the requester may invite to this mission (mission token / iTAK cert / web login).
+    Pass an open pika channel to publish on it (bulk invites); otherwise a connection is opened
+    and closed here.
+    """
+    invitation = _build_invitation(mission, invitation_type, invitee, role, creator_uid)
+    if not isinstance(invitation, MissionInvitation):
+        return invitation
+
+    try:
+        db.session.add(invitation)
+        db.session.commit()
+    except sqlalchemy.exc.IntegrityError as e:
+        db.session.rollback()
+        logger.error(f"Failed to save invitation for {invitee} to mission {mission.name}: {e}")
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Invalid invitee: %(invitee)s", invitee=invitee),
+                }
+            ),
+            400,
+        )
+
+    if channel is not None:
+        _publish_invitation(channel, mission, invitee, invitation.role)
+        return None
+
+    rabbit_credentials = pika.PlainCredentials(
+        app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
+    )
+    rabbit_host = app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS")
+    rabbit_connection = pika.BlockingConnection(
+        pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
+    )
+    try:
+        own_channel = rabbit_connection.channel()
+        _publish_invitation(own_channel, mission, invitee, invitation.role)
+        own_channel.close()
+    finally:
+        rabbit_connection.close()
+
+    return None
+
+
+@mission_marti_api.route(
+    "/Marti/api/missions/<mission_name>/invite/<invitation_type>/<invitee>", methods=["PUT"]
+)
+@mission_marti_api.route(
+    "/Marti/api/missions/guid/<mission_guid>/invite/<invitation_type>/<invitee>", methods=["PUT"]
+)
+def invite(
+    mission_name: str = None,
+    invitation_type: str = None,
+    invitee: str = None,
+    mission_guid: str = None,
+):
+    """PUT .../invite/<type>/<invitee>: TAK Server's single-invitee form. The web UI does not call
+    this route function; it uses _create_invitation() directly because it has no mission token."""
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
+    permission_granted = check_permission(mission_name)
+    if isinstance(permission_granted, flask.Response):
+        return permission_granted
+
+    mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
+    if not mission:
+        return _mission_not_found(mission_name)
+    mission = mission[0]
+
+    error = _create_invitation(
+        mission,
+        invitation_type,
+        invitee,
+        role=request.args.get("role"),
+        creator_uid=request.args.get("creatorUid"),
+    )
+    if error is not None:
+        return error
 
     return "", 200
 
@@ -1142,7 +1278,12 @@ def invite_json(mission_name: str = None, mission_guid: str = None):
         return permission_granted
 
     creator_uid = request.args.get("creatorUid")
-    invitees = request.json
+    invitees = request.get_json(silent=True)
+    if not isinstance(invitees, list):
+        return (
+            jsonify({"success": False, "error": gettext("Expected a JSON list of invitations")}),
+            400,
+        )
 
     mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
     if not mission:
@@ -1166,78 +1307,42 @@ def invite_json(mission_name: str = None, mission_guid: str = None):
     rabbit_connection = pika.BlockingConnection(
         pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
     )
-    channel = rabbit_connection.channel()
+    try:
+        channel = rabbit_connection.channel()
 
-    for invitee in invitees:
-        invitation = MissionInvitation()
-        invitation.mission_name = mission_name
-        if not invitee.get("type") or not invitee.get("invitee"):
-            channel.close()
-            rabbit_connection.close()
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": gettext("invitation found without type or invitee attribute"),
-                    }
-                ),
-                400,
+        for invitee in invitees:
+            if not isinstance(invitee, dict) or not invitee.get("type") or not invitee.get("invitee"):
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": gettext("invitation found without type or invitee attribute"),
+                        }
+                    ),
+                    400,
+                )
+            # TAK Server treats a missing role as "grant the mission's default role"
+            role = invitee.get("role")
+            if isinstance(role, dict):
+                role = role.get("type")
+
+            # Shared with PUT .../invite/<type>/<invitee>: validates that the EUD/user/group/team
+            # exists (the FK columns would otherwise raise IntegrityError -> 500), commits and
+            # publishes the invitation CoT on our channel.
+            error = _create_invitation(
+                mission,
+                invitee["type"],
+                invitee["invitee"],
+                role=role,
+                creator_uid=creator_uid,
+                channel=channel,
             )
-        # TAK Server treats a missing role as "grant the mission's default role"
-        role = invitee.get("role")
-        invitation.role = (
-            MissionRole.normalize_role_type(role.get("type") if isinstance(role, dict) else role)
-            or mission.default_role
-            or MissionRole.MISSION_SUBSCRIBER
-        )
-        invitation.creator_uid = creator_uid or mission.creator_uid
+            if error is not None:
+                return error
 
-        if invitee["type"].lower() == "clientuid":
-            invitation.client_uid = invitee["invitee"]
-            invitation.type = InvitationTypeEnum.clientUid
-        elif invitee["type"].lower() == "callsign":
-            invitation.callsign = invitee["invitee"]
-            invitation.type = InvitationTypeEnum.callsign
-        elif invitee["type"].lower() == "username":
-            invitation.username = invitee["invitee"]
-            invitation.type = InvitationTypeEnum.userName
-        elif invitee["type"].lower() == "group":
-            invitation.group_name = invitee["invitee"]
-            invitation.type = InvitationTypeEnum.group
-        elif invitee["type"].lower() == "team":
-            invitation.team_name = invitee["invitee"]
-            invitation.type = InvitationTypeEnum.team
-        else:
-            channel.close()
-            rabbit_connection.close()
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": gettext(
-                            "Invalid invitation type: %(invitation)s", invitation=invitee["type"]
-                        ),
-                    }
-                ),
-                400,
-            )
-
-        db.session.add(invitation)
-        db.session.commit()
-
-        event = generate_invitation_cot(mission, invitee["invitee"], role=invitation.role)
-
-        logger.debug(f"Sending invitation to mission {mission_name} to {invitee['invitee']}")
-        channel.basic_publish(
-            exchange="dms",
-            routing_key=invitee["invitee"],
-            body=json.dumps(
-                {"uid": app.config["RAVEN_NODE_ID"], "cot": tostring(event).decode("utf-8")}
-            ),
-        )
-
-    channel.close()
-    rabbit_connection.close()
+        channel.close()
+    finally:
+        rabbit_connection.close()
 
     return jsonify({"success": True})
 
@@ -1321,7 +1426,7 @@ def change_eud_role(mission_name: str = None, mission_guid: str = None):
 
     role = db.session.execute(
         db.session.query(MissionRole).filter_by(
-            clientUid=eud_uid, role_type=MissionRole.MISSION_OWNER
+            clientUid=eud_uid, mission_name=mission_name, role_type=MissionRole.MISSION_OWNER
         )
     ).first()
     if not role:
@@ -1355,8 +1460,11 @@ def change_eud_role(mission_name: str = None, mission_guid: str = None):
         MissionRole.MISSION_SUBSCRIBER,
         MissionRole.MISSION_READ_ONLY,
     ]:
-        return jsonify(
-            {"success": False, "error": gettext("Invalid role: %(new_role)s", new_role=new_role)}
+        return (
+            jsonify(
+                {"success": False, "error": gettext("Invalid role: %(new_role)s", new_role=new_role)}
+            ),
+            400,
         )
     elif new_role:
         r = db.session.execute(
@@ -1731,6 +1839,25 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
 @mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/subscription", methods=["GET"])
 def get_subscription(mission_name: str = None, mission_guid: str = None):
     """TAK Server's 'am I subscribed?' lookup: GET .../subscription?uid=<clientUid> -> the subscription or 404"""
+    # The response contains a freshly minted mission token for `uid`, so the caller must prove it is
+    # that EUD: a valid client cert whose user owns the EUD (or is an admin), or a mission token for it.
+    cert = verify_client_cert()
+    if not cert:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Missions are only supported on SSL connections"),
+                }
+            ),
+            400,
+        )
+    username = cert.get_subject().commonName
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        logger.warning(f"GET /Marti/api/missions/.../subscription: no account matches certificate CN {username!r}")
+        return jsonify({"success": False, "error": gettext("Unknown user certificate")}), 403
+
     mission_name = _resolve_mission_name(mission_name, mission_guid)
     if not mission_name:
         return _mission_not_found(mission_guid)
@@ -1743,6 +1870,21 @@ def get_subscription(mission_name: str = None, mission_guid: str = None):
     role = None
     if uid:
         uid = bleach.clean(uid)
+
+        token = verify_token()
+        token_matches = bool(
+            token
+            and token.get("sub") == uid
+            and (token.get("MISSION_NAME") == mission.name or token.get("MISSION_GUID") == mission.guid)
+        )
+        owns_eud = (
+            db.session.execute(db.session.query(EUD).filter_by(uid=uid, user_id=user.id)).first()
+            is not None
+        )
+        if not (token_matches or owns_eud or user.has_role("administrator")):
+            logger.warning(f"{username} asked for the mission subscription/token of EUD {uid} it does not own")
+            return jsonify({"success": False, "error": gettext("Access Denied")}), 403
+
         role = db.session.execute(
             db.session.query(MissionRole).filter_by(mission_name=mission_name, clientUid=uid)
         ).first()
@@ -1804,10 +1946,21 @@ def mission_unsubscribe(mission_name: str = None, mission_guid: str = None):
     rabbit_connection = pika.BlockingConnection(
         pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
     )
-    channel = rabbit_connection.channel()
-    channel.queue_unbind(queue=eud_uid, exchange="missions", routing_key=f"missions.{mission_name}")
-    channel.close()
-    rabbit_connection.close()
+    try:
+        channel = rabbit_connection.channel()
+        try:
+            channel.queue_unbind(
+                queue=eud_uid, exchange="missions", routing_key=f"missions.{mission_name}"
+            )
+            channel.close()
+        except pika.exceptions.AMQPError as e:
+            # The EUD's queue is gone (it disconnected and the queue auto-deleted), so there is
+            # nothing left to unbind. The role row is already deleted, so this is still a success.
+            logger.warning(
+                f"Could not unbind queue {eud_uid} from missions.{mission_name} while unsubscribing: {e}"
+            )
+    finally:
+        rabbit_connection.close()
 
     return "", 200
 
@@ -1989,7 +2142,14 @@ def upload_content():
 
         return jsonify(response)
 
-    filename, extension = os.path.splitext(secure_filename(file_name))
+    # Never trust the client-supplied name on disk or in the DB: ?name=../../x would otherwise be
+    # written outside the missions folder. data_package_marti_api reads files back by
+    # content.filename, so the DB and on-disk names must both be the sanitised one.
+    safe_name = secure_filename(file_name)
+    filename, extension = os.path.splitext(safe_name)
+    if not filename:
+        safe_name = f"{uuid.uuid4().hex}{extension}"
+        filename, _ = os.path.splitext(safe_name)
 
     if extension.replace(".", "").lower() not in app.config.get("ALLOWED_EXTENSIONS"):
         logger.error(f"{extension} is not an allowed file extension")
@@ -2015,7 +2175,7 @@ def upload_content():
     if not content:
         content = MissionContent()
         content.mime_type = request.content_type
-        content.filename = file_name
+        content.filename = safe_name
         content.submission_time = datetime.datetime.now(datetime.timezone.utc)
         content.submitter = username or "anonymous"
         content.uid = str(uuid.uuid4())
@@ -2034,14 +2194,14 @@ def upload_content():
 
         # For some reason iTAK changes file names to a timestamp with the format YYYYMMDD-HHMMSS so the file name in the DB
         # needs to be updated
-        if file_name != content.filename:
-            content.filename = file_name
+        if safe_name != content.filename:
+            content.filename = safe_name
             db.session.add(content)
             db.session.commit()
 
     # Save the content even if it exists in the database in case it was deleted from disk
     os.makedirs(os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "missions"), exist_ok=True)
-    with open(os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "missions", file_name), "wb") as f:
+    with open(os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "missions", safe_name), "wb") as f:
         f.write(file)
         f.flush()
 
@@ -2100,32 +2260,23 @@ def add_content_keywords(content_hash: str):
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/contents", methods=["PUT"])
 def mission_contents(mission_name: str | None = None, mission_guid: str | None = None):
     """Associates content/files with a mission"""
+    # Resolve the GUID form to a name *before* the permission check: check_permission(None)
+    # grants access, and every row written below is keyed on mission_name.
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        logger.error(f"No such mission: {mission_guid}")
+        return _mission_not_found(mission_guid)
+
     permission_granted = check_permission(mission_name)
     if isinstance(permission_granted, flask.Response):
         return permission_granted
 
     body = request.json
 
-    mission = None
-
-    if mission_name:
-        mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
-    elif mission_guid:
-        mission = db.session.execute(db.session.query(Mission).filter_by(guid=mission_guid)).first()
+    mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
     if not mission:
-        logger.error(f"No such mission: {mission_name} - {mission_guid}")
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": gettext(
-                        "No such mission: %(mission_name)s",
-                        mission_name=mission_name or mission_guid,
-                    ),
-                }
-            ),
-            404,
-        )
+        logger.error(f"No such mission: {mission_name}")
+        return _mission_not_found(mission_name)
 
     mission = mission[0]
 
@@ -2183,20 +2334,8 @@ def mission_contents(mission_name: str | None = None, mission_guid: str | None =
                     mission_name, mission, mission_change, content=content
                 )
 
-                body = json.dumps(
-                    {"uid": mission_change.creator_uid, "cot": tostring(event).decode("utf-8")}
-                )
-                rabbit_credentials = pika.PlainCredentials(
-                    app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
-                )
-                rabbit_host = app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS")
-                rabbit_connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
-                )
-                channel = rabbit_connection.channel()
-                channel.basic_publish("missions", routing_key=f"missions.{mission_name}", body=body)
-                channel.close()
-                rabbit_connection.close()
+                # Must not rebind `body` here -- the "uids" branch below still reads request.json from it.
+                _publish_mission_change_cot(mission_name, event, mission_change.creator_uid)
 
     if "uids" in body:
         creator_uid = request.args.get("creatorUid")
@@ -2210,8 +2349,10 @@ def mission_contents(mission_name: str | None = None, mission_guid: str | None =
             if cot:
                 cot = cot[0]
                 cot_type = cot.type
-                latitude = cot.point.latitude
-                longitude = cot.point.longitude
+                # CoT rows written by _store_mission_package_cot have no Point relationship
+                if cot.point is not None:
+                    latitude = cot.point.latitude
+                    longitude = cot.point.longitude
 
                 event = BeautifulSoup(cot.xml, "xml")
                 usericon = event.find("usericon")
@@ -2261,6 +2402,13 @@ def mission_contents(mission_name: str | None = None, mission_guid: str | None =
 @mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/contents", methods=["DELETE"])
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/contents", methods=["DELETE"])
 def delete_content(mission_name: str | None = None, mission_guid: str | None = None):
+    # Resolve the GUID form first so the token's MISSION_NAME is compared against the real name
+    # (otherwise every /guid/<guid>/contents caller 401s) and the rows below get a non-NULL name.
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        logger.error(f"Mission not found: {mission_guid}")
+        return _mission_not_found(mission_guid)
+
     if "iTAK" not in request.user_agent.string:
         token = verify_token()
         if not token or token["MISSION_NAME"] != mission_name:
@@ -2273,29 +2421,10 @@ def delete_content(mission_name: str | None = None, mission_guid: str | None = N
             return role
         eud_uid = role.clientUid
 
-    query = db.session.query(Mission)
-    mission = None
-
-    if mission_name:
-        mission = db.session.execute(query.filter_by(name=mission_name)).first()
-    elif mission_guid:
-        mission = db.session.query(Mission).filter_by(guid=mission_guid).first()
-
+    mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
     if not mission:
-        logger.error(f"Mission not found: {mission_name} - {mission_guid}")
-
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": gettext(
-                        "Mission %(mission_name)s not found",
-                        mission_name=mission_name or mission_guid,
-                    ),
-                }
-            ),
-            404,
-        )
+        logger.error(f"Mission not found: {mission_name}")
+        return _mission_not_found(mission_name)
     mission = mission[0]
 
     mission_change = MissionChange()
@@ -2384,7 +2513,7 @@ def delete_content(mission_name: str | None = None, mission_guid: str | None = N
             )
 
     event = generate_mission_change_cot(
-        eud_uid,
+        mission_name,
         mission,
         mission_change,
         content=content,
@@ -2420,8 +2549,16 @@ def delete_content(mission_name: str | None = None, mission_guid: str | None = N
     )
 
 
-def _publish_mission_change_cot(mission_name: str, event: Element, creator_uid: str | None):
-    rabbit_body = json.dumps({"uid": creator_uid, "cot": tostring(event).decode("utf-8")})
+def _publish_mission_change_cot(mission_name: str, event: Element, creator_uid: str | None = None):
+    # The body "uid" is the *sender* as far as EudHandler.on_message is concerned: it drops any
+    # message whose uid matches the receiving EUD (echo suppression). Stamping the creator here
+    # meant the uploading device never got its own change notification, so use the server node id
+    # like the CoT-parser path and delete_content do. `creator_uid` is kept only so existing call
+    # sites keep working.
+    del creator_uid
+    rabbit_body = json.dumps(
+        {"uid": app.config.get("RAVEN_NODE_ID"), "cot": tostring(event).decode("utf-8")}
+    )
     rabbit_credentials = pika.PlainCredentials(
         app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
     )
@@ -2579,7 +2716,14 @@ def add_content(mission_name):
         content.filename = f"{mission_name}_{uuid.uuid4().hex}.zip"
         content.submission_time = datetime.datetime.now(datetime.timezone.utc)
         content.submitter = username or "anonymous"
-        content.uid = manifest_uid or str(uuid.uuid4())
+        # MissionContent.uid is unique; a re-exported package keeps its manifest uid but has new
+        # bytes (new hash), so reusing the manifest uid would raise IntegrityError on insert.
+        content_uid = manifest_uid
+        if content_uid and db.session.execute(
+            db.session.query(MissionContent).filter_by(uid=content_uid)
+        ).first():
+            content_uid = None
+        content.uid = content_uid or str(uuid.uuid4())
         content.creator_uid = creator_uid
         content.size = request.content_length
         content.expiration = -1

@@ -315,6 +315,9 @@ def add_update_stream():
         if not video and request.path.endswith("add"):
             video = VideoStream()
             video.path = path
+            # Set before generate_xml() so the <uid> in the stored XML matches
+            # the row (the column default only fires at INSERT time).
+            video.uid = str(uuid.uuid4())
             video.username = current_user.username
             video.mediamtx_settings = json.dumps(form.serialize())
             video.rover_port = -1
