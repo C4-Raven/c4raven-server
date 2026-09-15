@@ -5,8 +5,8 @@ description = "A server for ATAK, WinTAK, and iTAK"
 authors = ["C4 Raven <support@c4raven.net>"]
 readme = "README.md"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/C4Raven/c4raven-server"
-documentation = "https://github.com/C4Raven/c4raven-server"
+repository = "https://github.com/C4-Raven/c4raven-server"
+documentation = "https://github.com/C4-Raven/c4raven-server"
 include = [{path = "raven/translations/**/*", format = ["sdist", "wheel"]}]
 
 [tool.poetry.dependencies]
