@@ -34,7 +34,11 @@ from raven.models.Group import Group
 from raven.models.GroupMission import GroupMission
 from raven.models.GroupUser import GroupUser
 from raven.models.Mission import Mission
-from raven.models.MissionChange import MissionChange, generate_mission_change_cot
+from raven.models.MissionChange import (
+    MissionChange,
+    generate_mission_change_cot,
+    upsert_mission_uid_and_change,
+)
 from raven.models.MissionContent import MissionContent
 from raven.models.MissionContentMission import MissionContentMission
 from raven.models.MissionInvitation import InvitationTypeEnum, MissionInvitation
@@ -1953,92 +1957,52 @@ def mission_contents(mission_name: str | None = None, mission_guid: str | None =
                 rabbit_connection.close()
 
     if "uids" in body:
+        creator_uid = request.args.get("creatorUid")
         for uid in body["uids"]:
-            mission_uid = db.session.execute(
-                db.session.query(MissionUID).filter_by(uid=uid, mission_name=mission_name)
-            ).first()
-            if mission_uid:
-                mission_uid = mission_uid[0]
-            else:
-                mission_uid = MissionUID()
-
-            mission_uid.uid = uid
-            mission_uid.timestamp = datetime.datetime.now(datetime.timezone.utc)
-            mission_uid.creator_uid = request.args.get("creatorUid")
-            mission_uid.mission_name = mission_name
-
             # iTAK sucks. It sends a CoT and makes a PUT to this endpoint rather than including a <dest mission="mission_name">
             # tag in the CoT. This endpoint finishes before the CoT can be parsed and inserted into the database. In that case
             # we insert a row in the mission_uids table with the CoT data missing, and the parse_point method in
             # cot_controller will fill it in
             cot = db.session.execute(db.session.query(CoT).filter_by(uid=uid)).first()
+            cot_type = latitude = longitude = iconset_path = color = callsign = None
             if cot:
                 cot = cot[0]
-
-                mission_uid.cot_type = cot.type
-                mission_uid.latitude = cot.point.latitude
-                mission_uid.longitude = cot.point.longitude
+                cot_type = cot.type
+                latitude = cot.point.latitude
+                longitude = cot.point.longitude
 
                 event = BeautifulSoup(cot.xml, "xml")
                 usericon = event.find("usericon")
-                color = event.find("color")
+                color_tag = event.find("color")
                 contact = event.find("contact")
 
                 if usericon and "iconsetpath" in usericon.attrs:
-                    mission_uid.iconset_path = usericon.attrs["iconsetpath"]
+                    iconset_path = usericon.attrs["iconsetpath"]
                 elif usericon and "iconsetPath" in usericon.attrs:
-                    mission_uid.iconset_path = usericon.attrs["iconsetPath"]
+                    iconset_path = usericon.attrs["iconsetPath"]
 
-                if color and "argb" in color.attrs:
-                    mission_uid.color = color.attrs["argb"]
-                if color and "value" in color.attrs:
-                    mission_uid.color = color.attrs["value"]
+                if color_tag and "argb" in color_tag.attrs:
+                    color = color_tag.attrs["argb"]
+                elif color_tag and "value" in color_tag.attrs:
+                    color = color_tag.attrs["value"]
 
                 if contact and "callsign" in contact.attrs:
-                    mission_uid.callsign = contact.attrs["callsign"]
+                    callsign = contact.attrs["callsign"]
 
-            try:
-                db.session.add(mission_uid)
-                db.session.commit()
-            except sqlalchemy.exc.IntegrityError:
-                db.session.rollback()
-                db.session.execute(
-                    update(MissionUID)
-                    .where(MissionUID.uid == mission_uid.uid)
-                    .values(**mission_uid.serialize())
-                )
-                db.session.commit()
-
-            mission_change = MissionChange()
-            mission_change.isFederatedChange = False
-            mission_change.change_type = MissionChange.ADD_CONTENT
-            mission_change.mission_name = mission_name
-            mission_change.timestamp = datetime.datetime.now(datetime.timezone.utc)
-            mission_change.creator_uid = request.args.get("creatorUid")
-            mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)
-            mission_change.mission_uid = uid
-
-            db.session.execute(insert(MissionChange).values(**mission_change.serialize()))
-
-            event = generate_mission_change_cot(
-                mission_name, mission, mission_change, mission_uid=mission_uid
+            _mission_uid, _mission_change, change_cot = upsert_mission_uid_and_change(
+                mission_name,
+                mission,
+                uid,
+                creator_uid,
+                datetime.datetime.now(datetime.timezone.utc),
+                cot_type=cot_type,
+                callsign=callsign,
+                iconset_path=iconset_path,
+                color=color,
+                latitude=latitude,
+                longitude=longitude,
             )
-
-            body = json.dumps(
-                {"uid": mission_change.creator_uid, "cot": tostring(event).decode("utf-8")}
-            )
-            logger.warning(f"{body}")
-            rabbit_credentials = pika.PlainCredentials(
-                app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
-            )
-            rabbit_host = app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS")
-            rabbit_connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
-            )
-            channel = rabbit_connection.channel()
-            channel.basic_publish("missions", routing_key=f"missions.{mission_name}", body=body)
-            channel.close()
-            rabbit_connection.close()
+            _publish_mission_change_cot(mission_name, change_cot, creator_uid)
 
     db.session.commit()
 
@@ -2374,88 +2338,47 @@ def add_content(mission_name):
         # for a CoT already sitting in our own database -- just sourced
         # from the zip's embedded CoT XML instead of a DB row.
         for item_uid, event in map_items:
-            mission_uid = db.session.execute(
-                db.session.query(MissionUID).filter_by(uid=item_uid, mission_name=mission_name)
-            ).first()
-            mission_uid = mission_uid[0] if mission_uid else MissionUID()
-            mission_uid.uid = item_uid
-            mission_uid.mission_name = mission_name
-            mission_uid.timestamp = datetime.datetime.now(datetime.timezone.utc)
-            mission_uid.creator_uid = creator_uid
-            mission_uid.cot_type = event.attrs.get("type")
-
             point = event.find("point")
-            if point:
-                mission_uid.latitude = float(point.attrs["lat"])
-                mission_uid.longitude = float(point.attrs["lon"])
-
             usericon = event.find("usericon")
+            iconset_path = None
             if usericon and "iconsetpath" in usericon.attrs:
-                mission_uid.iconset_path = usericon.attrs["iconsetpath"]
+                iconset_path = usericon.attrs["iconsetpath"]
             elif usericon and "iconsetPath" in usericon.attrs:
-                mission_uid.iconset_path = usericon.attrs["iconsetPath"]
+                iconset_path = usericon.attrs["iconsetPath"]
 
-            color = event.find("color")
-            if color and "argb" in color.attrs:
-                mission_uid.color = color.attrs["argb"]
-            if color and "value" in color.attrs:
-                mission_uid.color = color.attrs["value"]
+            color_tag = event.find("color")
+            color = None
+            if color_tag and "argb" in color_tag.attrs:
+                color = color_tag.attrs["argb"]
+            elif color_tag and "value" in color_tag.attrs:
+                color = color_tag.attrs["value"]
 
             contact = event.find("contact")
-            if contact and "callsign" in contact.attrs:
-                mission_uid.callsign = contact.attrs["callsign"]
 
-            try:
-                db.session.add(mission_uid)
-                db.session.commit()
-            except sqlalchemy.exc.IntegrityError:
-                db.session.rollback()
-                # uid is MissionUID's sole primary key (not scoped per-mission), so
-                # the row this collided with may belong to a different mission than
-                # the one we're syncing to -- serialize() doesn't include
-                # mission_name, so pass it explicitly or this update would silently
-                # leave the row attached to its original mission.
-                db.session.execute(
-                    update(MissionUID)
-                    .where(MissionUID.uid == item_uid)
-                    .values(**mission_uid.serialize(), mission_name=mission_name)
-                )
-                db.session.commit()
-
-            mission_change = db.session.execute(
-                db.session.query(MissionChange).filter_by(mission_uid=item_uid, mission_name=mission_name)
-            ).first()
-            if not mission_change:
-                mission_change = MissionChange()
-                mission_change.isFederatedChange = False
-                mission_change.change_type = MissionChange.ADD_CONTENT
-                mission_change.mission_uid = item_uid
-                # This came in as a mission package upload (map item wrapped in
-                # a zip), not a bare UID association -- link the uploaded
-                # content too so the response's contentResource (hash, size,
-                # filename) reflects what was actually received, not just the
-                # marker's own details.
-                mission_change.content_uid = content.uid
-                mission_change.mission_name = mission_name
-                mission_change.creator_uid = creator_uid
-                db.session.add(mission_change)
-            else:
-                mission_change = mission_change[0]
-
-            # Always refresh the timestamp and republish, even on a re-upload of
-            # the same UID (e.g. the marker was moved and Data Sync re-synced it)
-            # -- otherwise only the very first upload for a given UID would ever
-            # notify subscribers, and every later position/detail update would
-            # update the DB row silently with no change/CoT broadcast.
-            mission_change.timestamp = datetime.datetime.now(datetime.timezone.utc)
-            mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)
-            db.session.commit()
-
-            change_cot = generate_mission_change_cot(
-                mission_name, mission, mission_change, mission_uid=mission_uid
+            mission_uid, mission_change, change_cot = upsert_mission_uid_and_change(
+                mission_name,
+                mission,
+                item_uid,
+                creator_uid,
+                datetime.datetime.now(datetime.timezone.utc),
+                cot_type=event.attrs.get("type"),
+                callsign=contact.attrs["callsign"] if contact and "callsign" in contact.attrs else None,
+                iconset_path=iconset_path,
+                color=color,
+                latitude=float(point.attrs["lat"]) if point else None,
+                longitude=float(point.attrs["lon"]) if point else None,
             )
-            _publish_mission_change_cot(mission_name, change_cot, creator_uid)
 
+            # This came in as a mission package upload (map item wrapped in a
+            # zip), not a bare UID association -- link the uploaded content
+            # too so the response's contentResource (hash, size, filename)
+            # reflects what was actually received, not just the marker's own
+            # details.
+            if mission_change.content_uid != content.uid:
+                mission_change.content_uid = content.uid
+                db.session.commit()
+
+            _publish_mission_change_cot(mission_name, change_cot, creator_uid)
             changes_json.append(mission_change.to_json())
     else:
         # No manifest/map-items found (e.g. a plain file, not a marker

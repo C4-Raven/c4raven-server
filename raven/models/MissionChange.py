@@ -3,8 +3,9 @@ import uuid
 from dataclasses import dataclass
 from xml.etree.ElementTree import Element, SubElement
 
+import sqlalchemy.exc
 from bs4 import BeautifulSoup
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, update
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from raven.extensions import db, logger
@@ -215,3 +216,107 @@ def generate_mission_change_cot(
     SubElement(mission_change_element, "type").text = mission_change.change_type
 
     return event
+
+
+def upsert_mission_uid_and_change(
+    mission_name: str,
+    mission: Mission,
+    item_uid: str,
+    creator_uid: str | None,
+    timestamp: datetime.datetime,
+    cot_type: str | None = None,
+    callsign: str | None = None,
+    iconset_path: str | None = None,
+    color: str | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+) -> tuple[MissionUID, "MissionChange", Element]:
+    """Upserts a single (mission, item_uid) map-item and its change record.
+
+    This is the one place that turns "a marker was added/re-synced to a
+    mission" into MissionUID + MissionChange rows and a change CoT to
+    broadcast -- three call sites (add_content()'s and mission_contents()'s
+    map-item handling in the Marti API, and CoTController.generate_mission_change()
+    in the regular CoT ingestion path) each grew their own copy of this with
+    diverging bugs (a missing WHERE clause that clobbered the whole
+    mission_uids table, a fallback update that dropped mission_name and
+    silently reattached a uid to the wrong mission, and an unconditional
+    insert that piled up duplicate MissionChange rows for the same item on
+    every re-sync). This is the single, consistent version: exactly one
+    MissionUID and one MissionChange row per (mission_name, item_uid), and
+    both always get refreshed and a change CoT regenerated even when they
+    already existed -- a client re-syncing an item (it moved, its icon
+    changed) is expected to notify subscribers again, not go silent after
+    the first sighting.
+
+    A cot_type/callsign/iconset_path/color/latitude/longitude left as None
+    means "no new value from this call" and leaves the existing column
+    alone (this is what lets mission_contents() insert a bare uid before
+    its CoT has even arrived -- cot_parser's own parse_point fills these in
+    later) -- it does not clear a previously-known value.
+
+    Returns (mission_uid, mission_change, change_cot); publishing change_cot
+    is left to the caller, since cot_parser.py holds a long-lived RabbitMQ
+    channel while the Marti API opens a fresh connection per call.
+    """
+    mission_uid = db.session.execute(
+        db.session.query(MissionUID).filter_by(uid=item_uid, mission_name=mission_name)
+    ).first()
+    mission_uid = mission_uid[0] if mission_uid else MissionUID()
+    mission_uid.uid = item_uid
+    mission_uid.mission_name = mission_name
+    mission_uid.timestamp = timestamp
+    mission_uid.creator_uid = creator_uid
+    if cot_type is not None:
+        mission_uid.cot_type = cot_type
+    if callsign is not None:
+        mission_uid.callsign = callsign
+    if iconset_path is not None:
+        mission_uid.iconset_path = iconset_path
+    if color is not None:
+        mission_uid.color = color
+    if latitude is not None:
+        mission_uid.latitude = latitude
+    if longitude is not None:
+        mission_uid.longitude = longitude
+
+    try:
+        db.session.add(mission_uid)
+        db.session.commit()
+    except sqlalchemy.exc.IntegrityError:
+        # uid is MissionUID's sole primary key (not scoped per-mission), so
+        # this collision means the uid already exists -- possibly under a
+        # different mission. Reattaching it here (mission_name included
+        # explicitly, since serialize() doesn't carry it) matches "adding"
+        # an item that already belongs elsewhere: it moves to this mission.
+        db.session.rollback()
+        db.session.execute(
+            update(MissionUID)
+            .where(MissionUID.uid == item_uid)
+            .values(mission_name=mission_name, **mission_uid.serialize())
+        )
+        db.session.commit()
+
+    mission_change = db.session.execute(
+        db.session.query(MissionChange).filter_by(mission_uid=item_uid, mission_name=mission_name)
+    ).first()
+    if mission_change:
+        mission_change = mission_change[0]
+    else:
+        mission_change = MissionChange()
+        mission_change.isFederatedChange = False
+        mission_change.change_type = MissionChange.ADD_CONTENT
+        mission_change.mission_uid = item_uid
+        mission_change.mission_name = mission_name
+        db.session.add(mission_change)
+
+    mission_change.creator_uid = creator_uid
+    mission_change.timestamp = timestamp
+    mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)
+    db.session.commit()
+
+    change_cot = generate_mission_change_cot(
+        mission_name, mission, mission_change, mission_uid=mission_uid
+    )
+
+    return mission_uid, mission_change, change_cot
