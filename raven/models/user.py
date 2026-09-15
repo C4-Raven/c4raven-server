@@ -7,7 +7,13 @@ from sqlalchemy.orm import relationship
 from raven.extensions import db
 from raven.models.Group import Group
 
-# Leave this import here
+# Leave these imports here: they are the relationship targets User names as
+# strings below, and SQLAlchemy can only resolve those once the classes have
+# been imported into the registry. Importing them here (rather than relying
+# on whichever blueprint happens to import them) is what lets the standalone
+# processes -- eud_handler, cot_parser, fedhub_bridge -- configure the User
+# mapper at all.
+from raven.models.SupportingDocument import SupportingDocument  # noqa: F401
 from raven.models.Token import Token
 from raven.models.WebAuthn import WebAuthn
 
