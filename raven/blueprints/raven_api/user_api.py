@@ -423,6 +423,12 @@ def deactivate_user():
             400,
         )
 
+    if username == current_user.username:
+        return (
+            jsonify({"success": False, "error": gettext("You can't deactivate your own account")}),
+            400,
+        )
+
     protected_response = _protected_user_response(username)
     if protected_response:
         return protected_response
@@ -628,6 +634,12 @@ def set_user_role():
     if not username or not roles:
         return (
             jsonify({"success": False, "error": gettext("Please specify a username and roles")}),
+            400,
+        )
+
+    if username == current_user.username:
+        return (
+            jsonify({"success": False, "error": gettext("You can't change your own role")}),
             400,
         )
 
