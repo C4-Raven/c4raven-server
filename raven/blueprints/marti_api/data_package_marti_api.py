@@ -241,7 +241,9 @@ def data_package_metadata(file_hash):
     elif request.method == "GET":
         data_package = db.session.execute(
             db.select(DataPackage).filter_by(hash=file_hash)
-        ).scalar_one()
+        ).scalar_one_or_none()
+        if not data_package:
+            return "", 404
         return send_from_directory(
             app.config.get("UPLOAD_FOLDER"),
             data_package.hash + ".zip",
