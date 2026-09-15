@@ -79,6 +79,12 @@ class MissionChange(db.Model):
 
         if self.content_resource:
             json["contentResource"] = self.content_resource.to_json()["data"]
+            # Real TAK server clients (e.g. goatak's MissionChangeDTO) carry
+            # the content's hash as its own top-level field, not just nested
+            # inside contentResource -- a client verifying its upload landed
+            # intact would check this directly against the hash it computed
+            # before uploading.
+            json["contentHash"] = self.content_resource.hash
 
         if self.uid:
             json["details"] = self.uid.to_details_json()
