@@ -10,7 +10,7 @@ documentation = "https://github.com/C4-Raven/c4raven-server"
 include = [{path = "raven/translations/**/*", format = ["sdist", "wheel"]}]
 
 [tool.poetry.dependencies]
-adsbxcot = "6.0.4"
+adsbxcot = "7.0.0"
 androguard = "4.1.3"
 aiscot = "7.0.10"
 beautifulsoup4 = "4.14.2"
