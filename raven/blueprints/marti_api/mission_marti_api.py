@@ -2423,6 +2423,12 @@ def add_content(mission_name):
                 mission_change.isFederatedChange = False
                 mission_change.change_type = MissionChange.ADD_CONTENT
                 mission_change.mission_uid = item_uid
+                # This came in as a mission package upload (map item wrapped in
+                # a zip), not a bare UID association -- link the uploaded
+                # content too so the response's contentResource (hash, size,
+                # filename) reflects what was actually received, not just the
+                # marker's own details.
+                mission_change.content_uid = content.uid
                 mission_change.mission_name = mission_name
                 mission_change.timestamp = datetime.datetime.now(datetime.timezone.utc)
                 mission_change.creator_uid = creator_uid
@@ -2471,25 +2477,28 @@ def add_content(mission_name):
     # try to read Mission's array-typed "externalData" as MissionChange's
     # object-typed one and blow up with a Jackson MismatchedInputException.
     #
-    # Status matters here too: mission_subscribe() and create_log_entry()
-    # (the other two "create something" endpoints in this file, both
-    # confirmed working against real TAK clients via nginx's access log)
-    # both return 201, unconditionally, even when the thing being created
-    # already existed. This endpoint returned the Flask-default 200 --
-    # inconsistent with that established precedent, and with genuinely
-    # correct MissionChange/MissionUID data now going out, an HTTP-level
-    # mismatch a Feign-generated client validates is the remaining
-    # plausible cause of "incompatibilities" that isn't a JSON parse error.
-    return (
-        jsonify(
-            {
-                "version": "3",
-                "type": "MissionChange",
-                "data": changes_json,
-                "nodeId": app.config.get("RAVEN_NODE_ID"),
-            }
-        ),
-        201,
+    # goatak's server (a real, independently-built TAK-compatible
+    # implementation) registers this exact route with no explicit status
+    # code, i.e. a plain 200 -- unlike mission_subscribe()/create_log_entry(),
+    # this one isn't a 201. 201 was this endpoint's prior guess, not
+    # confirmed-working precedent like those two.
+    #
+    # goatak's handler also answers with *every* change on the mission, not
+    # just the one this upload just created (mirrors mission_changes()'s own
+    # GET .../changes, which already does the same full-list query) -- a
+    # client cross-checking its upload against "the changes" plural, not a
+    # single echoed record, would read a one-item list as incomplete.
+    all_changes = db.session.execute(
+        db.session.query(MissionChange).filter_by(mission_name=mission_name)
+    ).all()
+
+    return jsonify(
+        {
+            "version": "3",
+            "type": "MissionChange",
+            "data": [change[0].to_json() for change in all_changes],
+            "nodeId": app.config.get("RAVEN_NODE_ID"),
+        }
     )
 
 
