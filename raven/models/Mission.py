@@ -18,6 +18,7 @@ class Mission(db.Model):
     INVITE = "INVITE"
     DELETE = "DELETE"
     CREATE = "CREATE"
+    CHANGE = "CHANGE"
 
     name: Mapped[str] = mapped_column(String(255), primary_key=True)
     description: Mapped[str] = mapped_column(String(255), nullable=True)
@@ -140,11 +141,15 @@ class Mission(db.Model):
 
         return json
 
-    def to_marti_json(self):
+    def to_marti_json(self, logs: bool = False):
         return_value = self.to_json()
 
         return_value["groups"] = []
         for group in self.groups:
             return_value["groups"].append(group.name)
+
+        # TAK Server attaches the mission log when asked for it (GET ...?logs=true) and on subscription
+        if logs:
+            return_value["logs"] = [log.to_json() for log in self.mission_logs]
 
         return return_value

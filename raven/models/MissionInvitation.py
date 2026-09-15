@@ -51,7 +51,7 @@ class MissionInvitation(db.Model):
             "client_uid": self.client_uid,
             "callsign": self.callsign,
             "username": self.username,
-            "group_name": self.group,
+            "group_name": self.group_name,
             "team_name": self.team_name,
             "creator_uid": self.creator_uid,
             "role": self.role,
@@ -61,14 +61,27 @@ class MissionInvitation(db.Model):
     def to_json(self):
         return self.serialize()
 
-    def to_marti_json(self):
+    def to_marti_json(self, token: str = ""):
+        invitee = (
+            self.client_uid
+            or self.callsign
+            or self.username
+            or self.group_name
+            or self.team_name
+        )
+        if self.role == MissionRole.MISSION_OWNER:
+            role = MissionRole.OWNER_ROLE
+        elif self.role == MissionRole.MISSION_READ_ONLY:
+            role = MissionRole.READ_ONLY_ROLE
+        else:
+            role = MissionRole.SUBSCRIBER_ROLE
         return {
             "missionName": self.mission_name,
-            "invitee": self.eud_uid,
-            "role": [MissionRole.MISSION_SUBSCRIBER],
+            "invitee": invitee,
+            "role": role,
             "type": self.type,
             "creatorUid": self.creator_uid,
             "createTime": iso8601_string_from_datetime(),
-            "token": "",
+            "token": token,
             "missionGuid": self.mission.guid or self.mission_guid,
         }

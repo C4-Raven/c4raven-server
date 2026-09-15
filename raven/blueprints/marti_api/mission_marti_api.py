@@ -60,12 +60,27 @@ mission_marti_api = Blueprint("mission_marti_api", __name__)
 #        return jsonify({'success': False, 'error': 'Missing or invalid client certificate'}), 400
 
 
-def verify_token() -> dict | bool:
-    token = request.headers.get("Authorization")
-    if not token or "Bearer" not in token:
-        return False
+def _mission_token_header() -> str | None:
+    """Return the bearer mission token from the request, if any.
 
-    token = token.replace("Bearer ", "")
+    TAK Server reads it from the MissionAuthorization header first and only falls back to
+    Authorization (MissionServiceDefaultImpl), so clients written against it may send the token
+    only in the former. We previously looked at Authorization alone, which made every token-guarded
+    route (DELETE mission, ...) answer 401 to such clients even when they held a valid owner token.
+    """
+    for header in ("MissionAuthorization", "Authorization"):
+        value = request.headers.get(header)
+        if value and "Bearer" in value:
+            if header == "MissionAuthorization":
+                logger.info("Mission token supplied via MissionAuthorization header")
+            return value.replace("Bearer ", "").strip()
+    return None
+
+
+def verify_token() -> dict | bool:
+    token = _mission_token_header()
+    if not token:
+        return False
 
     with open(
         os.path.join(
@@ -145,6 +160,32 @@ def check_permission(mission_name: str = None, mission_guid: str = None):
     return True
 
 
+def _resolve_mission_name(mission_name: str | None, mission_guid: str | None = None) -> str | None:
+    """
+    TAK Server exposes a /missions/guid/<guid>/... twin of nearly every /missions/<name>/... route and
+    TAKX uses the GUID form for most of Data Sync; the handlers here key on the name, so resolve it once.
+    """
+    if mission_name:
+        return mission_name
+    if mission_guid:
+        mission = db.session.execute(db.session.query(Mission).filter_by(guid=mission_guid)).first()
+        if mission:
+            return mission[0].name
+    return None
+
+
+def _mission_not_found(identifier: str | None):
+    return (
+        jsonify(
+            {
+                "success": False,
+                "error": gettext("Mission %(mission_name)s not found", mission_name=identifier or ""),
+            }
+        ),
+        404,
+    )
+
+
 def generate_token(mission: Mission, eud_uid: str):
     """
     jti: Unique UUID for the token
@@ -203,10 +244,10 @@ def generate_new_mission_cot(mission: Mission) -> Element:
         "mission",
         {
             "type": Mission.CREATE,
-            "tool": mission.tool,
+            "tool": mission.tool or "public",
             "name": mission.name,
-            "guid": mission.guid,
-            "authorUid": mission.creator_uid,
+            "guid": mission.guid or "",
+            "authorUid": mission.creator_uid or "",
         },
     )
 
@@ -214,14 +255,25 @@ def generate_new_mission_cot(mission: Mission) -> Element:
 
 
 def generate_invitation_cot(
-    mission: Mission, uid: str, cot_type: str = "t-x-m-i", delete: bool = False
+    mission: Mission,
+    uid: str,
+    cot_type: str = "t-x-m-i",
+    delete: bool = False,
+    role: str | None = None,
 ) -> Element:
     """
     Generates an invitation (t-x-m-i) or role change (t-x-m-r) cot
+
+    Data Sync clients (ATAK's Data Sync plugin, WinTAK, TAKX) only act on <mission> elements
+    whose tool is "public" -- other tools (ExCheck, citrap, ...) belong to other plugins -- so the
+    tool/guid/authorUid attributes are always emitted with a usable value even when the mission row
+    was created by the web UI with tool="" (the UI's create dialog submits an empty string).
     :param mission:
     :param uid:
     :param cot_type:
     :param delete:
+    :param role: role type being granted (MISSION_OWNER/MISSION_SUBSCRIBER/MISSION_READ_ONLY);
+                 defaults to the mission's default role
     :return:
     """
 
@@ -249,22 +301,23 @@ def generate_invitation_cot(
         "mission",
         {
             "type": Mission.INVITE,
-            "tool": mission.tool,
+            "tool": mission.tool or "public",
             "name": mission.name,
-            "guid": mission.guid,
-            "authorUid": mission.creator_uid,
+            "guid": mission.guid or "",
+            "authorUid": mission.creator_uid or "",
             "token": generate_token(mission, uid),
         },
     )
 
     if not delete:
-        role = SubElement(mission_tag, "role", {"type": mission.default_role})
-        permissions = SubElement(role, "permissions")
+        role_type = role or mission.default_role or MissionRole.MISSION_SUBSCRIBER
+        role_tag = SubElement(mission_tag, "role", {"type": role_type})
+        permissions = SubElement(role_tag, "permissions")
 
-        if mission.default_role == MissionRole.MISSION_SUBSCRIBER:
+        if role_type == MissionRole.MISSION_SUBSCRIBER:
             SubElement(permissions, "permission", {"type": MissionRole.MISSION_READ})
             SubElement(permissions, "permission", {"type": MissionRole.MISSION_WRITE})
-        elif mission.default_role == MissionRole.MISSION_OWNER:
+        elif role_type == MissionRole.MISSION_OWNER:
             SubElement(permissions, "permission", {"type": MissionRole.MISSION_MANAGE_FEEDS})
             SubElement(permissions, "permission", {"type": MissionRole.MISSION_SET_PASSWORD})
             SubElement(permissions, "permission", {"type": MissionRole.MISSION_WRITE})
@@ -303,10 +356,10 @@ def generate_mission_delete_cot(mission: Mission) -> Element:
         "mission",
         {
             "type": Mission.DELETE,
-            "tool": mission.tool,
+            "tool": mission.tool or "public",
             "name": mission.name,
-            "guid": mission.guid,
-            "authorUid": mission.creator_uid,
+            "guid": mission.guid or "",
+            "authorUid": mission.creator_uid or "",
         },
     )
 
@@ -335,14 +388,14 @@ def get_mission_by_guid(mission_guid: str):
         )
     mission = mission[0]
 
-    if mission.password_protected and not verify_password(password, mission.password):
+    if mission.password_protected and (not password or not verify_password(password, mission.password)):
         return jsonify({"success": False, "error": gettext("Invalid password")}), 401
 
     return jsonify(
         {
             "version": "3",
             "type": "Mission",
-            "data": [mission.to_marti_json()],
+            "data": [mission.to_marti_json(logs=request.args.get("logs", "false").lower() == "true")],
             "nodeId": app.config.get("RAVEN_NODE_ID"),
         }
     )
@@ -360,18 +413,18 @@ def get_missions():
         logger.warning(f"/Marti/api/missions: no account matches certificate CN {username!r}")
         return jsonify({"success": False, "error": gettext("Unknown user certificate")}), 403
 
-    password_protected = request.args.get("passwordProtected", False)
-
-    tool = request.args.get("tool")
-    if tool:
-        tool = bleach.clean(tool)
+    # TAK Server semantics: passwordProtected defaults to false (password-protected missions are hidden
+    # unless asked for) and the listing is filtered to a single tool, "public" (Data Sync), unless the
+    # client names another one (ExCheck, citrap, ...)
+    password_protected = request.args.get("passwordProtected", "false").lower() == "true"
+    tool = bleach.clean(request.args.get("tool") or "public")
 
     default_role = request.args.get("defaultRole")
     if default_role:
         default_role = bleach.clean(default_role).lower() == "true"
 
     response = {
-        "version": 3,
+        "version": "3",
         "type": "Mission",
         "data": [],
         "nodeId": app.config.get("RAVEN_NODE_ID"),
@@ -382,23 +435,20 @@ def get_missions():
 
         # Let admins see all missions
         if not user.has_role("administrator"):
-            group_filters = []
+            # Missions with no group assignment at all are public/ungrouped and visible to everyone
+            group_filters = [GroupMission.mission_name.is_(None)]
             groups = db.session.execute(
                 db.session.query(GroupUser).filter_by(user_id=user.id, direction=Group.IN)
             ).scalars()
             for group in groups:
                 group_filters.append(GroupMission.group_id == group.group.id)
-            if group_filters:
-                query = query.outerjoin(GroupMission).where(or_(*group_filters))
-            else:
-                # If a user isn't in a group, only show them __ANON__ missions
-                query.outerjoin(GroupMission).where(GroupMission.group_id == 1)
+            query = query.outerjoin(GroupMission).where(or_(*group_filters))
 
         missions = db.session.execute(query).scalars()
         for mission in missions:
             if not password_protected and mission.password_protected:
                 continue
-            if tool and tool.lower() != "public" and mission.tool != tool:
+            if (mission.tool or "public") != tool:
                 continue
             response["data"].append(mission.to_marti_json())
 
@@ -437,12 +487,19 @@ def all_invitations(mission_name: str | None = None, mission_guid: str | None = 
     elif mission_guid:
         query = query.join(Mission).where(Mission.guid == mission_guid)
 
-    logger.info(query)
-
     invitations = db.session.execute(query).all()
 
+    # TAK Server's /missions/all/invitations answers with just the mission names (Set<String>); the
+    # other three routes return the full invitation objects
+    names_only = request.path.rstrip("/").endswith("/missions/all/invitations")
     for invitation in invitations:
-        response["data"].append(invitation[0].to_marti_json())
+        invitation = invitation[0]
+        if names_only:
+            if invitation.mission_name not in response["data"]:
+                response["data"].append(invitation.mission_name)
+            continue
+        token = generate_token(invitation.mission, client_uid) if client_uid and invitation.mission else ""
+        response["data"].append(invitation.to_marti_json(token))
 
     return jsonify(response)
 
@@ -514,7 +571,9 @@ def put_mission(mission_name: str):
     mission.tool = request.args.get("tool") or mission.tool or "public"
     mission.group = request.args.get("group") or mission.group or "__ANON__"
     mission.default_role = (
-        request.args.get("defaultRole") or mission.default_role or MissionRole.MISSION_SUBSCRIBER
+        MissionRole.normalize_role_type(request.args.get("defaultRole"))
+        or mission.default_role
+        or MissionRole.MISSION_SUBSCRIBER
     )
     mission.password = password or mission.password or None
     mission.password_protected = mission.password is not None
@@ -675,7 +734,9 @@ def get_mission(mission_name: str):
             {
                 "version": "3",
                 "type": "Mission",
-                "data": [mission[0].to_marti_json()],
+                "data": [
+                    mission[0].to_marti_json(logs=request.args.get("logs", "false").lower() == "true")
+                ],
                 "nodeId": app.config.get("RAVEN_NODE_ID"),
             }
         )
@@ -686,11 +747,31 @@ def get_mission(mission_name: str):
 
 
 @mission_marti_api.route("/Marti/api/missions/<mission_name>", methods=["DELETE"])
-def delete_mission(mission_name: str):
+@mission_marti_api.route("/Marti/api/missions", methods=["DELETE"])
+def delete_mission(mission_name: str = None):
     """Used by the Data Sync plugin to delete a feed"""
 
     # ATAK sends a creatorUid param, but we ignore it in favor of the UID in the signed JWT token that ATAK also sends.
     creator_uid = request.args.get("creatorUid")
+    # TAK Server also takes DELETE /Marti/api/missions?guid=<guid>
+    mission_name = _resolve_mission_name(mission_name, request.args.get("guid"))
+    if not mission_name:
+        return _mission_not_found(request.args.get("guid"))
+
+    # Nothing to authorise against if the mission is already gone (e.g. deleted from the web UI).
+    # Answer 404 like TAK Server so the client drops its stale local copy instead of retrying on a 401.
+    if not db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first():
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "Mission %(mission_name)s not found", mission_name=mission_name
+                    ),
+                }
+            ),
+            404,
+        )
 
     if "iTAK" not in request.user_agent.string:
         token = verify_token()
@@ -724,6 +805,15 @@ def delete_mission(mission_name: str):
                 403,
             )
 
+        # Serialise the mission and its delete notification while the row still exists -- TAK Server
+        # answers a delete with the deleted mission in the usual envelope
+        response = {
+            "version": "3",
+            "type": "Mission",
+            "data": [mission.to_marti_json()],
+            "nodeId": app.config.get("RAVEN_NODE_ID"),
+        }
+        delete_cot = tostring(generate_mission_delete_cot(mission)).decode("utf-8")
         db.session.delete(mission)
         db.session.commit()
 
@@ -741,14 +831,14 @@ def delete_mission(mission_name: str):
             body=json.dumps(
                 {
                     "uid": app.config.get("RAVEN_NODE_ID"),
-                    "cot": tostring(generate_mission_delete_cot(mission)).decode("utf-8"),
+                    "cot": delete_cot,
                 }
             ),
         )
         channel.close()
         rabbit_connection.close()
 
-        return jsonify({"success": True})
+        return jsonify(response)
     else:
         return (
             jsonify(
@@ -764,8 +854,12 @@ def delete_mission(mission_name: str):
 
 
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/password", methods=["PUT", "DELETE"])
-def set_password(mission_name: str):
+@mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/password", methods=["PUT", "DELETE"])
+def set_password(mission_name: str = None, mission_guid: str = None):
     """Used by the Data Sync plugin to add a password to a feed"""
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
     if "iTAK" not in request.user_agent.string:
         token = verify_token()
         if not token or token["MISSION_NAME"] != mission_name:
@@ -820,7 +914,21 @@ def set_password(mission_name: str):
 @mission_marti_api.route(
     "/Marti/api/missions/<mission_name>/invite/<invitation_type>/<invitee>", methods=["PUT"]
 )
-def invite(mission_name: str, invitation_type: str, invitee: str):
+@mission_marti_api.route(
+    "/Marti/api/missions/guid/<mission_guid>/invite/<invitation_type>/<invitee>", methods=["PUT"]
+)
+def invite(
+    mission_name: str = None,
+    invitation_type: str = None,
+    invitee: str = None,
+    mission_guid: str = None,
+):
+    # Keep mission_name first: the web UI's /api/missions/invite calls this in-process as
+    # invite(mission_name, "clientuid", eud_uid). Flask passes URL variables as keywords, so the
+    # by-guid route is unaffected by the order.
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
     permission_granted = check_permission(mission_name)
     if isinstance(permission_granted, flask.Response):
         return permission_granted
@@ -843,6 +951,13 @@ def invite(mission_name: str, invitation_type: str, invitee: str):
 
     invitation = MissionInvitation()
     invitation.mission_name = mission_name
+    invitation.creator_uid = request.args.get("creatorUid") or mission.creator_uid
+    # TAK Server lets the inviter choose the granted role (?role=MISSION_OWNER|MISSION_SUBSCRIBER|MISSION_READONLY_SUBSCRIBER)
+    invitation.role = (
+        MissionRole.normalize_role_type(request.args.get("role"))
+        or mission.default_role
+        or MissionRole.MISSION_SUBSCRIBER
+    )
 
     if invitation_type.lower() == "clientuid":
         eud = db.session.execute(db.session.query(EUD).filter_by(uid=invitee)).first()
@@ -924,7 +1039,7 @@ def invite(mission_name: str, invitation_type: str, invitee: str):
     db.session.add(invitation)
     db.session.commit()
 
-    event = generate_invitation_cot(mission, invitee)
+    event = generate_invitation_cot(mission, invitee, role=invitation.role)
     rabbit_credentials = pika.PlainCredentials(
         app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
     )
@@ -949,7 +1064,15 @@ def invite(mission_name: str, invitation_type: str, invitee: str):
 @mission_marti_api.route(
     "/Marti/api/missions/<mission_name>/invite/<invitation_type>/<invitee>", methods=["DELETE"]
 )
-def delete_invitation(mission_name: str, invitation_type: str, invitee: str):
+@mission_marti_api.route(
+    "/Marti/api/missions/guid/<mission_guid>/invite/<invitation_type>/<invitee>", methods=["DELETE"]
+)
+def delete_invitation(
+    invitation_type: str, invitee: str, mission_name: str = None, mission_guid: str = None
+):
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
     permission_granted = check_permission(mission_name)
     if isinstance(permission_granted, flask.Response):
         return permission_granted
@@ -996,9 +1119,9 @@ def delete_invitation(mission_name: str, invitation_type: str, invitee: str):
     elif invitation_type.lower() == "username":
         query = query.where(MissionInvitation.username == invitee)
     elif invitation_type.lower() == "group":
-        query = query.where(MissionInvitation.group == invitee)
+        query = query.where(MissionInvitation.group_name == invitee)
     elif invitation_type.lower() == "team":
-        query = query.where(MissionInvitation.team == invitee)
+        query = query.where(MissionInvitation.team_name == invitee)
 
     invitations = db.session.execute(query).scalars()
     for invitation in invitations:
@@ -1009,7 +1132,11 @@ def delete_invitation(mission_name: str, invitation_type: str, invitee: str):
 
 
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/invite", methods=["POST"])
-def invite_json(mission_name: str):
+@mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/invite", methods=["POST"])
+def invite_json(mission_name: str = None, mission_guid: str = None):
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
     permission_granted = check_permission(mission_name)
     if isinstance(permission_granted, flask.Response):
         return permission_granted
@@ -1044,25 +1171,51 @@ def invite_json(mission_name: str):
     for invitee in invitees:
         invitation = MissionInvitation()
         invitation.mission_name = mission_name
-        invitation.role = invitee["role"]["type"]
+        if not invitee.get("type") or not invitee.get("invitee"):
+            channel.close()
+            rabbit_connection.close()
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": gettext("invitation found without type or invitee attribute"),
+                    }
+                ),
+                400,
+            )
+        # TAK Server treats a missing role as "grant the mission's default role"
+        role = invitee.get("role")
+        invitation.role = (
+            MissionRole.normalize_role_type(role.get("type") if isinstance(role, dict) else role)
+            or mission.default_role
+            or MissionRole.MISSION_SUBSCRIBER
+        )
+        invitation.creator_uid = creator_uid or mission.creator_uid
 
         if invitee["type"].lower() == "clientuid":
             invitation.client_uid = invitee["invitee"]
+            invitation.type = InvitationTypeEnum.clientUid
         elif invitee["type"].lower() == "callsign":
             invitation.callsign = invitee["invitee"]
+            invitation.type = InvitationTypeEnum.callsign
         elif invitee["type"].lower() == "username":
             invitation.username = invitee["invitee"]
+            invitation.type = InvitationTypeEnum.userName
         elif invitee["type"].lower() == "group":
-            invitation.group = invitee["invitee"]
+            invitation.group_name = invitee["invitee"]
+            invitation.type = InvitationTypeEnum.group
         elif invitee["type"].lower() == "team":
-            invitation.team = invitee["invitee"]
+            invitation.team_name = invitee["invitee"]
+            invitation.type = InvitationTypeEnum.team
         else:
+            channel.close()
+            rabbit_connection.close()
             return (
                 jsonify(
                     {
                         "success": False,
                         "error": gettext(
-                            "Invalid invitation type: %(invitation)s", invitation=invitation["type"]
+                            "Invalid invitation type: %(invitation)s", invitation=invitee["type"]
                         ),
                     }
                 ),
@@ -1072,7 +1225,7 @@ def invite_json(mission_name: str):
         db.session.add(invitation)
         db.session.commit()
 
-        event = generate_invitation_cot(mission, invitee["invitee"])
+        event = generate_invitation_cot(mission, invitee["invitee"], role=invitation.role)
 
         logger.debug(f"Sending invitation to mission {mission_name} to {invitee['invitee']}")
         channel.basic_publish(
@@ -1083,8 +1236,8 @@ def invite_json(mission_name: str):
             ),
         )
 
-        channel.close()
-        rabbit_connection.close()
+    channel.close()
+    rabbit_connection.close()
 
     return jsonify({"success": True})
 
@@ -1133,8 +1286,12 @@ def mission_roles_by_guid(mission_guid: str):
 
 
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/role", methods=["PUT"])
-def change_eud_role(mission_name: str):
+@mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/role", methods=["PUT"])
+def change_eud_role(mission_name: str = None, mission_guid: str = None):
     """Used by Data Sync to change EUD mission roles or kick an EUD off of a mission"""
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
     if "iTAK" not in request.user_agent.string:
         token = verify_token()
         if not token or token["MISSION_NAME"] != mission_name:
@@ -1192,7 +1349,7 @@ def change_eud_role(mission_name: str):
         )
     eud = eud[0]
 
-    new_role = request.args.get("role")
+    new_role = MissionRole.normalize_role_type(request.args.get("role"))
     if new_role and new_role not in [
         MissionRole.MISSION_OWNER,
         MissionRole.MISSION_SUBSCRIBER,
@@ -1222,7 +1379,8 @@ def change_eud_role(mission_name: str):
         db.session.add(role)
         db.session.commit()
 
-        event = generate_invitation_cot(mission, role.clientUid)
+        # TAK Server announces a role change as t-x-m-r (createMissionRoleChangeMessage), not a fresh invite
+        event = generate_invitation_cot(mission, role.clientUid, "t-x-m-r", role=new_role)
         body = {"uid": app.config.get("RAVEN_NODE_ID"), "cot": tostring(event).decode("utf-8")}
 
         rabbit_credentials = pika.PlainCredentials(
@@ -1265,30 +1423,37 @@ def change_eud_role(mission_name: str):
 
 
 @mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/role")
-def get_role_by_guid(mission_guid: str):
-    permission_granted = check_permission(mission_guid=mission_guid)
+@mission_marti_api.route("/Marti/api/missions/<mission_name>/role", methods=["GET"])
+def get_role_by_guid(mission_guid: str = None, mission_name: str = None):
+    permission_granted = check_permission(mission_name, mission_guid)
     if isinstance(permission_granted, flask.Response):
         return permission_granted
 
-    mission = db.session.execute(db.session.query(Mission).filter_by(guid=mission_guid)).first()
+    if mission_guid:
+        mission = db.session.execute(db.session.query(Mission).filter_by(guid=mission_guid)).first()
+    else:
+        mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
     if not mission:
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": gettext(
-                        "No mission found with guid: %(mission_guid)s", mission_guid=mission_guid
-                    ),
-                }
-            ),
-            404,
-        )
+        return _mission_not_found(mission_guid or mission_name)
     mission = mission[0]
+
+    token = verify_token()
+    client_uid = request.args.get("clientUid") or (token.get("sub") if token else None)
+    role_json = None
+    for role in mission.roles:
+        if client_uid and role.clientUid == client_uid:
+            role_json = role.to_json()["role"]
+            break
+    if role_json is None:
+        role_json = {
+            MissionRole.MISSION_OWNER: MissionRole.OWNER_ROLE,
+            MissionRole.MISSION_READ_ONLY: MissionRole.READ_ONLY_ROLE,
+        }.get(mission.default_role, MissionRole.SUBSCRIBER_ROLE)
 
     response = {
         "version": "3",
         "type": "com.bbn.marti.sync.model.MissionRole",
-        "data": mission.roles[0].to_json()["role"],
+        "data": role_json,
         "nodeId": app.config.get("RAVEN_NODE_ID"),
     }
 
@@ -1296,7 +1461,11 @@ def get_role_by_guid(mission_guid: str):
 
 
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/subscriptions")
-def get_subscriptions(mission_name: str):
+@mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/subscriptions")
+def get_subscriptions(mission_name: str = None, mission_guid: str = None):
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
     permission_granted = check_permission(mission_name)
     if isinstance(permission_granted, flask.Response):
         return permission_granted
@@ -1357,6 +1526,16 @@ def put_mission_keywords(mission_name):
 def mission_subscribe(mission_name: str = None, mission_guid: str = None):
     """Used by the Data Sync plugin to subscribe to a feed"""
     cert = verify_client_cert()
+    if not cert:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Missions are only supported on SSL connections"),
+                }
+            ),
+            400,
+        )
     username = cert.get_subject().commonName
     user = app.security.datastore.find_user(username=username)
     if not user:
@@ -1396,19 +1575,23 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
         )
 
     mission = mission[0]
-    group_filters = []
+    # TAKX (re)subscribes by GUID, so mission_name is None on that route -- everything below
+    # (visibility check, token check, role lookup, RabbitMQ binding, invitation cleanup) keys on the name.
+    mission_name = mission.name
+    # Missions with no group assignment at all are public/ungrouped and visible to everyone
+    group_filters = [GroupMission.mission_name.is_(None)]
     groups = db.session.execute(db.session.query(GroupUser).filter_by(user_id=user.id)).scalars()
     for group in groups:
         group_filters.append(GroupMission.group_id == group.group_id)
-    if not group_filters:
-        # Default to the __ANON__ group
-        group_filters.append(GroupMission.group_id == 1)
 
-    query = db.session.query(GroupMission).filter_by(mission_name=mission_name)
-    query = query.where(or_(*group_filters))
-    mission_groups = db.session.execute(query).scalars()
+    visible_mission = db.session.execute(
+        db.session.query(Mission)
+        .filter_by(name=mission_name)
+        .outerjoin(GroupMission)
+        .where(or_(*group_filters))
+    ).first()
 
-    if not mission_groups:
+    if not visible_mission:
         return (
             jsonify(
                 {
@@ -1430,12 +1613,18 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
     }
 
     # And EUD will send a token if it has previously subscribed to the mission
-    if "Authorization" in request.headers:
-        token = verify_token()
-        if not token or token["MISSION_NAME"] != mission_name:
+    token = verify_token() if _mission_token_header() else False
+    if token and (token.get("MISSION_NAME") != mission_name or not token.get("sub")):
+        # A token for some other mission (or a stale one): TAK Server falls back to the default
+        # role in that case rather than refusing the subscription, so do the same and let the
+        # ?uid= path below identify the EUD
+        logger.warning(f"Ignoring mission token that doesn't match mission {mission_name}")
+        token = False
+    if token:
+        eud = db.session.execute(db.session.query(EUD).filter_by(uid=token["sub"])).first()
+        if not eud:
             return jsonify({"success": False, "error": gettext("Invalid token")}), 400
-
-        eud = db.session.execute(db.session.query(EUD).filter_by(uid=token["sub"])).first()[0]
+        eud = eud[0]
         uid = token["sub"]
         role = db.session.execute(
             db.session.query(MissionRole).filter_by(mission_name=mission_name, clientUid=uid)
@@ -1456,7 +1645,7 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
             role = role[0]
 
         response["data"] = {
-            "token": request.headers.get("Authorization").replace("Bearer ", ""),
+            "token": _mission_token_header(),
             "clientUid": token["sub"],
             "username": role.username,
             "createTime": iso8601_string_from_datetime(role.createTime),
@@ -1487,7 +1676,7 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
         if not role:
             role = MissionRole()
             role.clientUid = uid
-            role.username = eud.user.username
+            role.username = eud.user.username if eud.user else "anonymous"
             role.createTime = datetime.datetime.now(datetime.timezone.utc)
             role.role_type = mission.default_role
             role.mission_name = mission.name
@@ -1502,7 +1691,7 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
         response["data"] = {
             "token": token,
             "clientUid": uid,
-            "mission": mission.to_marti_json(),
+            "mission": mission.to_marti_json(logs=True),
             "username": role.username,
             "createTime": iso8601_string_from_datetime(role.createTime),
             "role": role.to_json()["role"],
@@ -1521,9 +1710,15 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
     channel.close()
     rabbit_connection.close()
 
-    # Delete any invitations to this mission for this EUD
+    # Delete any invitations to this mission for this EUD -- TAK Server clears both the clientUid and the
+    # callsign invitation on subscribe
+    invitation_filters = [MissionInvitation.client_uid == uid]
+    if eud.callsign:
+        invitation_filters.append(MissionInvitation.callsign == eud.callsign)
     invitations = db.session.execute(
-        db.session.query(MissionInvitation).filter_by(mission_name=mission_name, client_uid=uid)
+        db.session.query(MissionInvitation)
+        .filter_by(mission_name=mission_name)
+        .where(or_(*invitation_filters))
     ).all()
     for invitation in invitations:
         db.session.delete(invitation[0])
@@ -1532,9 +1727,52 @@ def mission_subscribe(mission_name: str = None, mission_guid: str = None):
     return jsonify(response), 201
 
 
+@mission_marti_api.route("/Marti/api/missions/<mission_name>/subscription", methods=["GET"])
+@mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/subscription", methods=["GET"])
+def get_subscription(mission_name: str = None, mission_guid: str = None):
+    """TAK Server's 'am I subscribed?' lookup: GET .../subscription?uid=<clientUid> -> the subscription or 404"""
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
+    mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
+    if not mission:
+        return _mission_not_found(mission_name)
+    mission = mission[0]
+
+    uid = request.args.get("uid")
+    role = None
+    if uid:
+        uid = bleach.clean(uid)
+        role = db.session.execute(
+            db.session.query(MissionRole).filter_by(mission_name=mission_name, clientUid=uid)
+        ).first()
+    if not role:
+        return jsonify({"success": False, "error": gettext("Mission subscription not found")}), 404
+    role = role[0]
+
+    return jsonify(
+        {
+            "version": "3",
+            "type": "com.bbn.marti.sync.model.MissionSubscription",
+            "data": {
+                "token": generate_token(mission, uid),
+                "clientUid": uid,
+                "username": role.username,
+                "createTime": iso8601_string_from_datetime(role.createTime),
+                "role": role.to_json()["role"],
+            },
+            "nodeId": app.config.get("RAVEN_NODE_ID"),
+        }
+    )
+
+
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/subscription", methods=["DELETE"])
-def mission_unsubscribe(mission_name: str):
+@mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/subscription", methods=["DELETE"])
+def mission_unsubscribe(mission_name: str = None, mission_guid: str = None):
     """Used by the Data Sync plugin to unsubscribe to a feed"""
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
     if "iTAK" not in request.user_agent.string:
         token = verify_token()
         if not token or token["MISSION_NAME"] != mission_name:
@@ -1575,7 +1813,11 @@ def mission_unsubscribe(mission_name: str):
 
 
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/changes", methods=["GET"])
-def mission_changes(mission_name):
+@mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/changes", methods=["GET"])
+def mission_changes(mission_name: str = None, mission_guid: str = None):
+    mission_name = _resolve_mission_name(mission_name, mission_guid)
+    if not mission_name:
+        return _mission_not_found(mission_guid)
     permission_granted = check_permission(mission_name)
     if isinstance(permission_granted, flask.Response):
         return permission_granted
@@ -2194,6 +2436,46 @@ def _publish_mission_change_cot(mission_name: str, event: Element, creator_uid: 
     rabbit_connection.close()
 
 
+def _store_mission_package_cot(
+    mission_name: str, item_uid: str, event: BeautifulSoup, creator_uid: str | None
+) -> None:
+    """Persist a marker that arrived inside a mission package as a CoT row.
+
+    The change notification we push only carries the marker's UID; every
+    client (TAKX itself after a restart included) then fetches the marker
+    with GET /Marti/api/cot/xml/<uid>, and /Marti/api/missions/<name>/cot
+    is built from the same table. Markers dropped in TAKX only ever reach
+    us inside the package zip -- never over the streaming connection, which
+    is what normally fills the cot table -- so without this row both
+    lookups 404 and the marker never renders on any other client.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    def _attr_time(name: str) -> datetime.datetime:
+        try:
+            return datetime_from_iso8601_string(event.attrs[name])
+        except (KeyError, ValueError, TypeError):
+            return now
+
+    sender_uid = None
+    if creator_uid and db.session.execute(db.session.query(EUD).filter_by(uid=creator_uid)).first():
+        sender_uid = creator_uid
+
+    cot = db.session.execute(db.session.query(CoT).filter_by(uid=item_uid)).first()
+    cot = cot[0] if cot else CoT()
+    cot.uid = item_uid
+    cot.how = event.attrs.get("how")
+    cot.type = event.attrs.get("type")
+    cot.sender_uid = sender_uid
+    cot.timestamp = _attr_time("time")
+    cot.start = _attr_time("start")
+    cot.stale = _attr_time("stale")
+    cot.xml = str(event)
+    cot.mission_name = mission_name
+    db.session.add(cot)
+    db.session.commit()
+
+
 def _parse_mission_package_map_items(file: bytes) -> tuple[str | None, list]:
     """A Data Sync "mission package" upload is a Data Package zip: a
     MANIFEST/manifest.xml declaring the package's own UID plus one or more
@@ -2378,6 +2660,8 @@ def add_content(mission_name):
                 mission_change.content_uid = content.uid
                 db.session.commit()
 
+            _store_mission_package_cot(mission_name, item_uid, event, creator_uid)
+
             _publish_mission_change_cot(mission_name, change_cot, creator_uid)
             changes_json.append(mission_change.to_json())
     else:
@@ -2475,5 +2759,15 @@ def get_mission_cots(mission_name: str = None, mission_guid: str = None):
 
 
 @mission_marti_api.route("/Marti/api/missions/<mission_name>/layers")
-def get_mission_layers(mission_name: str):
-    return ""
+@mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/layers")
+def get_mission_layers(mission_name: str = None, mission_guid: str = None):
+    # Map layers aren't implemented; answer the way TAK Server does for a mission without any
+    # (an empty MissionLayer envelope) -- the empty body we used to return is a JSON parse error
+    return jsonify(
+        {
+            "version": "3",
+            "type": "MissionLayer",
+            "data": [],
+            "nodeId": app.config.get("RAVEN_NODE_ID"),
+        }
+    )
