@@ -39,6 +39,16 @@ class MissionUID(db.Model):
             "longitude": self.longitude,
         }
 
+    def color_as_int(self) -> int:
+        # WinTAK deserializes details.color into a non-nullable C# Int32 --
+        # a null or non-numeric string throws a JsonSerializationException
+        # and aborts the whole GetMissionsAsync call. -1 (0xFFFFFFFF, opaque
+        # white) is the standard CoT/ATAK default for "no color override".
+        try:
+            return int(self.color)
+        except (TypeError, ValueError):
+            return -1
+
     def to_json(self):
         return {
             "data": self.uid,
@@ -48,8 +58,11 @@ class MissionUID(db.Model):
                 "type": self.cot_type,
                 "callsign": self.callsign,
                 "iconsetPath": self.iconset_path,
-                "color": self.color,
-                "location": {"lat": self.latitude, "lon": self.longitude},
+                "color": self.color_as_int(),
+                "location": {
+                    "lat": self.latitude if self.latitude is not None else 0.0,
+                    "lon": self.longitude if self.longitude is not None else 0.0,
+                },
             },
         }
 
@@ -58,6 +71,9 @@ class MissionUID(db.Model):
             "type": self.cot_type,
             "callsign": self.callsign,
             "iconsetPath": self.iconset_path,
-            "color": self.color,
-            "location": {"lat": self.latitude, "lon": self.longitude},
+            "color": self.color_as_int(),
+            "location": {
+                "lat": self.latitude if self.latitude is not None else 0.0,
+                "lon": self.longitude if self.longitude is not None else 0.0,
+            },
         }
