@@ -15,7 +15,11 @@ class DataPackage(db.Model):
     __tablename__ = "data_packages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    filename: Mapped[str] = mapped_column(String(255), unique=True)
+    # Not unique: clients routinely reuse a generic filename for distinct
+    # content -- TAKX's chat/quick-file-share feature names every package
+    # "chat-transfer.zip" regardless of what's inside. hash is the real
+    # content identity and is already unique on its own.
+    filename: Mapped[str] = mapped_column(String(255))
     hash: Mapped[str] = mapped_column(String(255), unique=True)
     creator_uid: Mapped[str] = mapped_column(
         String(255), ForeignKey("euds.uid", ondelete="CASCADE"), nullable=True
