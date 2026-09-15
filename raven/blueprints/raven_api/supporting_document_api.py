@@ -66,6 +66,10 @@ def download_supporting_document():
     document_id = request.args.get("id")
     if not document_id:
         return jsonify({"success": False, "error": gettext("Please provide a document ID")}), 400
+    try:
+        document_id = int(document_id)
+    except ValueError:
+        return jsonify({"success": False, "error": gettext("Invalid document ID")}), 400
 
     document = db.session.get(SupportingDocument, document_id)
     if not document:
@@ -86,6 +90,10 @@ def delete_supporting_document():
     document_id = request.args.get("id")
     if not document_id:
         return jsonify({"success": False, "error": gettext("Please provide a document ID")}), 400
+    try:
+        document_id = int(document_id)
+    except ValueError:
+        return jsonify({"success": False, "error": gettext("Invalid document ID")}), 400
 
     document = db.session.get(SupportingDocument, document_id)
     if not document:
