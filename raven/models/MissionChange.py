@@ -178,12 +178,19 @@ def generate_mission_change_cot(
             details_tag.set("color", color.attrs["argb"])
         if color and "value" in color.attrs:
             details_tag.set("color", color.attrs["value"])
-        if callsign:
-            details_tag.set("callsign", callsign.attrs["callsign"])
+        # BeautifulSoup's xml parser preserves attribute case, so a <contact> with no
+        # callsign or a <usericon iconsetPath=...> (as ATAK writes it) must not KeyError.
+        if callsign and callsign.attrs.get("callsign"):
+            details_tag.set("callsign", callsign.attrs.get("callsign"))
         if icon:
-            details_tag.set("iconsetPath", icon.attrs["iconsetpath"])
+            iconset_path = icon.attrs.get("iconsetpath") or icon.attrs.get("iconsetPath")
+            if iconset_path:
+                details_tag.set("iconsetPath", iconset_path)
 
-        SubElement(details_tag, "location", {"lon": point.attrs["lon"], "lat": point.attrs["lat"]})
+        if point and point.attrs.get("lat") is not None and point.attrs.get("lon") is not None:
+            SubElement(
+                details_tag, "location", {"lon": point.attrs.get("lon"), "lat": point.attrs.get("lat")}
+            )
         # SubElement(mission_change_element, "contentUid").text = cot_event.attrs['uid']
 
     if mission_uid:
@@ -292,26 +299,49 @@ def upsert_mission_uid_and_change(
         # explicitly, since serialize() doesn't carry it) matches "adding"
         # an item that already belongs elsewhere: it moves to this mission.
         db.session.rollback()
-        db.session.execute(
-            update(MissionUID)
-            .where(MissionUID.uid == item_uid)
-            .values(mission_name=mission_name, **mission_uid.serialize())
-        )
+        # Only overwrite the columns this call actually supplied -- serialize() emits
+        # None for everything else, which would null out the existing row's
+        # cot_type/callsign/iconset_path/color/lat/lon (see docstring).
+        values = {
+            "mission_name": mission_name,
+            "timestamp": timestamp,
+            "creator_uid": creator_uid,
+        }
+        for column, value in (
+            ("cot_type", cot_type),
+            ("callsign", callsign),
+            ("iconset_path", iconset_path),
+            ("color", color),
+            ("latitude", latitude),
+            ("longitude", longitude),
+        ):
+            if value is not None:
+                values[column] = value
+        db.session.execute(update(MissionUID).where(MissionUID.uid == item_uid).values(**values))
         db.session.commit()
+        # Re-read the persistent row so the change CoT below carries the merged
+        # (existing + newly supplied) values rather than the detached transient.
+        mission_uid = db.session.execute(
+            db.session.query(MissionUID).filter_by(uid=item_uid)
+        ).scalar_one()
 
+    # Filter on change_type too: delete_content() leaves a REMOVE_CONTENT row for
+    # this uid, and reusing it here would broadcast a re-add as <type>REMOVE_CONTENT</type>.
     mission_change = db.session.execute(
-        db.session.query(MissionChange).filter_by(mission_uid=item_uid, mission_name=mission_name)
+        db.session.query(MissionChange).filter_by(
+            mission_uid=item_uid, mission_name=mission_name, change_type=MissionChange.ADD_CONTENT
+        )
     ).first()
     if mission_change:
         mission_change = mission_change[0]
     else:
         mission_change = MissionChange()
         mission_change.isFederatedChange = False
-        mission_change.change_type = MissionChange.ADD_CONTENT
         mission_change.mission_uid = item_uid
         mission_change.mission_name = mission_name
         db.session.add(mission_change)
 
+    mission_change.change_type = MissionChange.ADD_CONTENT
     mission_change.creator_uid = creator_uid
     mission_change.timestamp = timestamp
     mission_change.server_time = datetime.datetime.now(datetime.timezone.utc)

@@ -26,6 +26,12 @@ from raven.eud_handler.EudServerUdp import EudServerUdp
 from raven.extensions import logger, db, ldap_manager
 from raven.models.EUD import EUD
 
+# Imported for its side effect only: User.supporting_documents names "SupportingDocument" as a
+# string, and SQLAlchemy can only resolve that once the class has been imported into the
+# registry. The web app gets it via the supporting_document_api blueprint; this standalone
+# process has to pull it in itself or mapper configuration fails at the first query.
+from raven.models.SupportingDocument import SupportingDocument  # noqa: F401
+
 
 def args():
     parser = argparse.ArgumentParser()

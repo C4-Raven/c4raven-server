@@ -20,8 +20,12 @@ class SupportingDocument(db.Model):
     mime_type: Mapped[str] = mapped_column(String(255), nullable=True)
     size: Mapped[int] = mapped_column(Integer)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime)
-    uploaded_by_id: Mapped[int] = mapped_column(Integer, ForeignKey("user.id"), nullable=True)
-    uploaded_by = relationship("User")
+    # SET NULL so deleting the uploading user (user_api.delete_user) does not fail on
+    # the FK; the document itself stays available.
+    uploaded_by_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    uploaded_by = relationship("User", back_populates="supporting_documents")
 
     def to_json(self):
         return {

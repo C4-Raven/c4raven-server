@@ -21,10 +21,10 @@ from flask_security import (
 from sqlalchemy import or_
 
 from raven.blueprints.marti_api.mission_marti_api import (
+    _create_invitation,
     generate_invitation_cot,
     generate_mission_delete_cot,
     generate_new_mission_cot,
-    invite,
 )
 from raven.blueprints.raven_api.api import paginate, search
 from raven.extensions import db, logger
@@ -83,6 +83,19 @@ def create_edit_mission():
     mission_name = bleach.clean(mission_name)
     creator_uid = bleach.clean(creator_uid)
 
+    # Validate group ids once here so neither branch below can raise on int() of a
+    # non-numeric id. group_ids is the parsed list (empty when none were supplied).
+    group_ids: list[int] = []
+    raw_group_ids = request.json.get("groups")
+    if raw_group_ids is not None:
+        if not isinstance(raw_group_ids, (list, tuple)):
+            return jsonify({"success": False, "error": gettext("Invalid group id")}), 400
+        for raw_group_id in raw_group_ids:
+            try:
+                group_ids.append(int(raw_group_id))
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "error": gettext("Invalid group id")}), 400
+
     mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).first()
 
     # Creates a new mission
@@ -91,8 +104,10 @@ def create_edit_mission():
         if not eud:
             return jsonify({"success": False, "error": f"Invalid UID: {creator_uid}"}), 400
 
-        groups = None
         mission_groups = []
+        # Names of the groups the mission actually gets associated with (drives the
+        # new-mission CoT broadcast below).
+        mission_group_names = []
 
         mission = Mission()
         mission.create_time = datetime.datetime.now(datetime.timezone.utc)
@@ -103,12 +118,17 @@ def create_edit_mission():
             if key == "password" and request.json.get("password"):
                 mission.password = hash_password(request.json.get("password"))
             elif key == "groups":
-                group_ids = request.json.get("groups")
-                groups = db.session.execute(
-                    db.session.query(GroupUser).filter_by(
-                        user_id=current_user.id, enabled=True, direction=Group.IN
+                # .all() materializes the result: a bare ScalarResult is single-pass and would
+                # be exhausted after the first group_id, giving a false 403 on the second.
+                groups = (
+                    db.session.execute(
+                        db.session.query(GroupUser).filter_by(
+                            user_id=current_user.id, enabled=True, direction=Group.IN
+                        )
                     )
-                ).scalars()
+                    .scalars()
+                    .all()
+                )
 
                 # Make sure the user is a member of the IN group that they want the mission to be associated with. Also allow
                 # administrators to associate a mission with any group
@@ -117,7 +137,7 @@ def create_edit_mission():
 
                     if not current_user.has_role("administrator"):
                         for group in groups:
-                            if group.group_id == int(group_id):
+                            if group.group_id == group_id:
                                 user_in_group = True
                                 break
 
@@ -143,7 +163,6 @@ def create_edit_mission():
                                 400,
                             )
 
-                    group_id = int(group_id)
                     group = db.session.execute(
                         db.session.query(Group).filter_by(id=group_id)
                     ).first()
@@ -154,6 +173,7 @@ def create_edit_mission():
                     group_mission.mission_name = mission_name
                     group_mission.group_id = group_id
                     mission_groups.append(group_mission)
+                    mission_group_names.append(group[0].name)
 
             elif hasattr(mission, key):
                 setattr(mission, key, request.json[key])
@@ -211,35 +231,38 @@ def create_edit_mission():
         rabbit_connection = pika.BlockingConnection(
             pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
         )
-        channel = rabbit_connection.channel()
+        try:
+            channel = rabbit_connection.channel()
 
-        for group in groups or []:
-            logger.debug(f"Publishing to {group.group.name}.{group.direction}")
+            # Announce the mission to the groups it was actually associated with (not the
+            # creator's own memberships). EUD queues are bound to "<group>.OUT" (see
+            # CoTController.route_cot / group_api), which is where every other
+            # server-originated group broadcast goes.
+            new_mission_cot = tostring(generate_new_mission_cot(mission)).decode("utf-8")
+            for group_name in mission_group_names:
+                logger.debug(f"Publishing to {group_name}.{Group.OUT}")
+                channel.basic_publish(
+                    exchange="groups",
+                    routing_key=f"{group_name}.{Group.OUT}",
+                    body=json.dumps({"uid": app.config.get("RAVEN_NODE_ID"), "cot": new_mission_cot}),
+                )
+
+            # EudHandler.on_message() drops messages whose "uid" equals the receiving EUD's own uid (echo
+            # suppression), so the owner invite must be stamped with the server's node id -- stamping it
+            # with creator_uid meant the creator's own device never received its owner invitation.
             channel.basic_publish(
-                exchange="groups",
-                routing_key=f"{group.group.name}.{group.direction}",
+                exchange="dms",
+                routing_key=creator_uid,
                 body=json.dumps(
                     {
                         "uid": app.config.get("RAVEN_NODE_ID"),
-                        "cot": tostring(generate_new_mission_cot(mission)).decode("utf-8"),
+                        "cot": tostring(generate_invitation_cot(mission, creator_uid)).decode("utf-8"),
                     }
                 ),
             )
-
-        # EudHandler.on_message() drops messages whose "uid" equals the receiving EUD's own uid (echo
-        # suppression), so the owner invite must be stamped with the server's node id -- stamping it
-        # with creator_uid meant the creator's own device never received its owner invitation.
-        channel.basic_publish(
-            exchange="dms",
-            routing_key=creator_uid,
-            body=json.dumps(
-                {
-                    "uid": app.config.get("RAVEN_NODE_ID"),
-                    "cot": tostring(generate_invitation_cot(mission, creator_uid)).decode("utf-8"),
-                }
-            ),
-        )
-        channel.close()
+            channel.close()
+        finally:
+            rabbit_connection.close()
 
         return jsonify({"success": True})
 
@@ -268,14 +291,21 @@ def create_edit_mission():
         )
 
     for key in request.json:
-        if key == "password" and request.json.get("password"):
-            mission.password = hash_password(request.json.get("password"))
-        elif key == "groups" and request.json.get("groups"):
+        if key == "password":
+            # Keep password_protected in step with password: serialize() below writes it back,
+            # so leaving it stale would persist False on a mission that now has a password.
+            if request.json.get("password"):
+                mission.password = hash_password(request.json.get("password"))
+                mission.password_protected = True
+            else:
+                # Explicitly blank/null password in the request clears protection.
+                mission.password = None
+                mission.password_protected = False
+        elif key == "groups" and group_ids:
             db.session.execute(sqlalchemy.delete(GroupMission).filter_by(mission_name=mission_name))
             db.session.commit()
 
-            for group_id in request.json.get("groups"):
-                group_id = int(group_id)
+            for group_id in group_ids:
                 group = db.session.execute(db.session.query(Group).filter_by(id=group_id)).first()
                 if not group:
                     continue
@@ -288,7 +318,10 @@ def create_edit_mission():
         elif hasattr(mission, key):
             setattr(mission, key, request.json.get(key))
         else:
-            return jsonify({"success": False, "error": gettext("Invalid property: %(key)s")}), 400
+            return (
+                jsonify({"success": False, "error": gettext("Invalid property: %(key)s", key=key)}),
+                400,
+            )
 
     # Same as on create: an edit from the web UI can blank the tool, which hides the mission from Data Sync clients
     mission.tool = mission.tool or "public"
@@ -425,4 +458,10 @@ def invite_eud():
     ):
         return jsonify({"success": False, "error": gettext("Invalid password")}), 401
 
-    return invite(mission_name=mission_name, invitation_type="clientuid", invitee=eud_uid)
+    # The browser session (auth_required above) is the authorisation here; the Marti invite() route
+    # would demand a mission token this caller does not have, so use the shared helper directly.
+    error = _create_invitation(mission, "clientuid", eud_uid)
+    if error is not None:
+        return error
+
+    return jsonify({"success": True})
