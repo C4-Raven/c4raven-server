@@ -14,7 +14,7 @@ RUN python -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
 # TODO: Install from PyPI
-RUN pip install git+https://github.com/C4Raven/c4raven-server.git
+RUN pip install git+https://github.com/C4-Raven/c4raven-server.git
 
 RUN /app/venv/bin/flask --app /app/venv/lib/python3.13/site-packages/raven/app.py raven create-ca
 #RUN /app/venv/bin/flask --app /app/venv/lib/python3.13/site-packages/raven/app.py db upgrade
