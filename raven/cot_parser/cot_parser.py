@@ -50,7 +50,11 @@ from raven.models.Icon import Icon
 from raven.models.Marker import Marker
 from raven.models.Meshtastic import MeshtasticChannel
 from raven.models.Mission import Mission
-from raven.models.MissionChange import MissionChange, generate_mission_change_cot
+from raven.models.MissionChange import (
+    MissionChange,
+    generate_mission_change_cot,
+    upsert_mission_uid_and_change,
+)
 from raven.models.MissionContentMission import MissionContentMission
 from raven.models.MissionInvitation import MissionInvitation
 from raven.models.MissionLogEntry import MissionLogEntry
@@ -1032,113 +1036,80 @@ class CoTController:
 
     def generate_mission_change(self, uid: str, event: BeautifulSoup):
         destinations = event.find_all("dest")
-        mission_changes = []
 
         if not destinations:
             return
 
         for destination in destinations:
-            if "mission" in destination.attrs:
-                with self.context:
-                    mission = db.session.execute(
-                        db.session.query(Mission).filter_by(name=destination.attrs["mission"])
-                    ).first()
+            if "mission" not in destination.attrs:
+                continue
 
-                    if not mission:
-                        self.logger.error(f"No such mission found: {destination.attrs['mission']}")
-                        return
+            mission_name = destination.attrs["mission"]
 
-                    mission = mission[0]
-                    self.rabbit_channel.basic_publish(
-                        "missions",
-                        routing_key=f"missions.{destination.attrs['mission']}",
-                        body=json.dumps({"uid": uid, "cot": str(event)}),
-                        properties=pika.BasicProperties(
-                            expiration=app.config.get("RAVEN_RABBITMQ_TTL")
-                        ),
-                    )
+            with self.context:
+                mission = db.session.execute(
+                    db.session.query(Mission).filter_by(name=mission_name)
+                ).first()
 
-                    mission_uid = db.session.execute(
-                        db.session.query(MissionUID).filter_by(uid=event.attrs["uid"])
-                    ).first()
+                if not mission:
+                    self.logger.error(f"No such mission found: {mission_name}")
+                    continue
 
-                    if not mission_uid:
-                        mission_uid = MissionUID()
-                        mission_uid.uid = event.attrs["uid"]
-                        mission_uid.mission_name = destination.attrs["mission"]
-                        mission_uid.timestamp = datetime_from_iso8601_string(event.attrs["start"])
-                        mission_uid.creator_uid = uid
-                        mission_uid.cot_type = event.attrs["type"]
+                mission = mission[0]
+                ttl = pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL"))
 
-                        color = event.find("color")
-                        icon = event.find("usericon")
-                        point = event.find("point")
-                        contact = event.find("contact")
-
-                        if color and "argb" in color.attrs:
-                            mission_uid.color = color.attrs["argb"]
-                        elif color and "value" in color.attrs:
-                            mission_uid.color = color.attrs["value"]
-                        if icon:
-                            mission_uid.iconset_path = icon["iconsetpath"]
-                        if point:
-                            mission_uid.latitude = float(point.attrs["lat"])
-                            mission_uid.longitude = float(point.attrs["lon"])
-                        if contact:
-                            mission_uid.callsign = contact.attrs["callsign"]
-
-                        try:
-                            db.session.add(mission_uid)
-                            db.session.commit()
-                        except sqlalchemy.exc.IntegrityError:
-                            db.session.rollback()
-                            db.session.execute(update(MissionUID).values(**mission_uid.serialize()))
-
-                        mission_change = MissionChange()
-                        mission_change.isFederatedChange = False
-                        mission_change.change_type = MissionChange.ADD_CONTENT
-                        mission_change.mission_name = destination.attrs["mission"]
-                        mission_change.timestamp = datetime_from_iso8601_string(
-                            event.attrs["start"]
-                        )
-                        mission_change.creator_uid = uid
-                        mission_change.server_time = datetime_from_iso8601_string(
-                            event.attrs["start"]
-                        )
-                        mission_change.mission_uid = event.attrs["uid"]
-
-                        change_pk = db.session.execute(
-                            insert(MissionChange).values(**mission_change.serialize())
-                        )
-                        db.session.commit()
-
-                        body = {
-                            "uid": self.context.app.config.get("RAVEN_NODE_ID"),
-                            "cot": tostring(
-                                generate_mission_change_cot(
-                                    mission_name=str(destination.attrs["mission"]),
-                                    mission=mission,
-                                    mission_change=mission_change,
-                                    cot_event=event,
-                                )
-                            ).decode("utf-8"),
-                        }
-                        mission_changes.append({"mission": mission.name, "message": body})
-                        self.rabbit_channel.basic_publish(
-                            "missions",
-                            routing_key=f"missions.{mission.name}",
-                            body=json.dumps(body),
-                        )
-
-        if mission_changes:
-            for change in mission_changes:
+                # The raw incoming CoT itself, for anything subscribed to the
+                # live event stream -- independent of the mission-change
+                # record below, which is Data Sync's own history/notification
+                # mechanism.
                 self.rabbit_channel.basic_publish(
                     "missions",
-                    routing_key=f"missions.{change['mission']}",
-                    body=json.dumps(change["message"]),
-                    properties=pika.BasicProperties(
-                        expiration=self.context.app.config.get("RAVEN_RABBITMQ_TTL")
+                    routing_key=f"missions.{mission_name}",
+                    body=json.dumps({"uid": uid, "cot": str(event)}),
+                    properties=ttl,
+                )
+
+                color = event.find("color")
+                icon = event.find("usericon")
+                point = event.find("point")
+                contact = event.find("contact")
+
+                iconset_path = None
+                if icon and "iconsetpath" in icon.attrs:
+                    iconset_path = icon.attrs["iconsetpath"]
+                elif icon and "iconsetPath" in icon.attrs:
+                    iconset_path = icon.attrs["iconsetPath"]
+
+                cot_color = None
+                if color and "argb" in color.attrs:
+                    cot_color = color.attrs["argb"]
+                elif color and "value" in color.attrs:
+                    cot_color = color.attrs["value"]
+
+                _mission_uid, _mission_change, change_cot = upsert_mission_uid_and_change(
+                    mission_name,
+                    mission,
+                    event.attrs["uid"],
+                    uid,
+                    datetime_from_iso8601_string(event.attrs["start"]),
+                    cot_type=event.attrs.get("type"),
+                    callsign=contact.attrs["callsign"] if contact and "callsign" in contact.attrs else None,
+                    iconset_path=iconset_path,
+                    color=cot_color,
+                    latitude=float(point.attrs["lat"]) if point else None,
+                    longitude=float(point.attrs["lon"]) if point else None,
+                )
+
+                self.rabbit_channel.basic_publish(
+                    "missions",
+                    routing_key=f"missions.{mission_name}",
+                    body=json.dumps(
+                        {
+                            "uid": self.context.app.config.get("RAVEN_NODE_ID"),
+                            "cot": tostring(change_cot).decode("utf-8"),
+                        }
                     ),
+                    properties=ttl,
                 )
 
     def route_cot(self, event, uid: str, user_id: int, target_groups: list[str] | None = None):
