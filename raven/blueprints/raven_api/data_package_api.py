@@ -7,11 +7,15 @@ from flask import Blueprint
 from flask import current_app as app
 from flask import jsonify, request, send_from_directory
 from flask_babel import gettext
-from flask_security import auth_required
+from flask_security import auth_required, current_user
 from sqlalchemy import update
 from werkzeug.datastructures import ImmutableMultiDict
 
-from raven.blueprints.marti_api.data_package_marti_api import data_package_share
+from raven.blueprints.marti_api.data_package_marti_api import (
+    can_access_data_package,
+    data_package_share,
+    visible_data_packages,
+)
 from raven.blueprints.raven_api.api import paginate, search
 from raven.extensions import db, logger
 from raven.forms.data_package_form import DataPackageUpdateForm
@@ -24,6 +28,10 @@ data_package_api = Blueprint("data_package_api", __name__)
 @data_package_api.route("/api/data_packages", methods=["PATCH"])
 @auth_required()
 def edit_data_package():
+    # These flags push the package to every device, so only admins may set them
+    if not current_user.has_role("administrator"):
+        return jsonify({"success": False, "error": gettext("Administrator role required")}), 403
+
     form = DataPackageUpdateForm(formdata=ImmutableMultiDict(request.json))
     if not form.validate():
         return jsonify({"success": False, "errors": form.errors}), 400
@@ -46,6 +54,20 @@ def edit_data_package():
                     "success": False,
                     "error": gettext(
                         "Server connection data packages can't be installed on enrollment or connection"
+                    ),
+                }
+            ),
+            400,
+        )
+
+    wants_auto_install = form.install_on_enrollment.data or form.install_on_connection.data
+    if data_package.is_private and wants_auto_install:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "Private data packages can't be installed on enrollment or connection"
                     ),
                 }
             ),
@@ -81,6 +103,18 @@ def delete_data_package():
     data_package = db.session.execute(query).first()
     if not data_package:
         return jsonify({"success": False, "error": gettext("Invalid/unknown hash")}), 400
+
+    dp = data_package[0]
+    is_owner = dp.submission_user == current_user.id or (
+        dp.eud is not None and dp.eud.user_id == current_user.id
+    )
+    if not (is_owner or current_user.has_role("administrator")):
+        return (
+            jsonify(
+                {"success": False, "error": gettext("You can only delete your own data packages")}
+            ),
+            403,
+        )
 
     try:
         logger.warning(
@@ -122,6 +156,7 @@ def data_packages():
     query = search(query, DataPackage, "mime_type")
     query = search(query, DataPackage, "size")
     query = search(query, DataPackage, "tool")
+    query = visible_data_packages(query, current_user, admin_sees_all=True)
 
     return paginate(query, DataPackage)
 
@@ -151,6 +186,17 @@ def data_package_download():
                 }
             ),
             404,
+        )
+
+    if not can_access_data_package(data_package[0], current_user):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("This data package is private to its sender and recipients"),
+                }
+            ),
+            403,
         )
 
     download_name = data_package[0].filename

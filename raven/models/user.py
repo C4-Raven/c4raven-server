@@ -14,6 +14,7 @@ from raven.models.Group import Group
 # processes -- eud_handler, cot_parser, fedhub_bridge -- configure the User
 # mapper at all.
 from raven.models.SupportingDocument import SupportingDocument  # noqa: F401
+from raven.models.DataPackageRecipient import DataPackageRecipient  # noqa: F401
 from raven.models.Token import Token
 from raven.models.WebAuthn import WebAuthn
 

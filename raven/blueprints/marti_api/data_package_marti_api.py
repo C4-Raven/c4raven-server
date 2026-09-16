@@ -15,13 +15,18 @@ from flask import current_app as app
 from flask import jsonify, request, send_from_directory
 from flask_babel import gettext
 from flask_login import current_user
+from sqlalchemy import func, or_, select
 from werkzeug.datastructures.file_storage import FileStorage
 from werkzeug.utils import secure_filename
 
+from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, logger
 from raven.functions import format_bytes, iso8601_string_from_datetime
 from raven.models.DataPackage import DataPackage
+from raven.models.DataPackageRecipient import DataPackageRecipient
+from raven.models.EUD import EUD
 from raven.models.MissionContent import MissionContent
+from raven.models.user import User
 
 data_package_marti_api = Blueprint("data_package_marti_api", __name__)
 
@@ -68,13 +73,23 @@ def save_data_package_to_db(
         data_package = DataPackage()
         data_package.filename = filename
         data_package.hash = sha256_hash
-        data_package.creator_uid = request.args.get("CreatorUid")  # iTAK
-        data_package.creator_uid = request.args.get("creatorUid")  # All other TAK clients
+        # iTAK sends CreatorUid, every other TAK client creatorUid; an explicit eud_uid
+        # argument wins. This used to be overwritten with a None eud_uid unconditionally,
+        # leaving every Marti upload without a sender -- which private-package access
+        # control needs.
+        creator_uid = (
+            eud_uid or request.args.get("creatorUid") or request.args.get("CreatorUid")
+        )
+        if creator_uid and not db.session.execute(
+            db.session.query(EUD.uid).filter_by(uid=creator_uid)
+        ).first():
+            # FK to euds.uid: an unknown uid would fail the insert outright
+            creator_uid = None
+        data_package.creator_uid = creator_uid
         data_package.submission_user = current_user.id if current_user.is_authenticated else None
         data_package.submission_time = datetime.now(timezone.utc)
         data_package.mime_type = mimetype
         data_package.size = file_size
-        data_package.creator_uid = eud_uid
 
         if username:
             user = app.security.datastore.find_user(username=username)
@@ -175,6 +190,63 @@ def create_data_package_zip(file: FileStorage | str) -> str:
     return data_package_hash
 
 
+def data_package_caller() -> User | None:
+    """The user behind this request: web session if there is one, else the Marti client cert
+    nginx forwarded. None for anonymous/unverifiable callers."""
+    if current_user.is_authenticated:
+        return current_user
+    try:
+        cert = verify_client_cert()
+        if not cert:
+            return None
+        return app.security.datastore.find_user(username=cert.get_subject().commonName)
+    except BaseException:
+        # A malformed cert header shouldn't 500 a listing; treat as anonymous.
+        return None
+
+
+def visible_data_packages(query, user, admin_sees_all: bool = False):
+    """Restrict a DataPackage query/select to what `user` may see: public packages, plus
+    private ones they sent or were sent (TAK Server semantics for tool=private)."""
+    if admin_sees_all and user is not None and user.has_role("administrator"):
+        return query
+
+    is_public = or_(DataPackage.tool.is_(None), func.lower(DataPackage.tool) != "private")
+    if user is None:
+        return query.filter(is_public)
+
+    # Sender may be identified by web user or by the uploading EUD; recipients are
+    # recorded by uid or callsign depending on which client addressed the fileshare CoT.
+    user_eud_uids = select(EUD.uid).where(EUD.user_id == user.id)
+    user_callsigns = select(EUD.callsign).where(EUD.user_id == user.id, EUD.callsign.isnot(None))
+    received = select(DataPackageRecipient.data_package_hash).where(
+        or_(
+            DataPackageRecipient.eud_uid.in_(user_eud_uids),
+            DataPackageRecipient.callsign.in_(user_callsigns),
+        )
+    )
+
+    return query.filter(
+        or_(
+            is_public,
+            DataPackage.submission_user == user.id,
+            DataPackage.creator_uid.in_(user_eud_uids),
+            DataPackage.hash.in_(received),
+        )
+    )
+
+
+def can_access_data_package(dp: DataPackage, user) -> bool:
+    """Whether `user` may download `dp`. Deliberately no admin bypass: admins can see private
+    packages listed but the contents stay between sender and recipients."""
+    if not dp.is_private:
+        return True
+    return (
+        visible_data_packages(db.session.query(DataPackage).filter_by(hash=dp.hash), user).first()
+        is not None
+    )
+
+
 @data_package_marti_api.route("/Marti/sync/missionupload", methods=["POST"])
 def data_package_share():
     if not len(request.files):
@@ -228,9 +300,12 @@ def data_package_metadata(file_hash):
             ).first()
             if data_package:
                 data_package = data_package[0]
-                data_package.keywords = bleach.clean(request.data.decode("utf-8"))
-                db.session.add(data_package)
-                db.session.commit()
+                # ATAK sends "private" for user-to-user transfers, "public" otherwise
+                tool = bleach.clean(request.data.decode("utf-8")).strip()
+                if tool:
+                    data_package.tool = tool
+                    db.session.add(data_package)
+                    db.session.commit()
                 return "", 200
             else:
                 return "", 404
@@ -244,6 +319,8 @@ def data_package_metadata(file_hash):
         ).scalar_one_or_none()
         if not data_package:
             return "", 404
+        if not can_access_data_package(data_package, data_package_caller()):
+            return jsonify({"success": False, "error": "Forbidden"}), 403
         return send_from_directory(
             app.config.get("UPLOAD_FOLDER"),
             data_package.hash + ".zip",
@@ -267,6 +344,7 @@ def get_data_package():
     if data_package_uid:
         query = query.where(DataPackage.hash == data_package_uid)
 
+    query = visible_data_packages(query, data_package_caller())
     data_packages = db.session.execute(query).scalars()
     return_value = {
         "version": "3",
@@ -300,7 +378,7 @@ def get_data_package():
                     "creatorUid": dp.creator_uid,
                     "hash": dp.hash,
                     "size": dp.size,
-                    "tool": dp.tool,
+                    "tool": dp.tool or "public",
                     "groups": [],
                     "expiration": expiration,
                     "latitude": 0,
@@ -323,6 +401,7 @@ def data_package_search():
     if data_package_uid:
         query = query.where(DataPackage.hash == data_package_uid)
 
+    query = visible_data_packages(query, data_package_caller())
     data_packages = db.session.execute(query).scalars()
     res = {"resultCount": 0, "results": []}
     for dp in data_packages:
@@ -354,6 +433,10 @@ def data_package_search():
 def download_data_package():
     file_hash = request.args.get("hash")
     file = db.session.execute(db.select(DataPackage).filter_by(hash=file_hash)).first()
+    if file and not can_access_data_package(file[0], data_package_caller()):
+        if request.method == "HEAD":
+            return "", 403
+        return jsonify({"success": False, "error": "Forbidden"}), 403
     if not file:
         file = db.session.execute(db.select(MissionContent).filter_by(hash=file_hash)).first()
     if not file and request.method == "HEAD":
@@ -426,6 +509,7 @@ def get_metadata():
     if name:
         query = query.filter_by(filename=bleach.clean(name))
 
+    query = visible_data_packages(query, data_package_caller())
     data_packages = db.session.execute(query).scalars()
 
     response = {

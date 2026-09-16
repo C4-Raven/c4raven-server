@@ -36,6 +36,19 @@ class DataPackage(db.Model):
     eud: Mapped["EUD"] = relationship(back_populates="data_packages")
     certificate = relationship("Certificate", back_populates="data_package", uselist=False)
     user = relationship("User", back_populates="data_packages")
+    recipients = relationship(
+        "DataPackageRecipient",
+        back_populates="data_package",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    @property
+    def is_private(self) -> bool:
+        """tool=private is what ATAK sets on user-to-user file transfers; anything else
+        (including the NULL legacy rows predate the tool column being honoured) is
+        public, matching TAK Server."""
+        return (self.tool or "").strip().lower() == "private"
 
     def serialize(self):
         return {
@@ -51,6 +64,7 @@ class DataPackage(db.Model):
             "expiration": self.expiration,
             "install_on_enrollment": self.install_on_enrollment,
             "install_on_connection": self.install_on_connection,
+            "private": self.is_private,
         }
 
     def to_json(self, include_eud=True):
@@ -68,4 +82,5 @@ class DataPackage(db.Model):
             "eud": self.eud.to_json(False) if include_eud and self.eud else None,
             "install_on_enrollment": self.install_on_enrollment,
             "install_on_connection": self.install_on_connection,
+            "private": self.is_private,
         }

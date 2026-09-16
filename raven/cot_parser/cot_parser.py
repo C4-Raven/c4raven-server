@@ -40,6 +40,7 @@ from raven.models.Chatrooms import Chatroom
 from raven.models.ChatroomsUids import ChatroomsUids
 from raven.models.CoT import CoT
 from raven.models.DataPackage import DataPackage
+from raven.models.DataPackageRecipient import DataPackageRecipient
 from raven.models.DeviceProfiles import DeviceProfiles
 from raven.models.EUD import EUD
 from raven.models.EUDStats import EUDStats
@@ -72,6 +73,43 @@ from raven.models.CITrap import CITrap
 # standalone process -- see the same import in eud_handler.py.
 from raven.models.SupportingDocument import SupportingDocument  # noqa: F401
 from raven.proto import atak_pb2
+
+
+def parse_fileshare(event, sender_uid: str | None):
+    """Pure XML extraction for a b-f-t-r (fileshare) CoT.
+
+    Returns (sha256, fileshare_sender_uid, callsigns, uids) or None when the
+    event is not a fileshare with a hash. Mission dests are ignored and the
+    sender's own uid is dropped so it never gets recorded as a recipient.
+    """
+    if event.attrs.get("type") != "b-f-t-r":
+        return None
+
+    fileshare = event.find("fileshare")
+    if not fileshare:
+        return None
+
+    sha256 = fileshare.attrs.get("sha256")
+    if not sha256:
+        return None
+
+    fileshare_sender_uid = fileshare.attrs.get("senderUid") or None
+
+    callsigns: list[str] = []
+    uids: list[str] = []
+    for dest in event.find_all("dest"):
+        if "mission" in dest.attrs:
+            continue
+        callsign = dest.attrs.get("callsign")
+        dest_uid = dest.attrs.get("uid")
+        if callsign:
+            if callsign not in callsigns:
+                callsigns.append(callsign)
+        elif dest_uid and dest_uid != sender_uid:
+            if dest_uid not in uids:
+                uids.append(dest_uid)
+
+    return sha256, fileshare_sender_uid, callsigns, uids
 
 
 class CoTController:
@@ -1137,6 +1175,74 @@ class CoTController:
                     properties=ttl,
                 )
 
+    def record_fileshare_recipients(self, event, uid: str | None):
+        """Remember who a private data package was sent to, so downloads of it
+        can be limited to the sender and the addressed recipients."""
+        parsed = parse_fileshare(event, uid)
+        if not parsed:
+            return
+
+        sha256, fileshare_sender_uid, callsigns, uids = parsed
+        if not callsigns and not uids:
+            return
+
+        with self.context:
+            try:
+                data_package = self.db.session.execute(
+                    self.db.session.query(DataPackage).filter_by(hash=sha256)
+                ).scalar()
+                if not data_package:
+                    # ATAK uploads before sending the CoT, so this should be rare
+                    self.logger.debug(f"No data package with hash {sha256} for fileshare CoT")
+                    return
+
+                # The download authorization relies on creator_uid to identify the sender
+                if not data_package.creator_uid and fileshare_sender_uid:
+                    sender = self.db.session.execute(
+                        self.db.session.query(EUD).filter_by(uid=fileshare_sender_uid)
+                    ).scalar()
+                    if sender:
+                        data_package.creator_uid = fileshare_sender_uid
+
+                recipients: list[tuple[str | None, str | None]] = []
+                for callsign in callsigns:
+                    eud = self.db.session.execute(
+                        self.db.session.query(EUD).filter_by(callsign=callsign)
+                    ).scalar()
+                    recipients.append((eud.uid if eud else None, callsign))
+                for dest_uid in uids:
+                    eud = self.db.session.execute(
+                        self.db.session.query(EUD).filter_by(uid=dest_uid)
+                    ).scalar()
+                    recipients.append((dest_uid, eud.callsign if eud else None))
+
+                now = datetime.now(timezone.utc)
+                for eud_uid, callsign in recipients:
+                    # Query first rather than relying on IntegrityError so one duplicate
+                    # doesn't roll back the other rows in this session
+                    existing = self.db.session.execute(
+                        self.db.session.query(DataPackageRecipient).filter_by(
+                            data_package_hash=sha256, eud_uid=eud_uid, callsign=callsign
+                        )
+                    ).scalar()
+                    if existing:
+                        continue
+                    self.db.session.add(
+                        DataPackageRecipient(
+                            data_package_hash=sha256,
+                            eud_uid=eud_uid,
+                            callsign=callsign,
+                            created_at=now,
+                        )
+                    )
+
+                self.db.session.commit()
+            except BaseException as e:
+                self.logger.error(f"Failed to record fileshare recipients: {e}")
+                self.logger.debug(traceback.format_exc())
+                # Don't let one bad message poison the shared session
+                self.db.session.rollback()
+
     def route_cot(self, event, uid: str, user_id: int, target_groups: list[str] | None = None):
         if not uid or uid == self.context.app.config.get("RAVEN_NODE_ID"):
             # This is a server generated CoT (i.e. ADS-B scheduled job) which was already properly routed
@@ -1268,6 +1374,7 @@ class CoTController:
                 self.parse_rbline(event, uid, point_pk, cot_pk)
                 self.parse_stats(event, uid)
                 self.generate_mission_change(uid, event)
+                self.record_fileshare_recipients(event, uid)
                 self.route_cot(event, uid, body.get("user_id"), body.get("target_groups"))
                 self.rabbit_channel.basic_ack(delivery_tag=basic_deliver.delivery_tag)
 
