@@ -431,6 +431,58 @@ def me():
     return jsonify(current_user.to_json())
 
 
+@api_blueprint.route("/api/plugins/ravenclear/pubkey")
+@auth_required()
+def ravenclear_pubkey():
+    """Return the ravenclear server signing public key for manual install.
+
+    Devices normally receive this automatically via the connection device
+    profile (pref ``ravenclear.server_pubkey``); this route exposes it for
+    manual provisioning / verification.
+
+    :rtype: object
+    """
+    from raven import remote_clear
+
+    return jsonify(
+        {"pem": remote_clear.public_key_pem(), "der_b64": remote_clear.public_key_der_b64()}
+    )
+
+
+@api_blueprint.route("/api/plugins/ravenclear/apk")
+@auth_required()
+def ravenclear_apk():
+    """Serve the C4 Raven Remote Clear ATAK plugin APK for sideloading.
+
+    The APK must be built and TAK-signed off-server (see the plugin's BUILD.md),
+    then dropped at <RAVEN_DATA_FOLDER>/plugins/ravenclear.apk. Until then this
+    returns a 404 with guidance rather than a broken download.
+    """
+    plugins_dir = os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "plugins")
+    apk = os.path.join(plugins_dir, "ravenclear.apk")
+    if not os.path.exists(apk):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "The Remote Clear plugin APK has not been uploaded yet. Build and "
+                        "TAK-sign it (see the plugin BUILD.md), then place it at "
+                        "%(path)s.",
+                        path=apk,
+                    ),
+                }
+            ),
+            404,
+        )
+    return send_from_directory(
+        plugins_dir,
+        "ravenclear.apk",
+        as_attachment=True,
+        download_name="C4Raven-RemoteClear.apk",
+    )
+
+
 @api_blueprint.route("/api/cot", methods=["GET"])
 @auth_required()
 def query_cot():

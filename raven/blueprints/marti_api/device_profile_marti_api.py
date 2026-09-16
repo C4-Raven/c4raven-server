@@ -15,6 +15,7 @@ from sqlalchemy import or_
 from werkzeug.wsgi import FileWrapper
 
 import raven
+from raven import remote_clear
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, ldap_manager, logger
 from raven.models.DataPackage import DataPackage
@@ -163,6 +164,20 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
                 db.session.query(DataPackage).filter_by(install_on_enrollment=True)
             ).all()
     else:
+        # ravenclear: provision the server's public signing key to every
+        # connected device. The device plugin fails CLOSED (ignores all remote
+        # "clear content" commands) without this pref, so it must always be
+        # present in the connection profile. This is a static/always-included
+        # entry -- deliberately NOT a DB DeviceProfiles row -- keyed off the
+        # server key material under RAVEN_CA_FOLDER. Value is single-line Base64
+        # of the SPKI DER public key (the exact wire format the plugin expects).
+        ravenclear_pubkey = SubElement(
+            pref,
+            "entry",
+            {"key": remote_clear.SERVER_PUBKEY_PREF_KEY, "class": "class java.lang.String"},
+        )
+        ravenclear_pubkey.text = remote_clear.public_key_der_b64()
+
         device_profile_query = db.session.query(DeviceProfiles).filter_by(
             connection=True, active=True
         )

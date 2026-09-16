@@ -24,6 +24,7 @@ from flask_security import (
 )
 from werkzeug.utils import secure_filename
 
+from raven.remote_clear import build_clear_cot
 from raven.blueprints.marti_api.data_package_marti_api import (
     create_data_package_zip,
     save_data_package_file,
@@ -1342,3 +1343,107 @@ def delete_user_filter(filter_id):
     db.session.commit()
 
     return jsonify({"success": True})
+
+
+@user_api_blueprint.route("/api/user/clear_content", methods=["POST"])
+@roles_accepted("administrator")
+def clear_user_content():
+    """Remotely clear ATAK content on a user's devices.
+
+    Sends a signed ``t-x-raven-clr`` command (see raven.remote_clear) to each of
+    the user's EUDs. Only devices that are online AND running the C4 Raven Remote
+    Clear plugin act on it; the plugin verifies the server signature, that the
+    command targets its own uid, and that it arrived over the server stream, then
+    runs ATAK's Clear Content (a full local wipe; the app exits). This does not
+    touch server-side data and is not reversible on the device.
+    """
+    if app.config.get("RAVEN_ENABLE_LDAP"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("LDAP is enabled, please manage users on your LDAP server"),
+                }
+            ),
+            400,
+        )
+
+    username = bleach.clean(request.json.get("username", ""))
+    if not username:
+        return (
+            jsonify({"success": False, "error": gettext("Please specify a username")}),
+            400,
+        )
+
+    # Protected accounts (other admins, etc.) are shielded the same way as
+    # deactivation: an admin shouldn't be able to wipe a protected peer's device.
+    protected_response = _protected_user_response(username)
+    if protected_response:
+        return protected_response
+
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("User %(username)s does not exist", username=username),
+                }
+            ),
+            404,
+        )
+
+    clearmaps = bool(request.json.get("clearmaps", False))
+
+    euds = db.session.execute(db.session.query(EUD).filter_by(user_id=user.id)).all()
+    if not euds:
+        return (
+            jsonify(
+                {"success": False, "error": gettext("This user has no enrolled devices")}
+            ),
+            400,
+        )
+
+    node_id = app.config.get("RAVEN_NODE_ID")
+    rabbit_connection = None
+    try:
+        rabbit_credentials = pika.PlainCredentials(
+            app.config.get("RAVEN_RABBITMQ_USERNAME"),
+            app.config.get("RAVEN_RABBITMQ_PASSWORD"),
+        )
+        rabbit_connection = pika.BlockingConnection(
+            pika.ConnectionParameters(
+                host=app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS"),
+                credentials=rabbit_credentials,
+            )
+        )
+        channel = rabbit_connection.channel()
+        for eud in euds:
+            cot = build_clear_cot(eud[0].uid, clearmaps=clearmaps, node_id=node_id)
+            channel.basic_publish(
+                exchange="dms",
+                routing_key=eud[0].uid,
+                # body uid MUST be the server node id, not the device uid:
+                # EudHandler.on_message drops any message whose uid == the
+                # receiving device's own uid (its echo-suppression rule).
+                body=json.dumps({"uid": node_id, "cot": cot}),
+                # 10 minutes: a wipe command must not linger in a queue and land
+                # on a device that reconnects long after the admin acted.
+                properties=pika.BasicProperties(expiration="600000"),
+            )
+        channel.close()
+    except BaseException as e:
+        logger.error(f"Failed to send clear-content command for {username}: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        if rabbit_connection is not None and rabbit_connection.is_open:
+            rabbit_connection.close()
+
+    logger.warning(
+        "Admin %s issued remote clear-content for %s across %d device(s) (clearmaps=%s)",
+        current_user.username,
+        username,
+        len(euds),
+        clearmaps,
+    )
+    return jsonify({"success": True, "devices": len(euds), "clearmaps": clearmaps})
