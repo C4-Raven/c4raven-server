@@ -55,6 +55,8 @@ from raven.models.DataPackage import DataPackage
 from raven.models.DeviceProfiles import DeviceProfiles
 from raven.models.EUD import EUD
 from raven.models.EUDStats import EUDStats
+from raven.models.PendingClearCommand import PendingClearCommand
+from raven import remote_clear
 from raven.models.Group import Group
 from raven.models.GroupMission import GroupMission
 from raven.models.GroupUser import GroupUser
@@ -817,6 +819,50 @@ class EudHandler(socketserver.BaseRequestHandler):
                         update(EUD).where(EUD.uid == eud.uid).values(**eud.serialize())
                     )
                     db.session.commit()
+
+                # Deliver any clear-content commands an admin queued while this
+                # device was offline. The device's dms queue and consumer were
+                # set up above, so a publish now lands immediately. A fresh CoT
+                # is signed per row (build_clear_cot), so it is inside the
+                # plugin's freshness window even if it was queued hours ago.
+                # Rows are stamped delivered rather than deleted (audit trail);
+                # filtering on delivered_at == None keeps a device from being
+                # re-wiped on every subsequent reconnect. Never let a delivery
+                # failure break the connection handshake.
+                if self.rabbit_channel and self.rabbit_channel.is_open:
+                    try:
+                        pending = (
+                            db.session.execute(
+                                select(PendingClearCommand).filter_by(
+                                    eud_uid=uid, delivered_at=None
+                                )
+                            )
+                            .scalars()
+                            .all()
+                        )
+                        if pending:
+                            node_id = self.app.config.get("RAVEN_NODE_ID")
+                            delivered_at = datetime.datetime.now(datetime.timezone.utc)
+                            for pc in pending:
+                                remote_clear.publish_clear_cot(
+                                    self.rabbit_channel,
+                                    uid,
+                                    node_id,
+                                    clearmaps=pc.clearmaps,
+                                    expiration=None,
+                                )
+                                pc.delivered_at = delivered_at
+                            db.session.commit()
+                            self.logger.warning(
+                                "Delivered %d queued clear command(s) to %s on reconnect",
+                                len(pending),
+                                uid,
+                            )
+                    except Exception as e:
+                        db.session.rollback()
+                        self.logger.error(
+                            "Failed to deliver queued clear commands for %s: %s", uid, e
+                        )
 
                 # If the RabbitMQ channel is open, publish the EUD info to socketio to be displayed on the web UI map.
                 # Also save the EUD's info for on_channel_open to publish

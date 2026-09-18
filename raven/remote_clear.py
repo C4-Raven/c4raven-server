@@ -13,8 +13,10 @@ trigger for this, so it is driven by our own ATAK plugin
 
 The private signing key never leaves the server; devices hold only the public
 key, so a compromised device cannot forge a wipe command for any other device.
-This module owns the key material and the signed-CoT construction; nothing here
-sends anything (see raven/blueprints/raven_api/user_api.py for the endpoint).
+This module owns the key material and the signed-CoT construction. It also
+offers a thin ``publish_clear_cot`` helper that puts a freshly-signed command on
+the ``dms`` exchange, shared by the admin endpoint (immediate send) and by
+EudHandler (delivery of commands queued while a device was offline).
 
 Wire contract (must match the plugin's ClearCommandVerifier exactly):
   CoT type      "t-x-raven-clr"
@@ -27,10 +29,13 @@ Wire contract (must match the plugin's ClearCommandVerifier exactly):
 """
 
 import base64
+import json
 import os
 import time
 import uuid
 from xml.etree.ElementTree import Element, SubElement, tostring
+
+import pika
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -171,6 +176,33 @@ def build_clear_cot(target_uid: str, clearmaps: bool = False, node_id: str | Non
     )
     return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + tostring(
         event, encoding="unicode"
+    )
+
+
+# Ten minutes, matching the CoT's own stale window: an immediate send that is
+# not consumed promptly must not linger in the queue and land on a device that
+# reconnects much later. Reconnect delivery passes expiration=None instead,
+# since the device is already connected and consuming when it is published.
+DEFAULT_CLEAR_EXPIRATION_MS = "600000"
+
+
+def publish_clear_cot(channel, target_uid, node_id, clearmaps=False, expiration=DEFAULT_CLEAR_EXPIRATION_MS):
+    """Build a freshly-signed clear command for ``target_uid`` and publish it to
+    the ``dms`` exchange so the device's direct-message queue receives it.
+
+    ``channel`` is any open pika channel (the endpoint's BlockingConnection
+    channel, or EudHandler's SelectConnection channel). The message uid is the
+    server ``node_id``, never the device uid: EudHandler.on_message drops any
+    message whose uid equals the receiving device's own uid (echo suppression).
+    Pass ``expiration=None`` to publish without a per-message TTL.
+    """
+    cot = build_clear_cot(target_uid, clearmaps=clearmaps, node_id=node_id)
+    properties = pika.BasicProperties(expiration=expiration) if expiration else pika.BasicProperties()
+    channel.basic_publish(
+        exchange="dms",
+        routing_key=target_uid,
+        body=json.dumps({"uid": node_id, "cot": cot}),
+        properties=properties,
     )
 
 

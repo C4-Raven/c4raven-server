@@ -24,7 +24,8 @@ from flask_security import (
 )
 from werkzeug.utils import secure_filename
 
-from raven.remote_clear import build_clear_cot
+from raven import remote_clear
+from raven.models.PendingClearCommand import PendingClearCommand
 from raven.blueprints.marti_api.data_package_marti_api import (
     create_data_package_zip,
     save_data_package_file,
@@ -1394,6 +1395,11 @@ def clear_user_content():
         )
 
     clearmaps = bool(request.json.get("clearmaps", False))
+    # When set, a command for a device that is offline right now is stored and
+    # delivered on that device's next connection (see PendingClearCommand and
+    # EudHandler's reconnect flush). When unset, only devices online right now
+    # are reached; the old best-effort behaviour.
+    queue_if_offline = bool(request.json.get("queue_if_offline", False))
 
     euds = db.session.execute(db.session.query(EUD).filter_by(user_id=user.id)).all()
     if not euds:
@@ -1405,6 +1411,9 @@ def clear_user_content():
         )
 
     node_id = app.config.get("RAVEN_NODE_ID")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    sent_now = 0
+    queued = 0
     rabbit_connection = None
     try:
         rabbit_credentials = pika.PlainCredentials(
@@ -1419,20 +1428,37 @@ def clear_user_content():
         )
         channel = rabbit_connection.channel()
         for eud in euds:
-            cot = build_clear_cot(eud[0].uid, clearmaps=clearmaps, node_id=node_id)
-            channel.basic_publish(
-                exchange="dms",
-                routing_key=eud[0].uid,
-                # body uid MUST be the server node id, not the device uid:
-                # EudHandler.on_message drops any message whose uid == the
-                # receiving device's own uid (its echo-suppression rule).
-                body=json.dumps({"uid": node_id, "cot": cot}),
-                # 10 minutes: a wipe command must not linger in a queue and land
-                # on a device that reconnects long after the admin acted.
-                properties=pika.BasicProperties(expiration="600000"),
-            )
+            device = eud[0]
+            online = device.last_status == "Connected"
+            if online or not queue_if_offline:
+                # Online devices are reached live; when the admin did not opt to
+                # queue, offline devices still get a best-effort publish that
+                # expires in the queue after ten minutes (the old behaviour).
+                remote_clear.publish_clear_cot(
+                    channel, device.uid, node_id, clearmaps=clearmaps
+                )
+                sent_now += 1
+            else:
+                # Offline and queuing requested: persist the intent. A fresh
+                # signed CoT is built when the device reconnects, so it will be
+                # within the plugin's freshness window then. No immediate publish
+                # here, so a device that reconnects and consumes the queued row
+                # is never also handed a stale duplicate.
+                db.session.add(
+                    PendingClearCommand(
+                        eud_uid=device.uid,
+                        clearmaps=clearmaps,
+                        requested_by=current_user.username,
+                        requested_at=now,
+                        node_id=node_id,
+                    )
+                )
+                queued += 1
         channel.close()
+        if queued:
+            db.session.commit()
     except BaseException as e:
+        db.session.rollback()
         logger.error(f"Failed to send clear-content command for {username}: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
     finally:
@@ -1440,10 +1466,21 @@ def clear_user_content():
             rabbit_connection.close()
 
     logger.warning(
-        "Admin %s issued remote clear-content for %s across %d device(s) (clearmaps=%s)",
+        "Admin %s issued remote clear-content for %s: %d sent now, %d queued for "
+        "reconnect (clearmaps=%s, queue_if_offline=%s)",
         current_user.username,
         username,
-        len(euds),
+        sent_now,
+        queued,
         clearmaps,
+        queue_if_offline,
     )
-    return jsonify({"success": True, "devices": len(euds), "clearmaps": clearmaps})
+    return jsonify(
+        {
+            "success": True,
+            "devices": len(euds),
+            "sent_now": sent_now,
+            "queued": queued,
+            "clearmaps": clearmaps,
+        }
+    )
