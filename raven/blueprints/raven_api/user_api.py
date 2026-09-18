@@ -1352,11 +1352,33 @@ def clear_user_content():
     """Remotely clear ATAK content on a user's devices.
 
     Sends a signed ``t-x-raven-clr`` command (see raven.remote_clear) to each of
-    the user's EUDs. Only devices that are online AND running the C4 Raven Remote
-    Clear plugin act on it; the plugin verifies the server signature, that the
-    command targets its own uid, and that it arrived over the server stream, then
-    runs ATAK's Clear Content (a full local wipe; the app exits). This does not
-    touch server-side data and is not reversible on the device.
+    the user's EUDs. Only devices running the C4 Raven Remote Clear plugin act
+    on it; the plugin verifies the server signature, that the command targets
+    its own uid, and that it arrived over the server stream, then runs ATAK's
+    Clear Content (a full local wipe; the app exits). This does not touch
+    server-side data and is not reversible on the device.
+
+    Two delivery modes, chosen by ``queue_if_offline``:
+
+    * false (default): best-effort live publish to every device's direct-message
+      queue with a ten-minute TTL. Reaches whoever is genuinely connected right
+      now; anything else is silently lost.
+    * true: store-and-forward. One PendingClearCommand row is written for EVERY
+      device and NOTHING is published live. EudHandler delivers the row on the
+      device's next connection. Devices whose row currently says "Connected"
+      are asked (via the ``eud_control`` exchange) to drop their socket; ATAK
+      reconnects within seconds and the pending row is delivered then.
+
+    Why queue mode ignores last_status entirely: that column lags reality by up
+    to the TCP keepalive window. A phone whose wifi was switched off moments
+    ago still reads "Connected", so a "send live if online, else queue" rule
+    publishes into a dead socket, consumes the message (auto_ack) and never
+    retries it -- observed 2026-09-19. The plugin sends no delivery
+    acknowledgement, so the server cannot tell a live send that landed from
+    one that vanished, and sending live AND queueing would double-wipe a
+    device that really was online. The only safe rule is a single delivery
+    path: store, then deliver on the next connection, forcing that connection
+    for devices that look online.
     """
     if app.config.get("RAVEN_ENABLE_LDAP"):
         return (
@@ -1395,10 +1417,10 @@ def clear_user_content():
         )
 
     clearmaps = bool(request.json.get("clearmaps", False))
-    # When set, a command for a device that is offline right now is stored and
-    # delivered on that device's next connection (see PendingClearCommand and
-    # EudHandler's reconnect flush). When unset, only devices online right now
-    # are reached; the old best-effort behaviour.
+    # See the docstring: when set, every device gets a stored command that is
+    # delivered on its next connection (EudHandler.parse_device_info), and
+    # devices that look online are told to reconnect so that happens now.
+    # When unset, only devices online right now are reached (best effort).
     queue_if_offline = bool(request.json.get("queue_if_offline", False))
 
     euds = db.session.execute(db.session.query(EUD).filter_by(user_id=user.id)).all()
@@ -1414,8 +1436,26 @@ def clear_user_content():
     now = datetime.datetime.now(datetime.timezone.utc)
     sent_now = 0
     queued = 0
+    reconnect_requested = 0
     rabbit_connection = None
     try:
+        if queue_if_offline:
+            # Persist first, publish second: the row must be committed before
+            # any reconnect it triggers can look for it.
+            for eud in euds:
+                device = eud[0]
+                db.session.add(
+                    PendingClearCommand(
+                        eud_uid=device.uid,
+                        clearmaps=clearmaps,
+                        requested_by=current_user.username,
+                        requested_at=now,
+                        node_id=node_id,
+                    )
+                )
+                queued += 1
+            db.session.commit()
+
         rabbit_credentials = pika.PlainCredentials(
             app.config.get("RAVEN_RABBITMQ_USERNAME"),
             app.config.get("RAVEN_RABBITMQ_PASSWORD"),
@@ -1427,36 +1467,34 @@ def clear_user_content():
             )
         )
         channel = rabbit_connection.channel()
-        for eud in euds:
-            device = eud[0]
-            online = device.last_status == "Connected"
-            if online or not queue_if_offline:
-                # Online devices are reached live; when the admin did not opt to
-                # queue, offline devices still get a best-effort publish that
-                # expires in the queue after ten minutes (the old behaviour).
+
+        if queue_if_offline:
+            # Ask every handler for a device that looks online to drop its
+            # socket. ATAK auto-reconnects and the stored row is delivered on
+            # that reconnect. A handler whose peer is already dead (status not
+            # yet caught up) just closes early; nothing is lost either way.
+            # Args must match the declaration in raven.app / EudHandler
+            # exactly or the broker closes the channel with 406.
+            channel.exchange_declare("eud_control", durable=True, exchange_type="direct")
+            for eud in euds:
+                device = eud[0]
+                if device.last_status == "Connected":
+                    channel.basic_publish(
+                        exchange="eud_control",
+                        routing_key=device.uid,
+                        body=json.dumps({"action": "disconnect", "uid": device.uid}),
+                        properties=pika.BasicProperties(expiration="10000"),
+                    )
+                    reconnect_requested += 1
+        else:
+            # Best-effort live publish; expires in the queue after ten minutes.
+            for eud in euds:
+                device = eud[0]
                 remote_clear.publish_clear_cot(
                     channel, device.uid, node_id, clearmaps=clearmaps
                 )
                 sent_now += 1
-            else:
-                # Offline and queuing requested: persist the intent. A fresh
-                # signed CoT is built when the device reconnects, so it will be
-                # within the plugin's freshness window then. No immediate publish
-                # here, so a device that reconnects and consumes the queued row
-                # is never also handed a stale duplicate.
-                db.session.add(
-                    PendingClearCommand(
-                        eud_uid=device.uid,
-                        clearmaps=clearmaps,
-                        requested_by=current_user.username,
-                        requested_at=now,
-                        node_id=node_id,
-                    )
-                )
-                queued += 1
         channel.close()
-        if queued:
-            db.session.commit()
     except BaseException as e:
         db.session.rollback()
         logger.error(f"Failed to send clear-content command for {username}: {e}")
@@ -1467,11 +1505,12 @@ def clear_user_content():
 
     logger.warning(
         "Admin %s issued remote clear-content for %s: %d sent now, %d queued for "
-        "reconnect (clearmaps=%s, queue_if_offline=%s)",
+        "next connection, %d reconnect(s) requested (clearmaps=%s, queue_if_offline=%s)",
         current_user.username,
         username,
         sent_now,
         queued,
+        reconnect_requested,
         clearmaps,
         queue_if_offline,
     )
@@ -1481,6 +1520,7 @@ def clear_user_content():
             "devices": len(euds),
             "sent_now": sent_now,
             "queued": queued,
+            "reconnect_requested": reconnect_requested,
             "clearmaps": clearmaps,
         }
     )

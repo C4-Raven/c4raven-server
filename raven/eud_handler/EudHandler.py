@@ -20,8 +20,9 @@ from socket import (
     TCP_KEEPIDLE,
     TCP_KEEPINTVL,
     TCP_KEEPCNT,
+    TCP_USER_TIMEOUT,
 )
-from threading import Thread
+from threading import Thread, Lock
 from xml.etree.ElementTree import Element, SubElement, tostring, fromstring, ParseError
 
 import bleach
@@ -91,6 +92,9 @@ class EudHandler(socketserver.BaseRequestHandler):
     iothread = None
     is_consuming = False
     is_authenticated = False
+    # Class-level defaults so close_connection() is safe even if setup() bailed early.
+    superseded = False
+    conn_token = None
     cached_messages = []
     eud = None
     callsign = None
@@ -175,12 +179,17 @@ class EudHandler(socketserver.BaseRequestHandler):
             )
 
             try:
-                self.request.send(event.encode())
+                self._send(event.encode())
                 return True
             except BaseException as e:
                 self.logger.error(f"Pong error: {e}")
 
         return False
+
+    def _send(self, data: bytes):
+        """Write to the device socket under send_lock (see setup())."""
+        with self.send_lock:
+            self.request.sendall(data)
 
     def setup(self):
         self.socket: socket = self.request
@@ -189,18 +198,45 @@ class EudHandler(socketserver.BaseRequestHandler):
         # drop, app killed, phone put to sleep) leaves recv() in handle()
         # blocked forever, so close_connection() never runs and the EUD's
         # last_status stays "Connected" indefinitely. This bounds detection
-        # of a dead peer to ~60s (30s idle + 3 probes 10s apart) instead.
+        # of a dead peer to ~30s (15s idle + 3 probes 5s apart) instead.
+        # TCP_USER_TIMEOUT additionally caps how long *sent* data may stay
+        # unacknowledged before the socket errors out, so a dead peer that
+        # we are actively writing to (other devices' SA, DMs) is noticed
+        # within 30s of the first write rather than only via keepalive.
+        # A tight bound matters for the remote clear "queue for offline
+        # devices" option: the API only queues for devices whose row says
+        # Disconnected, so the window in which a just-dropped device still
+        # looks Connected (and the command is sent live into the void) is
+        # exactly this detection time.
         # Must happen here (before handle() runs), not in __init__: since
         # super().__init__() calls setup()/handle()/finish() synchronously,
         # any code placed after that call in __init__ only runs once the
         # connection has already closed.
         try:
             self.socket.setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
-            self.socket.setsockopt(IPPROTO_TCP, TCP_KEEPIDLE, 30)
-            self.socket.setsockopt(IPPROTO_TCP, TCP_KEEPINTVL, 10)
+            self.socket.setsockopt(IPPROTO_TCP, TCP_KEEPIDLE, 15)
+            self.socket.setsockopt(IPPROTO_TCP, TCP_KEEPINTVL, 5)
             self.socket.setsockopt(IPPROTO_TCP, TCP_KEEPCNT, 3)
+            self.socket.setsockopt(IPPROTO_TCP, TCP_USER_TIMEOUT, 30000)
         except OSError as e:
             self.logger.debug(f"Failed to set TCP keepalive: {e}")
+
+        # Per-connection state. EudServer is a ForkingTCPServer, so every
+        # connection is its own process; these are still set per instance
+        # (not at class level) so nothing is ever shared by accident.
+        # conn_token identifies THIS connection in eud_control messages.
+        self.conn_token = uuid.uuid4().hex
+        # Set when a newer connection for the same uid told us to step aside
+        # (see on_control_message); close_connection then leaves the queue
+        # bindings and last_status alone because the newer handler owns them.
+        self.superseded = False
+        # Consumer tags for the shared uid/callsign queues, so they can be
+        # cancelled when superseded.
+        self.consumer_tags = []
+        # Serialises socket writes: on_message writes from the pika ioloop
+        # thread while pong() and queued-command delivery write from the
+        # handler thread. Concurrent writes on one SSL socket are unsafe.
+        self.send_lock = Lock()
 
         self.create_app()
 
@@ -246,6 +282,25 @@ class EudHandler(socketserver.BaseRequestHandler):
             return
 
         self.logger.info("{} disconnected".format(self.client_address[0]))
+
+        # A superseded handler (a newer connection for the same uid took
+        # over, see on_control_message) must not announce a disconnect,
+        # unbind the shared queues or flip last_status: all of that now
+        # belongs to the newer connection, and doing it here was exactly
+        # how a zombie connection broke a device that had just reconnected.
+        if self.superseded:
+            self.logger.info(
+                "superseded connection for %s closing without touching queues/status",
+                self.uid,
+            )
+            if (
+                self.rabbit_channel
+                and not self.rabbit_channel.is_closing
+                and not self.rabbit_channel.is_closed
+            ):
+                self.rabbit_channel.close()
+            self.shutdown = True
+            return
 
         if self.rabbit_channel:
             self.rabbit_channel.basic_publish(
@@ -365,6 +420,12 @@ class EudHandler(socketserver.BaseRequestHandler):
         self.rabbit_channel.exchange_declare(
             "flask-socketio", durable=False, exchange_type="fanout"
         )
+        # Per-uid control channel between handler processes (supersede /
+        # disconnect). Also declared in app.py at start-up; the arguments
+        # must match exactly or the broker closes this channel with 406.
+        self.rabbit_channel.exchange_declare(
+            "eud_control", durable=True, exchange_type="direct"
+        )
 
         for message in self.cached_messages:
             self.publish_cot(message)
@@ -419,10 +480,70 @@ class EudHandler(socketserver.BaseRequestHandler):
                 self.close_connection()
                 return
             if body["uid"] != self.uid:
-                self.request.send(body["cot"].encode())
+                self._send(body["cot"].encode())
         except BaseException as e:
             self.logger.error(f"{self.callsign}: {e}, closing socket")
             self.close_connection()
+            self.logger.error(traceback.format_exc())
+
+    def on_control_message(self, ch, method, properties, body):
+        """Handle a message on this connection's private eud_control queue.
+
+        Contract: JSON body with ``uid`` (the device uid the message is
+        about; anything else is ignored) and ``action``:
+
+        * ``supersede`` with ``except`` = the conn_token of the connection
+          that sent it. Every OTHER handler for that uid stops consuming the
+          shared uid/callsign queues and marks itself superseded, so its
+          eventual close leaves the newer connection's bindings and status
+          untouched. The socket is deliberately NOT closed: a device that is
+          legitimately connected twice must not be made to ping-pong.
+        * ``disconnect``: shut the device socket down so the blocked recv()
+          in handle() returns and the normal close path runs. ATAK
+          reconnects on its own, which (for example) lets a freshly queued
+          clear command be delivered on that reconnect.
+        """
+        try:
+            body = json.loads(body)
+            if body.get("uid") != self.uid:
+                return
+            action = body.get("action")
+            if action == "supersede":
+                if body.get("except") == self.conn_token:
+                    return
+                self.superseded = True
+                tags, self.consumer_tags = self.consumer_tags, []
+                for tag in tags:
+                    try:
+                        self.rabbit_channel.basic_cancel(tag)
+                    except Exception as e:
+                        self.logger.debug(f"basic_cancel({tag}) failed: {e}")
+                self.logger.warning(
+                    "superseded by a newer connection for %s, stepping aside", self.uid
+                )
+            elif action == "disconnect":
+                self.logger.warning(
+                    "server-requested disconnect for %s (forcing reconnect)", self.uid
+                )
+                # Step aside passively as well: the device is expected to
+                # reconnect within seconds, and if that new handler binds the
+                # shared queues before this close finishes, a normal close
+                # would unbind them again and mark the row Disconnected.
+                # The reconnect (or, failing that, the reconcile job) owns
+                # the status from here.
+                self.superseded = True
+                tags, self.consumer_tags = self.consumer_tags, []
+                for tag in tags:
+                    try:
+                        self.rabbit_channel.basic_cancel(tag)
+                    except Exception as e:
+                        self.logger.debug(f"basic_cancel({tag}) failed: {e}")
+                try:
+                    self.request.shutdown(SHUT_RDWR)
+                except Exception as e:
+                    self.logger.debug(f"socket shutdown failed: {e}")
+        except Exception as e:
+            self.logger.error(f"control message error for {self.uid}: {e}")
             self.logger.error(traceback.format_exc())
 
     def handle_auth(self, auth: str):
@@ -725,11 +846,54 @@ class EudHandler(socketserver.BaseRequestHandler):
                                 }
                             )
 
-                        self.rabbit_channel.basic_consume(
-                            queue=self.callsign, on_message_callback=self.on_message, auto_ack=True
+                        self.consumer_tags.append(
+                            self.rabbit_channel.basic_consume(
+                                queue=self.callsign, on_message_callback=self.on_message, auto_ack=True
+                            )
+                        )
+                        self.consumer_tags.append(
+                            self.rabbit_channel.basic_consume(
+                                queue=self.uid, on_message_callback=self.on_message, auto_ack=True
+                            )
+                        )
+
+                        # EudServer is a ForkingTCPServer: each connection is
+                        # its own process, so handlers can only talk to each
+                        # other through the broker. Every connection gets a
+                        # private, exclusive control queue bound to the
+                        # eud_control exchange by uid, then announces itself.
+                        # Any EARLIER handler for this uid (usually a zombie:
+                        # the phone dropped wifi and keepalive hasn't fired
+                        # yet) steps aside on that message. Without this the
+                        # old handler's consumer competes round-robin with
+                        # ours for the device's queue (a queued clear command
+                        # went to it and vanished, auto_ack), and when it
+                        # finally dies its close_connection unbinds the
+                        # queues we just bound and overwrites last_status
+                        # with Disconnected (observed 2026-09-19).
+                        control_queue = f"ctl.{self.uid}.{self.conn_token}"
+                        self.rabbit_channel.queue_declare(
+                            queue=control_queue, exclusive=True, auto_delete=True
+                        )
+                        self.rabbit_channel.queue_bind(
+                            exchange="eud_control", queue=control_queue, routing_key=self.uid
                         )
                         self.rabbit_channel.basic_consume(
-                            queue=self.uid, on_message_callback=self.on_message, auto_ack=True
+                            queue=control_queue,
+                            on_message_callback=self.on_control_message,
+                            auto_ack=True,
+                        )
+                        self.rabbit_channel.basic_publish(
+                            exchange="eud_control",
+                            routing_key=self.uid,
+                            body=json.dumps(
+                                {
+                                    "action": "supersede",
+                                    "uid": self.uid,
+                                    "except": self.conn_token,
+                                }
+                            ),
+                            properties=pika.BasicProperties(expiration="10000"),
                         )
 
             if "phone" in contact.attrs and contact.attrs["phone"]:
@@ -821,48 +985,60 @@ class EudHandler(socketserver.BaseRequestHandler):
                     db.session.commit()
 
                 # Deliver any clear-content commands an admin queued while this
-                # device was offline. The device's dms queue and consumer were
-                # set up above, so a publish now lands immediately. A fresh CoT
-                # is signed per row (build_clear_cot), so it is inside the
-                # plugin's freshness window even if it was queued hours ago.
-                # Rows are stamped delivered rather than deleted (audit trail);
-                # filtering on delivered_at == None keeps a device from being
-                # re-wiped on every subsequent reconnect. Never let a delivery
-                # failure break the connection handshake.
-                if self.rabbit_channel and self.rabbit_channel.is_open:
-                    try:
-                        pending = (
-                            db.session.execute(
-                                select(PendingClearCommand).filter_by(
-                                    eud_uid=uid, delivered_at=None
-                                )
+                # device was offline, by writing straight to this connection's
+                # socket. This used to publish to the device's RabbitMQ queue,
+                # but a stale zombie handler for the same uid (wifi dropped,
+                # keepalive not yet fired) still had a consumer on that queue
+                # and could take the message round-robin (auto_ack): the row
+                # was stamped delivered while the command never reached the
+                # device. A direct write cannot be stolen, and needs no
+                # RabbitMQ channel at all. A fresh CoT is signed per row
+                # (build_clear_cot), so it is inside the plugin's freshness
+                # window even if it was queued hours ago. Rows are stamped
+                # delivered only after the write succeeded, and kept rather
+                # than deleted (audit trail); filtering on delivered_at == None
+                # keeps a device from being re-wiped on every reconnect. On any
+                # failure the rows stay undelivered so the next connection
+                # retries. Never let a delivery failure break the handshake.
+                try:
+                    pending = (
+                        db.session.execute(
+                            select(PendingClearCommand).filter_by(
+                                eud_uid=uid, delivered_at=None
                             )
-                            .scalars()
-                            .all()
                         )
-                        if pending:
-                            node_id = self.app.config.get("RAVEN_NODE_ID")
-                            delivered_at = datetime.datetime.now(datetime.timezone.utc)
-                            for pc in pending:
-                                remote_clear.publish_clear_cot(
-                                    self.rabbit_channel,
-                                    uid,
-                                    node_id,
-                                    clearmaps=pc.clearmaps,
-                                    expiration=None,
-                                )
-                                pc.delivered_at = delivered_at
-                            db.session.commit()
-                            self.logger.warning(
-                                "Delivered %d queued clear command(s) to %s on reconnect",
-                                len(pending),
-                                uid,
-                            )
-                    except Exception as e:
-                        db.session.rollback()
-                        self.logger.error(
-                            "Failed to deliver queued clear commands for %s: %s", uid, e
+                        .scalars()
+                        .all()
+                    )
+                    if pending:
+                        node_id = self.app.config.get("RAVEN_NODE_ID")
+                        delivered_at = datetime.datetime.now(datetime.timezone.utc)
+                        # Collapse every undelivered row (an admin may have
+                        # clicked more than once) into ONE signed command:
+                        # each command the plugin accepts starts its own
+                        # ClearContentTask, so a burst of them would run
+                        # several wipes at once. clearmaps is true if any
+                        # row asked for it.
+                        clearmaps = any(pc.clearmaps for pc in pending)
+                        cot = remote_clear.build_clear_cot(
+                            uid, clearmaps=clearmaps, node_id=node_id
                         )
+                        self._send(cot.encode())
+                        for pc in pending:
+                            pc.delivered_at = delivered_at
+                        db.session.commit()
+                        self.logger.warning(
+                            "Delivered 1 clear command (collapsed from %d queued row(s), "
+                            "clearmaps=%s) directly to %s on reconnect",
+                            len(pending),
+                            clearmaps,
+                            uid,
+                        )
+                except Exception as e:
+                    db.session.rollback()
+                    self.logger.error(
+                        "Failed to deliver queued clear commands for %s: %s", uid, e
+                    )
 
                 # If the RabbitMQ channel is open, publish the EUD info to socketio to be displayed on the web UI map.
                 # Also save the EUD's info for on_channel_open to publish

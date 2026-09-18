@@ -178,6 +178,9 @@ def init_extensions(app):
         "firehose", durable=True, exchange_type="fanout"
     )  # A firehose of all CoT data
     channel.exchange_declare("flask-socketio", durable=False, exchange_type="fanout")
+    # Per-uid control messages between EUD handler processes (supersede / disconnect);
+    # EudHandler.on_channel_open declares it identically.
+    channel.exchange_declare("eud_control", durable=True, exchange_type="direct")
     channel.close()
     rabbit_connection.close()
 
