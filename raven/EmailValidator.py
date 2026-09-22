@@ -10,6 +10,27 @@ class EmailValidator(MailUtil):
         super().__init__(app)
         self.app = app
 
+    def send_mail(self, template, subject, recipient, sender, body, html, **kwargs):
+        # Flask-Security emails some notices on its own -- most visibly "your
+        # password was changed", sent from inside the change-password request.
+        # With email disabled (the default: MAIL_* still points at an
+        # unauthenticated smtp.gmail.com) or for an account with no address
+        # (the server-created `administrator`), that send can only fail, and
+        # the exception 500s the request that triggered it. On a fresh install
+        # that request is the forced first-login password change, so the new
+        # password is never saved and the only account is locked out for good.
+        # A notice with nowhere to go is skipped instead; real email, when
+        # enabled and addressed, is sent exactly as before.
+        if not self.app.config.get("RAVEN_ENABLE_EMAIL") or not recipient:
+            logger.info(
+                "Not sending the '{}' email: {}".format(
+                    template,
+                    "email is disabled" if recipient else "the account has no email address",
+                )
+            )
+            return None
+        return super().send_mail(template, subject, recipient, sender, body, html, **kwargs)
+
     def validate(self, email: str) -> str:
         domain_whitelist = self.app.config.get("RAVEN_EMAIL_DOMAIN_WHITELIST")
         domain_blacklist = self.app.config.get("RAVEN_EMAIL_DOMAIN_BLACKLIST")
