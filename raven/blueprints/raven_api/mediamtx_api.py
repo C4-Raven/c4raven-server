@@ -1,8 +1,9 @@
 import datetime
 import json
 import os
-import pathlib
 import shlex
+import shutil
+import sys
 import traceback
 import uuid
 from urllib.parse import urlparse
@@ -352,8 +353,18 @@ def add_update_stream():
                 ):
                     settings["source"] = None
                     settings["sourceOnDemand"] = False
-                    yt_dlp_path = os.path.join(
-                        pathlib.Path.home(), ".raven_venv", "bin", "yt-dlp"
+                    # yt-dlp is one of our own Python dependencies, so its
+                    # console script sits next to the interpreter running
+                    # this process -- whichever venv the installer made
+                    # (/opt/raven/c4raven-server/.venv, /opt/raven/venv, a
+                    # dev checkout's .venv). The old "$HOME/.raven_venv/bin"
+                    # guess matched none of those layouts. Fall back to PATH
+                    # for a distro-packaged yt-dlp, then to the bare name so
+                    # MediaMTX resolves it from its own PATH.
+                    yt_dlp_path = (
+                        shutil.which("yt-dlp", path=os.path.dirname(sys.executable))
+                        or shutil.which("yt-dlp")
+                        or "yt-dlp"
                     )
                     # `source` reaches here from any logged-in user's request
                     # body (this route only requires @auth_required, not an
