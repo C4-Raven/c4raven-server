@@ -134,6 +134,11 @@ class CoTController:
             pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
         )
         self.rabbit_channel = self.rabbit_connection.channel()
+        # raven declares this exchange on startup too (init_extensions), but
+        # on a fresh broker this process can get here first, and binding to
+        # a missing exchange closes the channel (404). Same arguments, so
+        # whichever side declares first, the other's declare is a no-op.
+        self.rabbit_channel.exchange_declare("cot_parser", durable=True, exchange_type="direct")
         self.rabbit_channel.queue_declare(queue="cot_parser")
         self.rabbit_channel.queue_bind(
             exchange="cot_parser", queue="cot_parser", routing_key="cot_parser"
@@ -1508,8 +1513,16 @@ def main():
         try:
             pid = os.fork()
             if pid == 0:
-                cot_parser = CoTController(app.app_context(), logger, db, sio)
-                cot_parser.run()
+                try:
+                    cot_parser = CoTController(app.app_context(), logger, db, sio)
+                    cot_parser.run()
+                except BaseException as e:
+                    # Exit here: falling through to the loop below would make
+                    # this child fork parser processes of its own.
+                    logger.error(f"cot_parser error: {e}")
+                    logger.debug(traceback.format_exc())
+                    os._exit(1)
+                os._exit(0)
             else:
                 child_processes.append(pid)
         except KeyboardInterrupt:

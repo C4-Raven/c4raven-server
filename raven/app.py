@@ -5,6 +5,7 @@ monkey.patch_all()
 import logging
 import os
 import platform
+import shutil
 import sqlite3
 import sys
 import traceback
@@ -287,11 +288,21 @@ def create_app(cli=True):
                     if "MTX_TOKEN" in conf:
                         new_conf = conf.replace("MTX_TOKEN", app.config.get("RAVEN_MEDIAMTX_TOKEN"))
                 if new_conf:
-                    with open(
-                        os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "mediamtx", "mediamtx.yml"),
-                        "w",
-                    ) as mediamtx_config:
+                    # Write a sibling file and rename it over the original.
+                    # mediamtx hot-reloads this file when it changes, and
+                    # every Raven process (raven, eud_handler x2, cot_parser,
+                    # each `flask` call) runs this on a fresh install. An
+                    # in-place rewrite lets mediamtx read it half-written,
+                    # fail to parse it, and exit -- with status 0, so
+                    # systemd's Restart=on-failure never brings it back.
+                    path = os.path.join(
+                        app.config.get("RAVEN_DATA_FOLDER"), "mediamtx", "mediamtx.yml"
+                    )
+                    tmp_path = f"{path}.{os.getpid()}.tmp"
+                    with open(tmp_path, "w") as mediamtx_config:
                         mediamtx_config.write(new_conf)
+                    shutil.copymode(path, tmp_path)
+                    os.replace(tmp_path, path)
             except BaseException as e:
                 logger.error("Failed to set MediaMTX token: {}".format(e))
         else:

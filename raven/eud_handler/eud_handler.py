@@ -3,6 +3,7 @@ import logging
 import os
 import platform
 import sys
+import time
 from logging.handlers import TimedRotatingFileHandler
 
 import colorlog
@@ -14,6 +15,7 @@ from flask_babel import gettext
 from flask_security import SQLAlchemyUserDatastore, Security
 from flask_security.models import fsqla
 from sqlalchemy import update
+from sqlalchemy.exc import ProgrammingError
 
 from raven.EmailValidator import EmailValidator
 from raven.PasswordValidator import PasswordValidator
@@ -159,11 +161,28 @@ def main():
     # forever once it stops reconnecting, since nothing after this point
     # would ever flip it back. Reconcile it here instead: any row still
     # marked "Connected" predates this process, so it's stale by definition.
+    #
+    # On a fresh install this process starts alongside raven, which only
+    # creates the schema (its migrations) a few seconds later. Wait for the
+    # table instead of crashing: raven.service Requires= this unit, so every
+    # crash here restarts raven too, mid-migration.
     with app.app_context():
-        db.session.execute(
-            update(EUD).where(EUD.last_status == "Connected").values(last_status="Disconnected")
-        )
-        db.session.commit()
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                db.session.execute(
+                    update(EUD)
+                    .where(EUD.last_status == "Connected")
+                    .values(last_status="Disconnected")
+                )
+                db.session.commit()
+                break
+            except ProgrammingError:
+                db.session.rollback()
+                if time.monotonic() > deadline:
+                    raise
+                logger.info("Waiting for raven to create the database schema...")
+                time.sleep(2)
 
     if opts.ssl:
         socket_server = EudServerSSL(
