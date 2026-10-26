@@ -34,6 +34,17 @@ class DefaultConfig:
     RAVEN_LISTENER_ADDRESS = os.getenv("RAVEN_LISTENER_ADDRESS", "127.0.0.1")
     RAVEN_LISTENER_PORT = int(os.getenv("RAVEN_LISTENER_PORT", 8081))
     RAVEN_MARTI_HTTP_PORT = int(os.getenv("RAVEN_MARTI_HTTP_PORT", 8080))
+    # Public DNS name of this server (the one with a Let's Encrypt cert), if any. Only used to tell
+    # the UI which address to offer for Quick Connect; bare-IP/VPN onboarding works without it.
+    RAVEN_DOMAIN = os.getenv("RAVEN_DOMAIN") or None
+    # VPN/IP onboarding links (POST /api/vpn_qr_string) expire after this many hours unless the
+    # request gives an explicit expiration. The link only lets a phone download the onboarding
+    # data package (server address + CA cert); it is not an enrollment credential.
+    RAVEN_VPN_QR_DEFAULT_EXPIRATION_HOURS = int(os.getenv("RAVEN_VPN_QR_DEFAULT_EXPIRATION_HOURS", 24))
+    # Password of the CA-cert-only truststore in onboarding packages. Not a secret (the p12 only
+    # holds the public CA cert); deliberately separate from RAVEN_CA_PASSWORD, which protects the
+    # CA's private key.
+    RAVEN_ONBOARD_TRUSTSTORE_PASSWORD = os.getenv("RAVEN_ONBOARD_TRUSTSTORE_PASSWORD", "atakatak")
     RAVEN_MARTI_HTTPS_PORT = int(os.getenv("RAVEN_MARTI_HTTPS_PORT", 8443))
     RAVEN_ENABLE_TCP_STREAMING_PORT = os.getenv("RAVEN_ENABLE_TCP_STREAMING_PORT", "True").lower() in [
         "true",

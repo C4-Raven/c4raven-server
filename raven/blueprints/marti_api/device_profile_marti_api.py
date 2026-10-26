@@ -16,6 +16,7 @@ from werkzeug.wsgi import FileWrapper
 
 import raven
 from raven import remote_clear
+from raven.blueprints.marti_api.certificate_enrollment_api import basic_auth
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, ldap_manager, logger
 from raven.models.DataPackage import DataPackage
@@ -258,10 +259,19 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
     return zip_buffer
 
 
-# Authentication for /Marti endpoints handled by client cert validation
-# EUDs hit this endpoint after a successful certificate enrollment
+# EUDs hit this endpoint on the enrollment port (8446) right after a successful
+# /Marti/api/tls/signClient/v2. ATAK sends the same Basic credentials it enrolled with
+# (CertificateEnrollmentClient.executeDeviceProfileRequest -> DeviceProfileClient.getProfile(..,
+# username, password, ..) -> DeviceProfileOperation: hasCredentials() -> TakHttpClient.execute(get,
+# creds) -> HttpUtil.AddBasicAuthentication), so require them here too: the profile carries the CA
+# truststore and the enrollment data packages. A token that signClient just used up is still
+# accepted (check_token_max=False) and this request doesn't count as another use.
 @device_profile_marti_api_blueprint.route("/Marti/api/tls/profile/enrollment")
 def enrollment_profile():
+    if not basic_auth(
+        request.headers.get("Authorization"), consume_token=False, check_token_max=False
+    ):
+        return "", 401
     try:
         profile_zip = create_profile_zip()
         profile_zip.seek(0)

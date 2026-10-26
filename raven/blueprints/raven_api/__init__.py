@@ -13,6 +13,7 @@ from raven.blueprints.raven_api.marker_api import marker_api_blueprint
 from raven.blueprints.raven_api.mediamtx_api import mediamtx_api_blueprint
 from raven.blueprints.raven_api.meshtastic_api import meshtastic_api_blueprint
 from raven.blueprints.raven_api.mission_api import data_sync_api
+from raven.blueprints.raven_api.onboard_api import onboard_api_blueprint
 from raven.blueprints.raven_api.package_api import packages_blueprint
 from raven.blueprints.raven_api.plugin_api import plugin_blueprint
 from raven.blueprints.raven_api.scheduler_api import scheduler_api_blueprint
@@ -44,6 +45,7 @@ raven_api.register_blueprint(eud_stats_blueprint)
 raven_api.register_blueprint(plugin_blueprint)
 raven_api.register_blueprint(supporting_document_api)
 raven_api.register_blueprint(token_api_blueprint)
+raven_api.register_blueprint(onboard_api_blueprint)
 raven_api.register_blueprint(ldap_blueprint)
 raven_api.register_blueprint(tak_gov_link_blueprint)
 raven_api.register_blueprint(language_api)

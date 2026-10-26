@@ -2,9 +2,11 @@ import io
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import traceback
+import unicodedata
 import uuid
 import zipfile
 from pathlib import Path
@@ -120,6 +122,7 @@ class CertificateAuthority:
             self.logger.debug("CA already exists")
 
     def issue_certificate(self, common_name, server=False):
+        self.validate_common_name(common_name)
         if not os.path.exists(os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca.pem")):
             raise FileNotFoundError("ca.pem not found")
 
@@ -247,7 +250,39 @@ class CertificateAuthority:
                     "Failed to generate server's public key. Exit code {}".format(exit_code)
                 )
 
-    def sign_csr(self, csr_bytes, common_name, server=False):
+    @staticmethod
+    def validate_common_name(common_name):
+        """
+        Rejects names that aren't safe to put into the openssl shell commands and file paths
+        below: only Unicode letters/digits and . _ @ - are allowed (covers Raven's username rule
+        of letters, digits, _ and ., plus LDAP-style ids), no leading . or -, no "..".
+
+        :raises ValueError: if common_name is unsafe
+        """
+        if (
+            not isinstance(common_name, str)
+            or not 0 < len(common_name) <= 255
+            or common_name[0] in ".-"
+            or ".." in common_name
+            or not all(
+                unicodedata.category(c)[0] in ("L", "N") or c in "._@-" for c in common_name
+            )
+        ):
+            raise ValueError("Unsafe certificate common name: {!r}".format(common_name))
+        return common_name
+
+    @staticmethod
+    def escape_subject_value(value):
+        """Escape a value for an openssl -subj "/K=V/..." string, where / + = and \\ are special."""
+        return re.sub(r"([\\/+=])", r"\\\1", value)
+
+    def sign_csr(self, csr_bytes, common_name, server=False, subject=None):
+        """Sign a CSR with the CA and write certs/<common_name>/<common_name>.pem.
+
+        :param subject: If given (openssl "/K=V/..." form), the issued cert gets this subject
+            instead of the one in the CSR. Needs OpenSSL >= 3.0 (x509 -req -subj).
+        """
+        self.validate_common_name(common_name)
         os.makedirs(
             os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name), exist_ok=True
         )
@@ -291,7 +326,7 @@ class CertificateAuthority:
             config_file = os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca_config.cfg")
             extensions = "client"
 
-        command = "openssl x509 -sha256 -req -days {} -in {} -CA {} -CAkey {} -out {} -set_serial {} -passin pass:{} -extensions {} -extfile {}".format(
+        command = "openssl x509 -sha256 -req -days {} -in {} -CA {} -CAkey {} -out {} -set_serial {} -passin pass:{} -extensions {} -extfile {}{}".format(
             self.app.config.get("RAVEN_CA_EXPIRATION_TIME"),
             os.path.join(
                 self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".csr"
@@ -305,6 +340,7 @@ class CertificateAuthority:
             self.app.config.get("RAVEN_CA_PASSWORD"),
             extensions,
             config_file,
+            " -subj {}".format(shlex.quote(subject)) if subject else "",
         )
 
         self.logger.debug(command)

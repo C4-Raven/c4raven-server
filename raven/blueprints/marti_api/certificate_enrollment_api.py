@@ -25,8 +25,20 @@ certificate_authority_api_blueprint = Blueprint("certificate_authority_api_bluep
 
 # flask-security's http_auth_required() decorator will deny access because ATAK doesn't do CSRF,
 # so we handle basic auth ourselves
-def basic_auth(credentials):
+def basic_auth(credentials, consume_token=True, check_token_max=True):
+    """
+    Validates an HTTP Basic Authorization header against the user's password, LDAP, or the user's
+    enrollment token (the password field carries the JWT for ATAK QR enrollment).
+
+    :param consume_token: Count a successful token login as one use of the token
+    :param check_token_max: Reject tokens that have reached their max uses
+    :return: The authenticated Raven username (truthy) on success, False otherwise. With LDAP
+        this is the LDAP user id, which is what save_user() stores as the Raven username.
+    """
     try:
+        if not credentials:
+            return False
+
         username, password = (
             base64.b64decode(credentials.split(" ", 1)[-1].encode("utf-8"))
             .decode("utf-8")
@@ -43,7 +55,7 @@ def basic_auth(credentials):
                 from raven.blueprints.raven_api.ldap_api import save_user
 
                 save_user(result.user_dn, result.user_id, result.user_info, result.user_groups)
-                return True
+                return result.user_id or username
             return False
 
         user = app.security.datastore.find_user(username=username)
@@ -51,9 +63,13 @@ def basic_auth(credentials):
             logger.error(f"User {username} doesn't exist")
             return False
         elif verify_password(password, user.password):
-            return True
-        else:
-            return Token.verify_token(password)
+            return user.username
+        elif Token.verify_token(
+            password, user.username, consume=consume_token, check_max=check_token_max
+        ):
+            # The token's subject must be the user it's presented for
+            return user.username
+        return False
 
     except BaseException as e:
         logger.error("Failed to verify credentials: {}".format(e))
@@ -88,7 +104,8 @@ def sign_csr():
 
 @certificate_authority_api_blueprint.route("/Marti/api/tls/signClient/v2", methods=["POST"])
 def sign_csr_v2():
-    if not basic_auth(request.headers.get("Authorization")):
+    username = basic_auth(request.headers.get("Authorization"))
+    if not username:
         return "", 401
 
     try:
@@ -108,12 +125,35 @@ def sign_csr_v2():
 
         x509 = crypto.load_certificate_request(crypto.FILETYPE_PEM, csr.encode())
 
-        common_name = x509.get_subject().CN
+        # The client cert's CN is the user's identity on the SSL streaming port, so like TAK
+        # Server the issued cert is always for the authenticated user, never for whatever CN the
+        # CSR asks for (any account could otherwise enroll a CN=admin cert). ATAK's commo puts
+        # the enrollment username in the CSR CN, so for it this is normally a no-op; anything
+        # else (another user's CN, several CNs, no CN) gets its subject replaced with the
+        # configured subject + CN=<username>.
+        csr_cns = [
+            value.decode("utf-8", "replace")
+            for key, value in x509.get_subject().get_components()
+            if key == b"CN"
+        ]
+        common_name = username
+        subject = None
+        if csr_cns != [username]:
+            logger.warning(
+                "signClient: CSR from {} asked for CN {}; issuing for {}".format(
+                    username, csr_cns, username
+                )
+            )
+            subject = app.config.get("RAVEN_CA_SUBJECT") + "/CN={}".format(
+                CertificateAuthority.escape_subject_value(username)
+            )
         logger.debug("Attempting to sign CSR for {}".format(common_name))
 
         cert_authority = CertificateAuthority(logger, app)
 
-        signed_csr = cert_authority.sign_csr(csr.encode(), common_name, False).decode("utf-8")
+        signed_csr = cert_authority.sign_csr(
+            csr.encode(), common_name, False, subject=subject
+        ).decode("utf-8")
         signed_csr = signed_csr.replace("-----BEGIN CERTIFICATE-----\n", "")
         signed_csr = signed_csr.replace("\n-----END CERTIFICATE-----\n", "")
 
@@ -142,19 +182,13 @@ def sign_csr_v2():
             response = tostring(enrollment).decode("utf-8")
             response = '<?xml version="1.0" encoding="UTF-8"?>\n' + response
 
-        username, password = (
-            base64.b64decode(request.headers.get("Authorization").split(" ")[-1].encode("utf-8"))
-            .decode("utf-8")
-            .split(":")
-        )
-        username = bleach.clean(username)
         user = app.security.datastore.find_user(username=username)
 
         try:
             if uid:
                 eud = EUD()
                 eud.uid = uid
-                eud.user_id = user.id
+                eud.user_id = user.id if user else None
 
                 db.session.add(eud)
                 db.session.commit()
@@ -170,6 +204,7 @@ def sign_csr_v2():
             certificate = Certificate()
             if uid:
                 certificate.common_name = common_name
+                certificate.username = user.username if user else None
                 certificate.eud_uid = uid
                 certificate.callsign = eud.callsign
                 certificate.expiration_date = datetime.datetime.today() + datetime.timedelta(
@@ -197,6 +232,7 @@ def sign_csr_v2():
                     db.session.query(Certificate).filter_by(eud_uid=eud.uid)
                 ).scalar_one()
                 certificate.common_name = common_name
+                certificate.username = user.username if user else None
                 certificate.callsign = eud.callsign
                 certificate.expiration_date = datetime.datetime.today() + datetime.timedelta(
                     days=app.config.get("RAVEN_CA_EXPIRATION_TIME")

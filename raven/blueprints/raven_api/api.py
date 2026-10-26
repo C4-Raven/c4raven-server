@@ -305,12 +305,20 @@ def certificate():
     if request.method == "POST" and "username" in request.json.keys():
         try:
             username = bleach.clean(request.json.get("username"))
-            truststore_filename = os.path.join(
-                app.config.get("RAVEN_CA_FOLDER"), "certs", "raven", "truststore-root.p12"
-            )
-            user_filename = os.path.join(
-                app.config.get("RAVEN_CA_FOLDER"), "certs", username, "{}.p12".format(username)
-            )
+
+            # The cert's CN is the identity on the SSL streaming port (EudHandler maps CN ->
+            # user), so minting one for somebody else is impersonating them. Non-admins only
+            # get their own; admins may issue for anyone.
+            if username != current_user.username and not current_user.has_role("administrator"):
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": gettext("You may only generate a certificate for yourself"),
+                        }
+                    ),
+                    403,
+                )
 
             user = app.security.datastore.find_user(username=username)
 
@@ -324,6 +332,16 @@ def certificate():
                     ),
                     400,
                 )
+
+            # Use the stored spelling (the lookup is case-insensitive) for the CN and paths
+            username = user.username
+            # create_ca() writes the truststore to the CA folder root, not certs/raven/
+            truststore_filename = os.path.join(
+                app.config.get("RAVEN_CA_FOLDER"), "truststore-root.p12"
+            )
+            user_filename = os.path.join(
+                app.config.get("RAVEN_CA_FOLDER"), "certs", username, "{}.p12".format(username)
+            )
 
             ca = CertificateAuthority(logger, app)
             filenames = ca.issue_certificate(username, False)
@@ -352,7 +370,16 @@ def certificate():
                 else:
                     data_package = DataPackage()
                     data_package.filename = filename
-                    data_package.keywords = "public"
+
+                # The package holds the user's p12 (and its password in the prefs), i.e. their
+                # streaming identity. It used to be a tool=NULL (= public) package, which
+                # visible_data_packages()/can_access_data_package() let every user and every
+                # cert-authenticated device list and download via /api/data_packages and
+                # /Marti/sync/content. tool=private limits it to its submission_user (the cert's
+                # owner, so they can download it from the Data Packages page), their EUDs and
+                # explicit recipients. Also applied to existing rows when re-issued.
+                data_package.keywords = None
+                data_package.tool = "private"
 
                 data_package.creator_uid = (
                     request.json["uid"] if "uid" in request.json.keys() else None
@@ -363,7 +390,7 @@ def certificate():
                     os.path.join(app.config.get("RAVEN_CA_FOLDER"), "certs", username, filename)
                 )
                 data_package.hash = file_hash
-                data_package.submission_user = current_user.id
+                data_package.submission_user = user.id
 
                 try:
                     if not existing_data_package:

@@ -33,9 +33,6 @@ def cloudtak_oauth_token():
     :return: jwt
     """
 
-    logger.warning(request.data)
-    logger.warning(request.form)
-
     username = bleach.clean(request.args.get("username") or request.form.get("username"))
     password = bleach.clean(request.args.get("password") or request.form.get("password"))
 
@@ -46,7 +43,9 @@ def cloudtak_oauth_token():
             # Keep this import here to avoid a circular import when Raven is started
             from raven.blueprints.raven_api.ldap_api import save_user
 
-            save_user(result.user_dn, result.user_id, result.user_info, result.user_groups)
+            user = save_user(
+                result.user_dn, result.user_id, result.user_info, result.user_groups
+            )
 
         else:
             return jsonify({"success": False, "error": "Invalid username or password"}), 400

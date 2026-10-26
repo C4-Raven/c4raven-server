@@ -76,6 +76,45 @@ from raven.models.VideoStream import VideoStream
 from raven.models.WebAuthn import WebAuthn
 from raven.models.CITrap import CITrap
 from raven.models.ZMIST import ZMIST
+from raven.models.Token import Token
+
+
+def authenticate_eud_credentials(app, username, password):
+    """
+    Checks the username/password an EUD sent in its streaming <auth> message, the same way
+    basic_auth() in certificate_enrollment_api.py checks enrollment credentials: LDAP when it's
+    enabled, otherwise the local password or the user's enrollment token (ATAK keeps the QR
+    enrollment token as the connection's password). Token logins here don't count as a use and
+    aren't capped by the token's max uses, since ATAK re-sends them on every reconnect after
+    enrollment already used the token up; expiry, disabled and the token's subject are still checked.
+
+    Must be called inside an app context. Returns the User, or None if the credentials are invalid.
+    """
+    if not username or not password:
+        return None
+
+    try:
+        if app.config.get("RAVEN_ENABLE_LDAP"):
+            result = ldap_manager.authenticate(username, password)
+            if result.status != AuthenticationResponseStatus.success:
+                return None
+
+            # Keep this import here to avoid a circular import when Raven is started
+            from raven.blueprints.raven_api.ldap_api import save_user
+
+            return save_user(result.user_dn, result.user_id, result.user_info, result.user_groups)
+
+        user = app.security.datastore.find_user(username=username)
+        if not user:
+            return None
+        if user.password and verify_password(password, user.password):
+            return user
+        if Token.verify_token(password, user.username, consume=False, check_max=False):
+            return user
+    except BaseException as e:
+        ots_logger.error(f"Failed to verify credentials for {username}: {e}")
+
+    return None
 
 
 class EudHandler(socketserver.BaseRequestHandler):
@@ -547,80 +586,60 @@ class EudHandler(socketserver.BaseRequestHandler):
             self.logger.error(traceback.format_exc())
 
     def handle_auth(self, auth: str):
-        self.logger.debug(auth)
+        # Don't write the plaintext password to the log
+        self.logger.debug(re.sub(r"""password=(["']).*?\1""", 'password="***"', auth or ""))
         if auth:
             auth = BeautifulSoup(auth, "xml")
         if self.is_ssl and not self.is_authenticated and (auth or self.common_name):
             user = None
+            uid = None
             with self.app.app_context():
                 if auth:
                     cot = auth.find("cot")
-                    if cot:
-                        username = cot.attrs["username"]
-                        password = cot.attrs["password"]
-                        uid = cot.attrs["uid"]
+                    username = cot.attrs.get("username") if cot else None
+                    password = cot.attrs.get("password") if cot else None
+                    uid = cot.attrs.get("uid") if cot else None
 
-                        if self.app.config.get("RAVEN_ENABLE_LDAP"):
-                            result = ldap_manager.authenticate(username, password)
+                    # A client certificate alone never vouches for the username in <auth>,
+                    # the password (or enrollment token) has to be checked
+                    user = authenticate_eud_credentials(self.app, username, password)
+                    if not user:
+                        self.logger.warning("Failed login for user {}".format(username))
+                        self.close_connection()
+                        return
 
-                            if result.status == AuthenticationResponseStatus.success:
-                                # Keep this import here to avoid a circular import when Raven is started
-                                from raven.blueprints.raven_api.ldap_api import save_user
-
-                                self.user = save_user(
-                                    result.user_dn,
-                                    result.user_id,
-                                    result.user_info,
-                                    result.user_groups,
-                                )
-
-                                try:
-                                    eud = db.session.execute(
-                                        db.session.query(EUD).filter_by(uid=uid)
-                                    ).first()[0]
-                                    self.logger.debug(
-                                        "Associating EUD uid {} to user {}".format(
-                                            eud.uid, self.user.username
-                                        )
-                                    )
-                                    eud.user_id = self.user.id
-                                    db.session.commit()
-                                except:
-                                    self.logger.debug(
-                                        "This is a new eud: {} {}".format(uid, self.user.username)
-                                    )
-                                    eud = EUD()
-                                    eud.uid = uid
-                                    eud.user_id = self.user.id
-                                    eud.callsign = self.callsign
-                                    db.session.add(eud)
-                                    db.session.commit()
-
-                            else:
-                                self.close_connection()
-                                return
-
-                        else:
-                            user = self.app.security.datastore.find_user(username=username)
+                    # Client certs are issued with CN = username, so a cert for one user can't
+                    # be used to stream as another
+                    if self.common_name and self.common_name.lower() != user.username.lower():
+                        self.logger.warning(
+                            "Cert CN {} doesn't match <auth> user {}, disconnecting".format(
+                                self.common_name, user.username
+                            )
+                        )
+                        self.close_connection()
+                        return
                 elif self.common_name:
                     user = self.app.security.datastore.find_user(username=self.common_name)
+                    if not user:
+                        self.logger.warning("User {} does not exist".format(self.common_name))
+                        self.close_connection()
+                        return
 
-                if not user:
-                    self.logger.warning("User {} does not exist".format(self.common_name))
+                if not user.active:
+                    self.logger.warning(
+                        "User {} is deactivated, disconnecting".format(user.username)
+                    )
                     self.close_connection()
                     return
-                elif not user.active:
-                    self.logger.warning("User {} is deactivated, disconnecting".format(username))
-                    self.close_connection()
-                    return
-                elif self.common_name:
+
+                if auth:
+                    self.logger.info("Successful login from {}".format(user.username))
+                else:
                     self.logger.info("{} is ID'ed by cert".format(user.username))
-                    self.is_authenticated = True
-                    self.user = user
-                elif verify_password(password, user.password):
-                    self.logger.info("Successful login from {}".format(username))
-                    self.is_authenticated = True
-                    self.user = user
+                self.is_authenticated = True
+                self.user = user
+
+                if uid:
                     try:
                         eud = db.session.execute(db.session.query(EUD).filter_by(uid=uid)).first()[
                             0
@@ -631,17 +650,18 @@ class EudHandler(socketserver.BaseRequestHandler):
                         eud.user_id = user.id
                         db.session.commit()
                     except:
+                        db.session.rollback()
                         self.logger.debug("This is a new eud: {} {}".format(uid, user.username))
                         eud = EUD()
                         eud.uid = uid
                         eud.user_id = user.id
+                        eud.callsign = self.callsign
                         db.session.add(eud)
                         db.session.commit()
 
-                else:
-                    self.logger.warning("Wrong password for user {}".format(username))
-                    self.close_connection()
-                    return
+                    # The commits above expired user's attributes. Reload them while the session
+                    # is still open, self.user.id is read after this app context ends.
+                    db.session.refresh(user)
 
     def handle_cot(self, cot):
         self.logger.debug(cot)
