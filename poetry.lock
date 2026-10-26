@@ -9,7 +9,6 @@ python-versions = "<4,>=3.6"
 groups = ["main"]
 files = [
     {file = "adsbxcot-6.0.4-py3-none-any.whl", hash = "sha256:5f134f502d18c1cb40bd23be37863c0b42edc081221fb623e8f65f7857313148"},
-    {file = "adsbxcot-6.0.4.tar.gz", hash = "sha256:6312ff4e6cef0ce52dac4caab5826bfdde310e4e539fd7630193a69d3bd16ce3"},
 ]
 
 [package.dependencies]
@@ -19,6 +18,10 @@ pytak = ">=6.2.0"
 
 [package.extras]
 test = ["black", "flake8", "pylint", "pytest-asyncio", "pytest-cov"]
+
+[package.source]
+type = "file"
+url = "vendor/adsbxcot-6.0.4-py3-none-any.whl"
 
 [[package]]
 name = "aiohappyeyeballs"
@@ -215,7 +218,6 @@ python-versions = "<4,>=3.6"
 groups = ["main"]
 files = [
     {file = "aiscot-7.0.10-py3-none-any.whl", hash = "sha256:91fbdfe8502ae98cb677c5e80190eccf359a665037e92f91af8a7bfd88380e28"},
-    {file = "aiscot-7.0.10.tar.gz", hash = "sha256:10700957fa55266fb5e00d4e299c2ff8779725b8eb3cfb858e7dbfb8bb0ebc4f"},
 ]
 
 [package.dependencies]
@@ -225,6 +227,10 @@ pytak = ">=5.4.0"
 [package.extras]
 test = ["black", "flake8", "pylint", "pytak", "pytest-asyncio", "pytest-cov"]
 with-takproto = ["takproto (>=2.0.0)"]
+
+[package.source]
+type = "file"
+url = "vendor/aiscot-7.0.10-py3-none-any.whl"
 
 [[package]]
 name = "alembic"
@@ -7151,4 +7157,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10, <3.15"
-content-hash = "ca1c38a058d0517869b38e321505d790d3c2d3131a20bcd8aa94d4e0296a6717"
+content-hash = "c1eaa2212f03e97aced7c1efb90a302780e7117d75326b2f5cfc3753ded5b413"

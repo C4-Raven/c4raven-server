@@ -10,9 +10,11 @@ documentation = "https://github.com/C4-Raven/c4raven-server"
 include = [{path = "raven/translations/**/*", format = ["sdist", "wheel"]}]
 
 [tool.poetry.dependencies]
-adsbxcot = "6.0.4"
+# adsbxcot and aiscot were deleted from PyPI (both projects 404 since
+# Oct 2026); the 6.0.4 / 7.0.10 wheels are vendored. See vendor/README.md.
+adsbxcot = {path = "vendor/adsbxcot-6.0.4-py3-none-any.whl"}
 androguard = "4.1.3"
-aiscot = "7.0.10"
+aiscot = {path = "vendor/aiscot-7.0.10-py3-none-any.whl"}
 beautifulsoup4 = "4.14.2"
 colorlog = "6.10.1"
 datetime = "5.5"
