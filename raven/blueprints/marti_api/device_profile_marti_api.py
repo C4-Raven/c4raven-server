@@ -18,6 +18,7 @@ import raven
 from raven import remote_clear
 from raven.blueprints.marti_api.certificate_enrollment_api import basic_auth
 from raven.blueprints.marti_api.marti_api import verify_client_cert
+from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
 from raven.extensions import db, ldap_manager, logger
 from raven.models.DataPackage import DataPackage
 from raven.models.DeviceProfiles import DeviceProfiles
@@ -251,10 +252,16 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
 
     zipf.writestr("5c2bfcae3d98c9f4d262172df99ebac5/preference.pref", tostring(prefs))
 
-    with open(
-        os.path.join(app.config.get("RAVEN_CA_FOLDER"), "truststore-root.p12"), "rb"
-    ) as truststore:
-        zipf.writestr("5c2bfcae3d98c9f4d262172df99ebac5/truststore-root.p12", truststore.read())
+    # Exported fresh under RAVEN_CA_PASSWORD (what updateServerCaPassword says) instead of reading
+    # truststore-root.p12, which keeps whatever password it was created with
+    zipf.writestr(
+        "5c2bfcae3d98c9f4d262172df99ebac5/truststore-root.p12",
+        export_onboard_truststore(
+            app.config.get("RAVEN_CA_FOLDER"),
+            app.config.get("RAVEN_CA_PASSWORD"),
+            app.config.get("RAVEN_CA_NAME"),
+        ),
+    )
 
     return zip_buffer
 

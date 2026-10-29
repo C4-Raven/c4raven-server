@@ -121,8 +121,10 @@ class CertificateAuthority:
         else:
             self.logger.debug("CA already exists")
 
-    def issue_certificate(self, common_name, server=False):
+    def issue_certificate(self, common_name, server=False, days=None):
+        """:param days: How many days the cert is valid for. None means RAVEN_CA_EXPIRATION_TIME."""
         self.validate_common_name(common_name)
+        days = self.validate_days(days)
         if not os.path.exists(os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca.pem")):
             raise FileNotFoundError("ca.pem not found")
 
@@ -160,7 +162,7 @@ class CertificateAuthority:
         csr_bytes = csr.read().encode()
         csr.close()
 
-        self.sign_csr(csr_bytes, common_name, server)
+        self.sign_csr(csr_bytes, common_name, server, days=days)
 
         use_legacy = not subprocess.call("openssl list -providers", shell=True)
 
@@ -271,18 +273,33 @@ class CertificateAuthority:
             raise ValueError("Unsafe certificate common name: {!r}".format(common_name))
         return common_name
 
+    def validate_days(self, days):
+        """
+        Returns days, or RAVEN_CA_EXPIRATION_TIME if it's None. It goes into an openssl shell
+        command below, so anything other than a positive int is rejected.
+
+        :raises ValueError: if days isn't a positive int
+        """
+        if days is None:
+            days = int(self.app.config.get("RAVEN_CA_EXPIRATION_TIME"))
+        if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+            raise ValueError("Invalid certificate validity: {!r}".format(days))
+        return days
+
     @staticmethod
     def escape_subject_value(value):
         """Escape a value for an openssl -subj "/K=V/..." string, where / + = and \\ are special."""
         return re.sub(r"([\\/+=])", r"\\\1", value)
 
-    def sign_csr(self, csr_bytes, common_name, server=False, subject=None):
+    def sign_csr(self, csr_bytes, common_name, server=False, subject=None, days=None):
         """Sign a CSR with the CA and write certs/<common_name>/<common_name>.pem.
 
         :param subject: If given (openssl "/K=V/..." form), the issued cert gets this subject
             instead of the one in the CSR. Needs OpenSSL >= 3.0 (x509 -req -subj).
+        :param days: How many days the cert is valid for. None means RAVEN_CA_EXPIRATION_TIME.
         """
         self.validate_common_name(common_name)
+        days = self.validate_days(days)
         os.makedirs(
             os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name), exist_ok=True
         )
@@ -327,7 +344,7 @@ class CertificateAuthority:
             extensions = "client"
 
         command = "openssl x509 -sha256 -req -days {} -in {} -CA {} -CAkey {} -out {} -set_serial {} -passin pass:{} -extensions {} -extfile {}{}".format(
-            self.app.config.get("RAVEN_CA_EXPIRATION_TIME"),
+            days,
             os.path.join(
                 self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".csr"
             ),
@@ -378,7 +395,6 @@ class CertificateAuthority:
         return os.path.exists(os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca.pem"))
 
     def generate_zip(self, common_name):
-        truststore = os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "truststore-root.p12")
         user_p12 = os.path.join(
             self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, "{}.p12".format(common_name)
         )
@@ -473,12 +489,19 @@ class CertificateAuthority:
 
         self.logger.debug("Generating inner Data Package: {}.zip".format(common_name))
 
-        copyfile(truststore, os.path.join(user_file_path, folder, "truststore-root.p12"))
-        self.logger.debug(
-            "Copying {} to {}".format(
-                truststore, os.path.join(user_file_path, folder, "truststore-root.p12")
+        # Export the truststore fresh rather than copying truststore-root.p12: that file keeps the
+        # password it was created with, so if RAVEN_CA_PASSWORD has changed since, the pref above
+        # would hand WinTAK/ATAK a password that doesn't open it.
+        from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
+
+        with open(os.path.join(user_file_path, folder, "truststore-root.p12"), "wb") as f:
+            f.write(
+                export_onboard_truststore(
+                    self.app.config.get("RAVEN_CA_FOLDER"),
+                    self.app.config.get("RAVEN_CA_PASSWORD"),
+                    self.app.config.get("RAVEN_CA_NAME"),
+                )
             )
-        )
         copyfile(user_p12, os.path.join(user_file_path, folder, "{}.p12".format(common_name)))
         zipf = zipfile.ZipFile(
             os.path.join(user_file_path, "{}.zip".format(common_name)), "w", zipfile.ZIP_DEFLATED

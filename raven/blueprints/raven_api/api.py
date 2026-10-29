@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import io
 import json
 import os
 import platform
@@ -14,13 +15,15 @@ import sqlalchemy.exc
 import yaml
 from flask import Blueprint
 from flask import current_app as app
-from flask import jsonify, request, send_from_directory, session
+from flask import jsonify, request, send_file, send_from_directory, session
 from flask_babel import gettext
 from flask_ldap3_login import AuthenticationResponseStatus
 from flask_security import auth_required, current_user, verify_password
 from sqlalchemy import String, Text, Unicode, UnicodeText, func, select
 
 from raven import __version__ as version
+from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
+from raven.cert_validity import resolve_cert_days
 from raven.certificate_authority import CertificateAuthority
 from raven.extensions import babel, db, ldap_manager, logger
 from raven.models.Alert import Alert
@@ -343,8 +346,12 @@ def certificate():
                 app.config.get("RAVEN_CA_FOLDER"), "certs", username, "{}.p12".format(username)
             )
 
+            # Per-user lifetime set by an admin on the Users page, else the server default
+            cert_days = resolve_cert_days(user)
+
             ca = CertificateAuthority(logger, app)
-            filenames = ca.issue_certificate(username, False)
+            filenames = ca.issue_certificate(username, False, days=cert_days)
+            file_hash = None
 
             for filename in filenames:
                 file_hash = hashlib.sha256(
@@ -422,7 +429,7 @@ def certificate():
                 cert.common_name = username
                 cert.username = username
                 cert.expiration_date = datetime.datetime.today() + datetime.timedelta(
-                    days=app.config.get("RAVEN_CA_EXPIRATION_TIME")
+                    days=cert_days
                 )
                 cert.server_address = urlparse(request.url_root).hostname
                 cert.server_port = app.config.get("RAVEN_SSL_STREAMING_PORT")
@@ -434,7 +441,29 @@ def certificate():
                 db.session.add(cert)
                 db.session.commit()
 
-            return jsonify({"success": True}), 200
+            # The package is tool=private to its owner and /api/data_packages/download has no
+            # admin bypass, so an admin issuing it for someone else asks for the zip here
+            # instead (they've just minted it, so this hands them nothing they couldn't get).
+            if request.json.get("download") and filenames:
+                return send_from_directory(
+                    os.path.join(app.config.get("RAVEN_CA_FOLDER"), "certs", username),
+                    filenames[0],
+                    as_attachment=True,
+                    download_name=filenames[0],
+                    mimetype="application/zip",
+                )
+
+            return (
+                jsonify(
+                    {
+                        "success": True,
+                        "hash": file_hash,
+                        "filename": filenames[0] if filenames else None,
+                        "cert_validity_days": cert_days,
+                    }
+                ),
+                200,
+            )
         except BaseException as e:
             logger.error(traceback.format_exc())
             return jsonify({"success": False, "error": str(e)}), 500
@@ -664,9 +693,16 @@ def get_euds():
 def get_truststore():
     """Downloads the server's truststore with no authentication required."""
     filename = f"truststore_root_{urlparse(request.url_root).hostname}.p12"
-    return send_from_directory(
+    # Exported fresh under RAVEN_CA_PASSWORD, like the cert packages: truststore-root.p12 keeps
+    # whatever password it was created with
+    truststore = export_onboard_truststore(
         app.config.get("RAVEN_CA_FOLDER"),
-        "truststore-root.p12",
+        app.config.get("RAVEN_CA_PASSWORD"),
+        app.config.get("RAVEN_CA_NAME"),
+    )
+    return send_file(
+        io.BytesIO(truststore),
+        mimetype="application/x-pkcs12",
         download_name=filename,
         as_attachment=True,
     )

@@ -26,6 +26,9 @@ class User(db.Model, fsqla.FsUserMixin):
     # CUSTOM: force_password_change patch -- when true, user is blocked from all
     # API access except changing their password, until they do so.
     force_password_change = db.Column(db.Boolean, nullable=False, default=False, server_default="false")
+    # Days that certificates issued for this user are valid for. NULL means the
+    # server default, RAVEN_CA_EXPIRATION_TIME (see raven/cert_validity.py).
+    cert_validity_days = db.Column(db.Integer, nullable=True)
     video_streams = relationship("VideoStream", back_populates="user")
     euds = relationship("EUD", back_populates="user")
     data_packages = relationship("DataPackage", back_populates="user")
@@ -54,6 +57,7 @@ class User(db.Model, fsqla.FsUserMixin):
             "current_login_ip": self.current_login_ip,
             "email": self.email,
             "login_count": self.login_count,
+            "cert_validity_days": self.cert_validity_days,
             "euds": [eud.serialize() for eud in self.euds],
             "video_streams": [v.serialize() for v in self.video_streams],
             "roles": [role.serialize() for role in self.roles],

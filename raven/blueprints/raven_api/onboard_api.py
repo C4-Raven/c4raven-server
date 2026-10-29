@@ -192,9 +192,11 @@ def verify_onboard_token(token: str) -> User | None:
 
 def export_onboard_truststore(ca_folder: str, password: str, ca_name: str) -> bytes:
     """
-    Exports a PKCS12 truststore holding only the CA certificate, under its own (non-secret)
-    password, with the same legacy encryption create_ca() uses for truststore-root.p12 (which ATAK
-    needs). Never ships RAVEN_CA_PASSWORD, which also protects the CA's private key.
+    Exports a PKCS12 truststore holding only the CA certificate under the given password, with the
+    same legacy encryption create_ca() uses for truststore-root.p12 (which ATAK needs). Onboarding
+    packages pass their own non-secret password, never RAVEN_CA_PASSWORD, which also protects the
+    CA's private key. The cert packages and /api/truststore pass RAVEN_CA_PASSWORD, which their
+    users already have.
     """
     ca_cert = os.path.join(ca_folder, "ca-trusted.pem")
     if not os.path.exists(ca_cert):

@@ -14,6 +14,7 @@ from flask_ldap3_login import AuthenticationResponseStatus
 from flask_security import verify_password
 from OpenSSL import crypto
 
+from raven.cert_validity import resolve_cert_days
 from raven.certificate_authority import CertificateAuthority
 from raven.extensions import db, ldap_manager, logger
 from raven.models.Certificate import Certificate
@@ -149,10 +150,15 @@ def sign_csr_v2():
             )
         logger.debug("Attempting to sign CSR for {}".format(common_name))
 
+        user = app.security.datastore.find_user(username=username)
+        # The admin can shorten a user's cert lifetime on the Users page; that applies to
+        # enrolled certs the same as to the cert data package from /api/certificate
+        cert_days = resolve_cert_days(user)
+
         cert_authority = CertificateAuthority(logger, app)
 
         signed_csr = cert_authority.sign_csr(
-            csr.encode(), common_name, False, subject=subject
+            csr.encode(), common_name, False, subject=subject, days=cert_days
         ).decode("utf-8")
         signed_csr = signed_csr.replace("-----BEGIN CERTIFICATE-----\n", "")
         signed_csr = signed_csr.replace("\n-----END CERTIFICATE-----\n", "")
@@ -182,8 +188,6 @@ def sign_csr_v2():
             response = tostring(enrollment).decode("utf-8")
             response = '<?xml version="1.0" encoding="UTF-8"?>\n' + response
 
-        user = app.security.datastore.find_user(username=username)
-
         try:
             if uid:
                 eud = EUD()
@@ -208,7 +212,7 @@ def sign_csr_v2():
                 certificate.eud_uid = uid
                 certificate.callsign = eud.callsign
                 certificate.expiration_date = datetime.datetime.today() + datetime.timedelta(
-                    days=app.config.get("RAVEN_CA_EXPIRATION_TIME")
+                    days=cert_days
                 )
                 certificate.server_address = urlparse(request.url_root).hostname
                 certificate.server_port = app.config.get("RAVEN_MARTI_HTTPS_PORT")
@@ -235,7 +239,7 @@ def sign_csr_v2():
                 certificate.username = user.username if user else None
                 certificate.callsign = eud.callsign
                 certificate.expiration_date = datetime.datetime.today() + datetime.timedelta(
-                    days=app.config.get("RAVEN_CA_EXPIRATION_TIME")
+                    days=cert_days
                 )
                 certificate.server_address = urlparse(request.url_root).hostname
                 certificate.server_port = app.config.get("RAVEN_MARTI_HTTPS_PORT")

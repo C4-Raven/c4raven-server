@@ -1524,3 +1524,105 @@ def clear_user_content():
             "clearmaps": clearmaps,
         }
     )
+
+
+def _certificate_validity_json(user):
+    from raven.cert_validity import max_cert_days, resolve_cert_days
+
+    return {
+        "success": True,
+        "username": user.username,
+        "cert_validity_days": user.cert_validity_days,
+        "effective_days": resolve_cert_days(user),
+        "default_days": max_cert_days(),
+        "max_days": max_cert_days(),
+    }
+
+
+@user_api_blueprint.route("/api/users/certificate_validity", methods=["GET"])
+@auth_required()
+def get_certificate_validity():
+    """How many days a user's certificates are valid for
+
+    :parameter: username, defaults to the current user. Only administrators may look up others.
+
+    :return: {username, cert_validity_days (null = server default), effective_days,
+        default_days, max_days}
+    """
+    username = bleach.clean(request.args.get("username") or current_user.username)
+    if username != current_user.username and not current_user.has_role("administrator"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("You may only view your own certificate validity"),
+                }
+            ),
+            403,
+        )
+
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify({"success": False, "error": gettext("No such user: %(username)s", username=username)}),
+            404,
+        )
+
+    return jsonify(_certificate_validity_json(user))
+
+
+@user_api_blueprint.route("/api/users/certificate_validity", methods=["PUT"])
+@auth_required()
+def set_certificate_validity():
+    """Set how many days certificates issued to a user are valid for. Applies to the next cert
+    issued, by data package (/api/certificate) or by enrollment; existing certs are unchanged.
+
+    :parameter: username
+    :parameter: cert_validity_days, an int from 1 to max_days, or null for the server default
+
+    :return: 403 if not an administrator, 400 if the days are invalid, 404 if no such user
+    """
+    from raven.cert_validity import max_cert_days, validate_cert_days
+
+    if not current_user.has_role("administrator"):
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Only administrators may change certificate validity"),
+                }
+            ),
+            403,
+        )
+
+    body = request.json or {}
+    if not body.get("username"):
+        return jsonify({"success": False, "error": gettext("Please provide a username")}), 400
+
+    username = bleach.clean(body.get("username"))
+    user = app.security.datastore.find_user(username=username)
+    if not user:
+        return (
+            jsonify({"success": False, "error": gettext("No such user: %(username)s", username=username)}),
+            404,
+        )
+
+    try:
+        days = validate_cert_days(body.get("cert_validity_days"))
+    except ValueError:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext(
+                        "Certificate validity must be a whole number of days from 1 to %(max)s",
+                        max=max_cert_days(),
+                    ),
+                }
+            ),
+            400,
+        )
+
+    user.cert_validity_days = days
+    db.session.commit()
+    return jsonify(_certificate_validity_json(user))
