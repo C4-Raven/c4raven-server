@@ -36,6 +36,9 @@ class VideoStream(db.Model):
     xml: Mapped[str] = mapped_column(TEXT, nullable=True)
     ready: Mapped[bool] = mapped_column(Boolean, default=False)
     mediamtx_settings: Mapped[str] = mapped_column(TEXT, default="")
+    # Set while an ffmpeg copy of this stream is publishing to another path (see
+    # mediamtx_api.start_web_copy). Browsers and HLS play that path instead.
+    web_path: Mapped[str] = mapped_column(String(255), nullable=True)
     cot_id: Mapped[int] = mapped_column(Integer, ForeignKey("cot.id"), nullable=True)
     cot = relationship("CoT", back_populates="video")
     user = relationship("User", back_populates="video_streams")
@@ -58,6 +61,11 @@ class VideoStream(db.Model):
             "username": self.username,
             "ready": self.ready,
         }
+
+    @property
+    def browser_path(self):
+        """The path WebRTC and HLS viewers should play: the web copy if there is one."""
+        return self.web_path or self.path
 
     def to_json(self):
         try:
@@ -96,8 +104,10 @@ class VideoStream(db.Model):
                 "source": source,
                 "record": record,
                 "rtsp_link": "rtsp://{}:{}/{}".format(hostname, self.port, self.path),
-                "webrtc_link": "{}://{}:{}/webrtc/{}/".format(protocol, hostname, port, self.path),
-                "hls_link": "{}://{}:{}/hls/{}/".format(protocol, hostname, port, self.path),
+                "webrtc_link": "{}://{}:{}/webrtc/{}/".format(
+                    protocol, hostname, port, self.browser_path
+                ),
+                "hls_link": "{}://{}:{}/hls/{}/".format(protocol, hostname, port, self.browser_path),
                 "thumbnail": f"{protocol}://{hostname}:{port}/api/videos/thumbnail?path={self.path}",
             }
 
@@ -115,7 +125,7 @@ class VideoStream(db.Model):
         hostname = url.hostname
         if url.scheme == "https" and url.port and url.port != 443:
             hostname = f"{hostname}:{url.port}"
-        stream_url = f"https://{hostname}/hls/{self.path}/index.m3u8"
+        stream_url = f"https://{hostname}/hls/{self.browser_path}/index.m3u8"
 
         # Must be stable across calls: TAK clients key their synced feed list
         # on this uuid and fetch/delete via /Marti/api/video/<uuid>, which

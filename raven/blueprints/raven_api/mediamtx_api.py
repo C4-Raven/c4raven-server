@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import traceback
 import uuid
@@ -50,6 +51,61 @@ def get_stream_protocol(source_type):
         protocol = "webrtc"
 
     return protocol
+
+
+# Suffix of the path an ffmpeg web copy publishes to (see start_web_copy)
+WEB_COPY_SUFFIX = "_raven_web"
+
+
+def start_web_copy(path: str, rtsp_port) -> str | None:
+    """
+    Some publishers (TAK ICU, for one) send RTSP with a single MPEG-TS track: an H264 stream
+    still inside its transport-stream wrapper. MediaMTX relays that to RTSP readers like ATAK,
+    but its WebRTC and HLS muxers can't unwrap it ("the stream doesn't contain any supported
+    codec"), so the stream never plays in a browser.
+
+    For such a stream, starts an ffmpeg process that copies the video (and audio, if any) out of
+    the wrapper, without re-encoding, to <path>_raven_web on the same server. Publishing from
+    127.0.0.1 is whitelisted in external_auth and RTSP reads are open, so it needs no
+    credentials. ffmpeg exits by itself when the source stops.
+
+    :return: The web copy's path, or None if the stream doesn't need one or ffmpeg didn't start
+    """
+    try:
+        r = requests.get(
+            "{}/v3/paths/get/{}".format(app.config.get("RAVEN_MEDIAMTX_API_ADDRESS"), path),
+            timeout=5,
+        )
+        tracks = r.json().get("tracks")
+    except BaseException as e:
+        logger.error(f"Failed to get the tracks of {path}: {e}")
+        return None
+
+    if tracks != ["MPEG-TS"]:
+        return None
+
+    port = int(rtsp_port or 8554)
+    web_path = path + WEB_COPY_SUFFIX
+    command = [
+        "ffmpeg", "-nostdin", "-loglevel", "error",
+        "-rtsp_transport", "tcp", "-i", f"rtsp://127.0.0.1:{port}/{path}",
+        "-map", "0:v", "-map", "0:a?", "-c", "copy",
+        "-f", "rtsp", "-rtsp_transport", "tcp", f"rtsp://127.0.0.1:{port}/{web_path}",
+    ]
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except BaseException as e:
+        logger.error(f"Failed to start the web copy of {path}: {e}")
+        return None
+
+    logger.info(f"{path} is MPEG-TS over RTSP, copying it to {web_path} for browsers")
+    return web_path
 
 
 @mediamtx_api_blueprint.route("/api/mediamtx/webhook")
@@ -121,6 +177,12 @@ def mediamtx_webhook():
     elif event == "ready" or event == "notready":
         rtsp_port = bleach.clean(request.args.get("rtsp_port"))
         path = bleach.clean(request.args.get("path"))
+
+        # A web copy started by start_web_copy() is played through its source's links and
+        # isn't a stream of its own
+        if path.endswith(WEB_COPY_SUFFIX):
+            return "", 200
+
         query = bleach.clean(request.args.get("query"))
         source_type = bleach.clean(request.args.get("source_type"))
         source_id = bleach.clean(request.args.get("source_id"))
@@ -175,6 +237,11 @@ def mediamtx_webhook():
 
             db.session.add(video_stream)
             db.session.commit()
+
+        # Started before the thumbnail, which blocks until ffmpeg grabs a frame
+        video_stream.web_path = start_web_copy(path, rtsp_port) if event == "ready" else None
+        db.session.add(video_stream)
+        db.session.commit()
 
         if event == "ready":
             os.makedirs(
