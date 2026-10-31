@@ -249,6 +249,21 @@ def delete_old_data():
         logger.info(f"Deleted data older than {iso8601_string_from_datetime(timestamp)}")
 
 
+def expire_group_memberships():
+    # Removes group memberships whose expiry (set per member on the Groups
+    # page, or from the group's default membership duration) has passed.
+    from raven.group_policy import expire_memberships
+
+    with apscheduler.app.app_context():
+        try:
+            removed = expire_memberships()
+            if removed:
+                logger.info(f"Expired {removed} group membership(s)")
+        except BaseException as e:
+            db.session.rollback()
+            logger.error(f"Failed to expire group memberships: {e}")
+
+
 # Kept so a stale job row/config entry that still references this old function name doesn't
 # fail to load. (The ADS-B and AIS feed jobs that replaced it have since been removed.)
 def get_airplanes_live_data():

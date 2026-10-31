@@ -760,4 +760,9 @@ def start():
             except sqlalchemy.exc.IntegrityError:
                 db.session.rollback()
 
+        # Groups with the auto-join policy
+        from raven.group_policy import apply_auto_join
+
+        apply_auto_join(user)
+
     main(app)

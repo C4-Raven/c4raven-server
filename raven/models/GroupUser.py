@@ -1,6 +1,7 @@
+import datetime
 from dataclasses import dataclass
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from raven.extensions import db
@@ -14,6 +15,8 @@ class GroupUser(db.Model):
     group_id: Mapped[Integer] = mapped_column(Integer, ForeignKey("groups.id"), primary_key=True)
     direction: Mapped[String] = mapped_column(String(255), primary_key=True)
     enabled: Mapped[Boolean] = mapped_column(Boolean, default=True)
+    # Naive UTC. The expire_group_memberships job deletes the row after this.
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=True, index=True)
     user = relationship("User", cascade="all, delete", viewonly=True)
     group = relationship("Group", cascade="all, delete", viewonly=True)
 
@@ -23,7 +26,13 @@ class GroupUser(db.Model):
             "group": self.group.serialize(),
             "direction": self.direction,
             "active": self.enabled,
+            "expires_at": self.expires_at_iso(),
         }
+
+    def expires_at_iso(self):
+        if not self.expires_at:
+            return None
+        return self.expires_at.replace(tzinfo=datetime.timezone.utc).isoformat()
 
     def to_marti_json(self):
         return {

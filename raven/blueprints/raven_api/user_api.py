@@ -26,6 +26,7 @@ from werkzeug.utils import secure_filename
 
 from raven import remote_clear
 from raven.audit import record_audit_event
+from raven.group_policy import apply_auto_join
 from raven.models.PendingClearCommand import PendingClearCommand
 from raven.blueprints.marti_api.data_package_marti_api import (
     create_data_package_zip,
@@ -170,6 +171,7 @@ def create_user():
             "user_admin", "user_created", username=username, actor=current_user.username,
             details=f"Roles: {', '.join(roles_cleaned)}",
         )
+        apply_auto_join(new_user, actor=current_user.username)
         return jsonify({"success": True}), 200
     else:
         logger.error("User {} already exists".format(username))

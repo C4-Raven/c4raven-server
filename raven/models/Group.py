@@ -3,7 +3,7 @@ import enum
 import re
 from dataclasses import dataclass
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import Boolean, DateTime, Integer, String, false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from raven.extensions import db
@@ -19,6 +19,11 @@ class GroupTypeEnum(str, enum.Enum):
 class GroupDirectionEnum(str, enum.Enum):
     IN = "IN"  # Write
     OUT = "OUT"  # Read
+
+
+# A group's default access for new members (see Group.default_access):
+# "both" = IN + OUT, "IN" = send only, "OUT" = receive only.
+ACCESS_DIRECTIONS = {"both": ("IN", "OUT"), "IN": ("IN",), "OUT": ("OUT",)}
 
 
 @dataclass
@@ -38,11 +43,24 @@ class Group(db.Model):
     name: Mapped[str] = mapped_column(String(255), unique=True)
     distinguishedName: Mapped[str] = mapped_column(String(255), nullable=True)
     created: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.datetime.now(datetime.timezone.utc)
+        # A callable, so each group gets its own creation time rather than the
+        # time this module was imported.
+        DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc)
     )
     type: Mapped[str] = mapped_column(String(255))
     bitpos: Mapped[int] = mapped_column(Integer)
     description: Mapped[str] = mapped_column(String(255), nullable=True)
+
+    # Policies (see raven/group_policy.py)
+    # Access new members get by default: "both", "IN" (send only) or "OUT" (receive only)
+    default_access: Mapped[str] = mapped_column(String(8), default="both", server_default="both")
+    # New users are added automatically with default_access
+    auto_join: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # New memberships expire after this many days unless set otherwise (None = never)
+    default_membership_days: Mapped[int] = mapped_column(Integer, nullable=True)
+    # A locked group can't be deleted and admins can't change its memberships
+    locked: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+
     users = relationship(
         "User",
         secondary="groups_users",
@@ -83,6 +101,10 @@ class Group(db.Model):
             "type": self.type,
             "bitpos": self.bitpos,
             "description": self.description,
+            "default_access": self.default_access or "both",
+            "auto_join": bool(self.auto_join),
+            "default_membership_days": self.default_membership_days,
+            "locked": bool(self.locked),
         }
 
     def to_json(self):
@@ -90,6 +112,7 @@ class Group(db.Model):
         return_value["id"] = self.id
         return_value["bitpos"] = "{0:b}".format(self.bitpos)
         return_value["users"] = [user.serialize() for user in self.users]
+        return_value["member_count"] = len({user.id for user in self.users})
         return_value["missions"] = [mission.serialize() for mission in self.missions]
         return return_value
 

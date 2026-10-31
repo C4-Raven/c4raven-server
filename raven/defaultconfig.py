@@ -352,4 +352,11 @@ class DefaultConfig:
             "minutes": 1,
             "next_run_time": None,
         },
+        {
+            "id": "expire_group_memberships",
+            "func": "raven.blueprints.scheduled_jobs:expire_group_memberships",
+            "trigger": "interval",
+            "seconds": 0,
+            "minutes": 1,
+        },
     ]
