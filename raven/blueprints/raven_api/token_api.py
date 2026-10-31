@@ -15,11 +15,23 @@ from flask_login import current_user
 from flask_security import auth_required, verify_password
 from sqlalchemy import delete
 
+from raven.audit import record_audit_event
 from raven.extensions import db, ldap_manager, logger
 from raven.models.Token import Token
 from raven.models.user import User
 
 token_api_blueprint = Blueprint("token_api_blueprint", __name__)
+
+
+def _token_summary(token: Token) -> str:
+    expires = (
+        time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(token.expiration))
+        if token.expiration
+        else "never"
+    )
+    disabled = ", disabled" if token.disabled else ""
+    uses = token.max_uses or "unlimited"
+    return f"ATAK enrollment QR token: max uses {uses}, expires {expires}{disabled}"
 
 
 @token_api_blueprint.route("/oauth/token", methods=["GET", "POST"])
@@ -48,12 +60,18 @@ def cloudtak_oauth_token():
             )
 
         else:
+            record_audit_event("auth", "oauth_token_failed", username=username, success=False)
             return jsonify({"success": False, "error": "Invalid username or password"}), 400
 
     else:
         user = app.security.datastore.find_user(username=username)
         if not user or not verify_password(password, user.password):
+            record_audit_event("auth", "oauth_token_failed", username=username, success=False)
             return jsonify({"success": False, "error": "Invalid username or password"}), 400
+
+    record_audit_event(
+        "auth", "oauth_token", username=user.username, details="TAKX/CloudTAK OAuth token issued"
+    )
 
     with open(
         os.path.join(
@@ -142,6 +160,10 @@ def new_atak_qr_string():
 
             db.session.add(token)
             db.session.commit()
+            record_audit_event(
+                "enrollment", "qr_generated", username=username, actor=current_user.username,
+                details=_token_summary(token),
+            )
 
             response = token.to_json()
             response["success"] = True
@@ -214,6 +236,9 @@ def delete_token():
 
         db.session.execute(delete(Token).where(Token.username == username))
         db.session.commit()
+        record_audit_event(
+            "enrollment", "qr_token_deleted", username=username, actor=current_user.username,
+        )
 
         return jsonify({"success": True})
     except BaseException as e:

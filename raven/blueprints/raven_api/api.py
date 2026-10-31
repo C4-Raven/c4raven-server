@@ -22,6 +22,7 @@ from flask_security import auth_required, current_user, verify_password
 from sqlalchemy import String, Text, Unicode, UnicodeText, func, select
 
 from raven import __version__ as version
+from raven.audit import record_audit_event
 from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
 from raven.cert_validity import resolve_cert_days
 from raven.certificate_authority import CertificateAuthority
@@ -441,10 +442,20 @@ def certificate():
                 db.session.add(cert)
                 db.session.commit()
 
+            record_audit_event(
+                "certificate", "cert_issued", username=username, actor=current_user.username,
+                details=f"Certificate package {', '.join(filenames)} issued, "
+                f"valid {cert_days} days",
+            )
+
             # The package is tool=private to its owner and /api/data_packages/download has no
             # admin bypass, so an admin issuing it for someone else asks for the zip here
             # instead (they've just minted it, so this hands them nothing they couldn't get).
             if request.json.get("download") and filenames:
+                record_audit_event(
+                    "enrollment", "enroll_zip", username=username, actor=current_user.username,
+                    details=f"Certificate package {filenames[0]} downloaded from the web UI",
+                )
                 return send_from_directory(
                     os.path.join(app.config.get("RAVEN_CA_FOLDER"), "certs", username),
                     filenames[0],

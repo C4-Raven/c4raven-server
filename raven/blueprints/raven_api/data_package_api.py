@@ -16,6 +16,7 @@ from raven.blueprints.marti_api.data_package_marti_api import (
     data_package_share,
     visible_data_packages,
 )
+from raven.audit import record_audit_event
 from raven.blueprints.raven_api.api import paginate, search
 from raven.extensions import db, logger
 from raven.forms.data_package_form import DataPackageUpdateForm
@@ -201,6 +202,14 @@ def data_package_download():
 
     download_name = data_package[0].filename
     name, extension = os.path.splitext(download_name)
+    if data_package[0].certificate:
+        record_audit_event(
+            "enrollment",
+            "enroll_zip",
+            username=data_package[0].certificate.username,
+            actor=current_user.username,
+            details=f"Certificate package {download_name} downloaded from the web UI",
+        )
 
     return send_from_directory(
         app.config.get("UPLOAD_FOLDER"),

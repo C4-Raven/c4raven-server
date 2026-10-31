@@ -397,6 +397,11 @@ def create_app(cli=True):
                 db.session.add(user)
                 db.session.commit()
 
+        # Security audit trail: login/logout/password/2FA signals and failed logins
+        from raven.audit import init_audit
+
+        init_audit(app)
+
         from raven.blueprints.marti_api import marti_blueprint
 
         app.register_blueprint(marti_blueprint)

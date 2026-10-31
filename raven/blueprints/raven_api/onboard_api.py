@@ -48,6 +48,7 @@ from flask_login import current_user
 from flask_security import auth_required
 from sqlalchemy import func
 
+from raven.audit import record_audit_event
 from raven.extensions import db, logger
 from raven.models.user import User
 
@@ -387,6 +388,11 @@ def new_vpn_qr_string():
         token = create_onboard_token(username, expiration)
         port = app.config.get("RAVEN_MARTI_HTTP_PORT") or 8080
         url = f"http://{host}:{port}/api/onboard/{token}"
+        record_audit_event(
+            "enrollment", "vpn_qr_generated", username=username, actor=current_user.username,
+            details=f"VPN onboarding QR for {host}, expires "
+            f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(expiration))}",
+        )
 
         return jsonify(
             {
@@ -434,6 +440,10 @@ def onboard_package(token):
         )
 
         logger.info(f"Serving onboarding package for {user.username} via {host}")
+        record_audit_event(
+            "enrollment", "onboard_package_download", username=user.username,
+            details=f"VPN onboarding QR scanned: CA/connection package served via {host}",
+        )
         return Response(
             package,
             mimetype="application/zip",

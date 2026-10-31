@@ -17,6 +17,7 @@ from raven.blueprints.raven_api.onboard_api import onboard_api_blueprint
 from raven.blueprints.raven_api.package_api import packages_blueprint
 from raven.blueprints.raven_api.plugin_api import plugin_blueprint
 from raven.blueprints.raven_api.scheduler_api import scheduler_api_blueprint
+from raven.blueprints.raven_api.security_audit_api import security_audit_api_blueprint
 from raven.blueprints.raven_api.supporting_document_api import supporting_document_api
 from raven.blueprints.raven_api.token_api import token_api_blueprint
 from raven.blueprints.raven_api.user_api import user_api_blueprint
@@ -36,6 +37,7 @@ raven_api.register_blueprint(mediamtx_api_blueprint)
 raven_api.register_blueprint(meshtastic_api_blueprint)
 raven_api.register_blueprint(packages_blueprint)
 raven_api.register_blueprint(scheduler_api_blueprint)
+raven_api.register_blueprint(security_audit_api_blueprint)
 raven_api.register_blueprint(user_api_blueprint)
 raven_api.register_blueprint(video_api_blueprint)
 raven_api.register_blueprint(data_sync_api)

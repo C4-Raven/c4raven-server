@@ -25,6 +25,7 @@ from flask_security import (
 from werkzeug.utils import secure_filename
 
 from raven import remote_clear
+from raven.audit import record_audit_event
 from raven.models.PendingClearCommand import PendingClearCommand
 from raven.blueprints.marti_api.data_package_marti_api import (
     create_data_package_zip,
@@ -165,6 +166,10 @@ def create_user():
         )
         db.session.commit()
         _add_to_anon_group(new_user)
+        record_audit_event(
+            "user_admin", "user_created", username=username, actor=current_user.username,
+            details=f"Roles: {', '.join(roles_cleaned)}",
+        )
         return jsonify({"success": True}), 200
     else:
         logger.error("User {} already exists".format(username))
@@ -226,6 +231,7 @@ def delete_user():
         )
 
     db.session.commit()
+    record_audit_event("user_admin", "user_deleted", username=username, actor=current_user.username)
     return jsonify({"success": True}), 200
 
 
@@ -338,6 +344,10 @@ def force_password_reset():
     user.force_password_change = True
     db.session.add(user)
     db.session.commit()
+    record_audit_event(
+        "user_admin", "force_password_change", username=user.username, actor=current_user.username,
+        details="User must set a new password at next login",
+    )
     return jsonify({"success": True}), 200
 
 
@@ -450,6 +460,9 @@ def deactivate_user():
     deactivated = app.security.datastore.deactivate_user(user)
     if deactivated:
         db.session.commit()
+        record_audit_event(
+            "user_admin", "user_disabled", username=user.username, actor=current_user.username
+        )
 
         # Deactivating only blocks future logins -- a device that's already
         # connected keeps its open socket. Kick every one of the user's EUDs
@@ -531,6 +544,9 @@ def activate_user():
     activated = app.security.datastore.activate_user(user)
     if activated:
         db.session.commit()
+        record_audit_event(
+            "user_admin", "user_enabled", username=user.username, actor=current_user.username
+        )
         return jsonify({"success": True})
     else:
         return jsonify(
@@ -568,6 +584,9 @@ def grant_site_access():
     user.site_access = True
     db.session.add(user)
     db.session.commit()
+    record_audit_event(
+        "user_admin", "site_access_granted", username=user.username, actor=current_user.username
+    )
     return jsonify({"success": True})
 
 
@@ -610,6 +629,9 @@ def revoke_site_access():
     user.site_access = False
     db.session.add(user)
     db.session.commit()
+    record_audit_event(
+        "user_admin", "site_access_revoked", username=user.username, actor=current_user.username
+    )
     return jsonify({"success": True})
 
 
@@ -676,6 +698,7 @@ def set_user_role():
             400,
         )
 
+    old_roles = [role.name for role in user.roles]
     for role in user.roles:
         app.security.datastore.remove_role_from_user(user, role)
 
@@ -683,6 +706,10 @@ def set_user_role():
         app.security.datastore.add_role_to_user(user, role)
 
     db.session.commit()
+    record_audit_event(
+        "user_admin", "role_changed", username=user.username, actor=current_user.username,
+        details=f"Roles {', '.join(old_roles) or 'none'} -> {', '.join(roles_cleaned)}",
+    )
     return jsonify({"success": True})
 
 
@@ -1514,6 +1541,11 @@ def clear_user_content():
         clearmaps,
         queue_if_offline,
     )
+    record_audit_event(
+        "security", "remote_clear", username=username, actor=current_user.username,
+        details=f"Remote clear-content on {len(euds)} device(s): {sent_now} sent, {queued} queued "
+        f"(clearmaps={clearmaps})",
+    )
     return jsonify(
         {
             "success": True,
@@ -1625,4 +1657,8 @@ def set_certificate_validity():
 
     user.cert_validity_days = days
     db.session.commit()
+    record_audit_event(
+        "certificate", "cert_validity_changed", username=user.username, actor=current_user.username,
+        details=f"Certificate validity set to {days or 'server default'} days",
+    )
     return jsonify(_certificate_validity_json(user))

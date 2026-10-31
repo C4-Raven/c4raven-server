@@ -9,11 +9,12 @@ import bleach
 import sqlalchemy
 from flask import Blueprint
 from flask import current_app as app
-from flask import jsonify, request
+from flask import g, jsonify, request
 from flask_ldap3_login import AuthenticationResponseStatus
 from flask_security import verify_password
 from OpenSSL import crypto
 
+from raven.audit import record_audit_event
 from raven.cert_validity import resolve_cert_days
 from raven.certificate_authority import CertificateAuthority
 from raven.extensions import db, ldap_manager, logger
@@ -35,8 +36,13 @@ def basic_auth(credentials, consume_token=True, check_token_max=True):
     :param check_token_max: Reject tokens that have reached their max uses
     :return: The authenticated Raven username (truthy) on success, False otherwise. With LDAP
         this is the LDAP user id, which is what save_user() stores as the Raven username.
+        g.raven_auth_method is set to "password", "token" or "ldap" on success (sign_csr_v2
+        uses it to tell a QR/token enrollment from a credentials one), and g.raven_auth_username
+        to the username that was tried.
     """
     try:
+        g.raven_auth_method = None
+        g.raven_auth_username = None
         if not credentials:
             return False
 
@@ -47,6 +53,7 @@ def basic_auth(credentials, consume_token=True, check_token_max=True):
         )
         username = bleach.clean(username)
         password = bleach.clean(password)
+        g.raven_auth_username = username
 
         if app.config.get("RAVEN_ENABLE_LDAP"):
             result = ldap_manager.authenticate(username, password)
@@ -56,6 +63,7 @@ def basic_auth(credentials, consume_token=True, check_token_max=True):
                 from raven.blueprints.raven_api.ldap_api import save_user
 
                 save_user(result.user_dn, result.user_id, result.user_info, result.user_groups)
+                g.raven_auth_method = "ldap"
                 return result.user_id or username
             return False
 
@@ -64,17 +72,23 @@ def basic_auth(credentials, consume_token=True, check_token_max=True):
             logger.error(f"User {username} doesn't exist")
             return False
         elif verify_password(password, user.password):
+            g.raven_auth_method = "password"
             return user.username
         elif Token.verify_token(
             password, user.username, consume=consume_token, check_max=check_token_max
         ):
             # The token's subject must be the user it's presented for
+            g.raven_auth_method = "token"
             return user.username
         return False
 
     except BaseException as e:
         logger.error("Failed to verify credentials: {}".format(e))
         return False
+
+
+def _client_uid():
+    return request.args.get("clientUID") or request.args.get("clientUid")
 
 
 # require basic auth
@@ -107,6 +121,10 @@ def sign_csr():
 def sign_csr_v2():
     username = basic_auth(request.headers.get("Authorization"))
     if not username:
+        record_audit_event(
+            "enrollment", "enroll_failed", username=g.get("raven_auth_username"), success=False,
+            details=f"Certificate enrollment rejected (bad credentials), device {_client_uid()}",
+        )
         return "", 401
 
     try:
@@ -255,6 +273,15 @@ def sign_csr_v2():
                 certificate.cert_password = app.config.get("RAVEN_CA_PASSWORD")
 
                 db.session.commit()
+
+        # A token in the password field means ATAK's enroll QR (tak://...enroll?...&token=)
+        qr = g.get("raven_auth_method") == "token"
+        record_audit_event(
+            "enrollment", "enroll_qr" if qr else "enroll_credentials", username=username,
+            details=f"Device {uid} (callsign {eud.callsign if uid else None}) enrolled with "
+            f"{'a QR enrollment token' if qr else g.get('raven_auth_method') or 'credentials'}, "
+            f"cert valid {cert_days} days",
+        )
 
         if request.headers.get("Accept") == "text/plain":
             return (

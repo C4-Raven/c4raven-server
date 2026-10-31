@@ -19,6 +19,7 @@ from sqlalchemy import func, or_, select
 from werkzeug.datastructures.file_storage import FileStorage
 from werkzeug.utils import secure_filename
 
+from raven.audit import record_audit_event
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, logger
 from raven.functions import format_bytes, iso8601_string_from_datetime
@@ -450,6 +451,13 @@ def download_data_package():
         return "", 200
 
     filename, extension = os.path.splitext(secure_filename(file[0].filename))
+    if getattr(file[0], "certificate", None):
+        caller = data_package_caller()
+        record_audit_event(
+            "enrollment", "enroll_zip", username=file[0].certificate.username,
+            actor=caller.username if caller else None,
+            details=f"Certificate package {file[0].filename} downloaded over Marti sync",
+        )
     if os.path.exists(os.path.join(app.config.get("UPLOAD_FOLDER"), f"{file_hash}{extension}")):
         return send_from_directory(
             app.config.get("UPLOAD_FOLDER"),
