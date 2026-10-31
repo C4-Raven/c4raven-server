@@ -320,14 +320,6 @@ class DefaultConfig:
     SCHEDULER_API_ENABLED = False
     JOBS = [
         {
-            "id": "get_adsb_data",
-            "func": "raven.blueprints.scheduled_jobs:get_adsb_data",
-            "trigger": "interval",
-            "seconds": 0,
-            "minutes": 1,
-            "next_run_time": None,
-        },
-        {
             "id": "delete_video_recordings",
             "func": "raven.blueprints.scheduled_jobs:delete_video_recordings",
             "trigger": "interval",
@@ -342,14 +334,6 @@ class DefaultConfig:
             "day": "*",
             "hour": 0,
             "minute": 0,
-            "next_run_time": None,
-        },
-        {
-            "id": "ais",
-            "func": "raven.blueprints.scheduled_jobs:get_aishub_data",
-            "trigger": "interval",
-            "seconds": 0,
-            "minutes": 1,
             "next_run_time": None,
         },
         {

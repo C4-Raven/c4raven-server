@@ -20,6 +20,7 @@ import pytz
 import requests
 import sqlalchemy
 import yaml
+from apscheduler.jobstores.base import JobLookupError
 from flask import Flask, current_app, g, request, session
 from flask_cors import CORS
 from flask_migrate import Migrate, upgrade
@@ -69,6 +70,59 @@ def get_locale():
 def get_timezone():
     # Always return UTC and let the frontend handle converting timezones
     return pytz.timezone("UTC")
+
+
+# Jobs that used to be in DefaultConfig.JOBS but were removed. The job store is persistent
+# (raven.sql_jobstore), so existing installs still have rows for them until we delete them.
+REMOVED_SCHEDULER_JOB_IDS = ("get_adsb_data", "ais")
+
+
+def drop_removed_jobs_from_config(app):
+    # config.yml snapshots JOBS on first run, so older installs still list jobs that have
+    # since been removed. Their functions no longer exist and add_job() would fail to resolve
+    # them, so drop them before Flask-APScheduler loads the list.
+    #
+    # Config JOBS never overwrite what's already in the persistent job store: add_job() is
+    # called without replace_existing and SQLJobStore ignores the resulting conflict, so a
+    # schedule an admin changed (POST /api/scheduler/job/schedule) survives restarts.
+    for jobs_key in ("JOBS", "SCHEDULER_JOBS"):
+        jobs = app.config.get(jobs_key)
+        if jobs:
+            app.config[jobs_key] = [
+                # A replace_existing in config.yml would clobber admin-set schedules.
+                {k: v for k, v in job.items() if k != "replace_existing"}
+                for job in jobs
+                if job.get("id") not in REMOVED_SCHEDULER_JOB_IDS
+            ]
+
+
+# Jobs added to DefaultConfig.JOBS after release. config.yml snapshots JOBS on first run, so
+# an existing install's config would never pick them up; add_new_jobs_to_config() appends
+# them. As with every config job, one already in the persistent job store is left as is.
+ADDED_SCHEDULER_JOB_IDS = ("expire_group_memberships",)
+
+
+def add_new_jobs_to_config(app):
+    from raven.defaultconfig import DefaultConfig
+
+    jobs = app.config.get("JOBS")
+    if not isinstance(jobs, list):
+        return
+    present = {job.get("id") for job in jobs}
+    for job in DefaultConfig.JOBS:
+        if job["id"] in ADDED_SCHEDULER_JOB_IDS and job["id"] not in present:
+            jobs.append(dict(job))
+
+
+def remove_obsolete_scheduler_jobs():
+    for job_id in REMOVED_SCHEDULER_JOB_IDS:
+        try:
+            apscheduler.remove_job(job_id)
+            logger.info(f"Removed obsolete scheduled job {job_id}")
+        except JobLookupError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to remove obsolete scheduled job {job_id}: {e}")
 
 
 def init_extensions(app):
@@ -186,8 +240,11 @@ def init_extensions(app):
     rabbit_connection.close()
 
     if not apscheduler.running:
+        add_new_jobs_to_config(app)
+        drop_removed_jobs_from_config(app)
         apscheduler.init_app(app)
         apscheduler.start(paused=False)
+        remove_obsolete_scheduler_jobs()
 
     try:
         fsqla.FsModels.set_db_info(db)

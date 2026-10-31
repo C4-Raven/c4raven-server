@@ -1,13 +1,9 @@
 import datetime
 import json
-import traceback
 from xml.etree.ElementTree import tostring
 
-import adsbxcot
-import aiscot
 import pika
 import requests
-from bs4 import BeautifulSoup
 from flask import Blueprint
 from flask import current_app as app
 from sqlalchemy import delete, func, text, update
@@ -43,98 +39,6 @@ from raven.models.VideoStream import VideoStream
 from raven.models.ZMIST import ZMIST
 
 scheduler_blueprint = Blueprint("scheduler_blueprint", __name__)
-
-
-def get_adsb_data():
-    with apscheduler.app.app_context():
-        try:
-            headers = {}
-            if app.config.get("RAVEN_ADSB_API_KEY"):
-                headers["api-auth"] = app.config["RAVEN_ADSB_API_KEY"]
-
-            adsb_api_url = app.config.get("RAVEN_ADSB_API_URL")
-            adsb_lat = app.config.get("RAVEN_ADSB_LAT")
-            adsb_lon = app.config.get("RAVEN_ADSB_LON")
-            adsb_radius = app.config.get("RAVEN_ADSB_RADIUS")
-
-            r = requests.get(f"{adsb_api_url}/{adsb_lat}/{adsb_lon}/{adsb_radius}", headers=headers)
-
-            logger.debug(r.text)
-            logger.debug(r.status_code)
-            logger.debug(r.request.headers)
-            logger.debug(r.request.url)
-
-            if r.status_code == 200:
-                rabbit_credentials = pika.PlainCredentials(
-                    app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
-                )
-                rabbit_host = app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS")
-                rabbit_connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
-                )
-                channel = rabbit_connection.channel()
-                channel.exchange_declare(
-                    exchange=app.config.get("RAVEN_ADSB_GROUP"), exchange_type="fanout"
-                )
-
-                for craft in r.json()["ac"]:
-                    try:
-                        event = adsbxcot.adsbx_to_cot(craft, known_craft=None)
-
-                    except ValueError as e:
-                        logger.error(f"Failed to parse adsb data: {e}")
-                        continue
-
-                    # noinspection PyTypeChecker
-                    channel.basic_publish(
-                        exchange="cot_parser",
-                        routing_key="cot_parser",
-                        body=json.dumps(
-                            {
-                                "cot": str(BeautifulSoup(event, "xml")),
-                                "uid": app.config["RAVEN_NODE_ID"],
-                            }
-                        ),
-                        properties=pika.BasicProperties(
-                            expiration=app.config.get("RAVEN_RABBITMQ_TTL")
-                        ),
-                    )
-                    # noinspection PyTypeChecker
-                    channel.basic_publish(
-                        exchange="groups",
-                        routing_key=f"{app.config.get('RAVEN_ADSB_GROUP')}.OUT",
-                        body=json.dumps(
-                            {
-                                "cot": str(BeautifulSoup(event, "xml")),
-                                "uid": app.config["RAVEN_NODE_ID"],
-                            }
-                        ),
-                        properties=pika.BasicProperties(
-                            expiration=app.config.get("RAVEN_RABBITMQ_TTL")
-                        ),
-                    )
-                    # noinspection PyTypeChecker
-                    channel.basic_publish(
-                        exchange="firehose",
-                        routing_key="",
-                        body=json.dumps(
-                            {
-                                "cot": str(BeautifulSoup(event, "xml")),
-                                "uid": app.config["RAVEN_NODE_ID"],
-                            }
-                        ),
-                        properties=pika.BasicProperties(
-                            expiration=app.config.get("RAVEN_RABBITMQ_TTL")
-                        ),
-                    )
-
-                channel.close()
-                rabbit_connection.close()
-            else:
-                logger.error("Failed to get airplanes.live: {}".format(r.text))
-        except BaseException as e:
-            logger.error("Failed to get airplanes.live: {}".format(e))
-            logger.error(traceback.format_exc())
 
 
 def delete_video_recordings():
@@ -220,85 +124,6 @@ def reconcile_eud_status():
             .values(last_status="Disconnected")
         )
         db.session.commit()
-
-
-def get_aishub_data():
-    with apscheduler.app.app_context():
-
-        if not app.config.get("RAVEN_AISHUB_USERNAME"):
-            logger.error("Please set your AISHub username")
-            return
-
-        try:
-            params = {
-                "username": app.config.get("RAVEN_AISHUB_USERNAME"),
-                "format": 1,
-                "output": "json",
-            }
-            if app.config.get("RAVEN_AISHUB_SOUTH_LAT"):
-                params["latmin"] = app.config.get("RAVEN_AISHUB_SOUTH_LAT")
-            if app.config.get("RAVEN_AISHUB_WEST_LON"):
-                params["lonmin"] = app.config.get("RAVEN_AISHUB_WEST_LON")
-            if app.config.get("RAVEN_AISHUB_NORTH_LAT"):
-                params["latmax"] = app.config.get("RAVEN_AISHUB_NORTH_LAT")
-            if app.config.get("RAVEN_AISHUB_EAST_LON"):
-                params["lonmax"] = app.config.get("RAVEN_AISHUB_EAST_LON")
-            if app.config.get("RAVEN_AISHUB_MMSI_LIST"):
-                params["mmsi"] = app.config.get("RAVEN_AISHUB_MMSI_LIST")
-            if app.config.get("RAVEN_AISHUB_IMO_LIST"):
-                params["imo"] = app.config.get("RAVEN_AISHUB_IMO_LIST")
-            r = requests.get("https://data.aishub.net/ws.php", params=params)
-
-            if r.status_code != 200:
-                logger.error(f"Failed to get AIS data: {r.text}")
-                return
-
-            rabbit_credentials = pika.PlainCredentials(
-                app.config.get("RAVEN_RABBITMQ_USERNAME"), app.config.get("RAVEN_RABBITMQ_PASSWORD")
-            )
-            rabbit_host = app.config.get("RAVEN_RABBITMQ_SERVER_ADDRESS")
-            rabbit_connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=rabbit_host, credentials=rabbit_credentials)
-            )
-            channel = rabbit_connection.channel()
-            channel.exchange_declare(
-                exchange=app.config.get("RAVEN_AIS_GROUP"), exchange_type="fanout"
-            )
-
-            for vessel in r.json()[1]:
-                event = aiscot.ais_to_cot(vessel, None, None)
-                # noinspection PyTypeChecker
-                channel.basic_publish(
-                    exchange="cot_parser",
-                    routing_key="cot_parser",
-                    body=json.dumps(
-                        {"cot": str(BeautifulSoup(event, "xml")), "uid": app.config["RAVEN_NODE_ID"]}
-                    ),
-                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
-                )
-                # noinspection PyTypeChecker
-                channel.basic_publish(
-                    exchange="groups",
-                    routing_key=f"{app.config.get('RAVEN_ADSB_GROUP')}.OUT",
-                    body=json.dumps(
-                        {"cot": str(BeautifulSoup(event, "xml")), "uid": app.config["RAVEN_NODE_ID"]}
-                    ),
-                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
-                )
-                channel.basic_publish(
-                    exchange="firehose",
-                    routing_key="",
-                    body=json.dumps(
-                        {"cot": str(BeautifulSoup(event, "xml")), "uid": app.config["RAVEN_NODE_ID"]}
-                    ),
-                    properties=pika.BasicProperties(expiration=app.config.get("RAVEN_RABBITMQ_TTL")),
-                )
-
-            channel.close()
-            rabbit_connection.close()
-        except BaseException as e:
-            logger.error(f"Failed to get AIS data: {e}")
-            logger.debug(traceback.format_exc())
 
 
 def delete_old_data():
@@ -424,6 +249,7 @@ def delete_old_data():
         logger.info(f"Deleted data older than {iso8601_string_from_datetime(timestamp)}")
 
 
-# This function is to prevent errors caused by changing get_airplanes_live_data() to get_adsb_data
+# Kept so a stale job row/config entry that still references this old function name doesn't
+# fail to load. (The ADS-B and AIS feed jobs that replaced it have since been removed.)
 def get_airplanes_live_data():
     return
