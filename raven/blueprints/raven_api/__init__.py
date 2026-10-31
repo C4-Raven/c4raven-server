@@ -6,6 +6,7 @@ from raven.blueprints.raven_api.api import api_blueprint
 from raven.blueprints.raven_api.casevac_api import casevac_api_blueprint
 from raven.blueprints.raven_api.data_package_api import data_package_api
 from raven.blueprints.raven_api.device_profile_api import device_profile_api_blueprint
+from raven.blueprints.raven_api.error_log_api import error_log_api_blueprint
 from raven.blueprints.raven_api.eud_stats_api import eud_stats_blueprint
 from raven.blueprints.raven_api.federation_hub_api import federation_hub_api
 from raven.blueprints.raven_api.group_api import group_api
@@ -38,6 +39,7 @@ raven_api.register_blueprint(meshtastic_api_blueprint)
 raven_api.register_blueprint(packages_blueprint)
 raven_api.register_blueprint(scheduler_api_blueprint)
 raven_api.register_blueprint(security_audit_api_blueprint)
+raven_api.register_blueprint(error_log_api_blueprint)
 raven_api.register_blueprint(user_api_blueprint)
 raven_api.register_blueprint(video_api_blueprint)
 raven_api.register_blueprint(data_sync_api)
