@@ -139,6 +139,13 @@ class DefaultConfig:
 
     RAVEN_SSL_VERIFICATION_MODE = int(os.getenv("RAVEN_SSL_VERIFICATION_MODE", 2))
     RAVEN_SSL_CERT_HEADER = os.getenv("RAVEN_SSL_CERT_HEADER", "X-Ssl-Cert")
+    # The connection device profile (/Marti/api/device/profile/connection, /api/connection)
+    # carries the CA truststore, the install-on-connection data packages and plugins, and
+    # settings. Require a verified client cert (what ATAK presents on 8443) or Basic credentials.
+    # Set to False only if devices fetch it over plain HTTP (TCP streaming connections).
+    RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH = os.getenv(
+        "RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH", "True"
+    ).lower() in ["true", "1", "yes"]
     RAVEN_NODE_ID = os.getenv(
         "RAVEN_NODE_ID", "".join(random.choices(string.ascii_lowercase + string.digits, k=32))
     )

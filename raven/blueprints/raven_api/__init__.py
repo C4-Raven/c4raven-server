@@ -6,6 +6,7 @@ from raven.blueprints.raven_api.api import api_blueprint
 from raven.blueprints.raven_api.casevac_api import casevac_api_blueprint
 from raven.blueprints.raven_api.data_package_api import data_package_api
 from raven.blueprints.raven_api.device_profile_api import device_profile_api_blueprint
+from raven.blueprints.raven_api.device_profile_tools_api import device_profile_tools_api_blueprint
 from raven.blueprints.raven_api.error_log_api import error_log_api_blueprint
 from raven.blueprints.raven_api.eud_stats_api import eud_stats_blueprint
 from raven.blueprints.raven_api.federation_hub_api import federation_hub_api
@@ -33,6 +34,7 @@ raven_api.register_blueprint(api_blueprint)
 raven_api.register_blueprint(casevac_api_blueprint)
 raven_api.register_blueprint(data_package_api)
 raven_api.register_blueprint(device_profile_api_blueprint)
+raven_api.register_blueprint(device_profile_tools_api_blueprint)
 raven_api.register_blueprint(marker_api_blueprint)
 raven_api.register_blueprint(mediamtx_api_blueprint)
 raven_api.register_blueprint(meshtastic_api_blueprint)

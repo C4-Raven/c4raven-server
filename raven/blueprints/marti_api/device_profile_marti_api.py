@@ -11,7 +11,6 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 from flask import Blueprint, Response
 from flask import current_app as app
 from flask import request
-from sqlalchemy import or_
 from werkzeug.wsgi import FileWrapper
 
 import raven
@@ -19,9 +18,9 @@ from raven import remote_clear
 from raven.blueprints.marti_api.certificate_enrollment_api import basic_auth
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
+from raven.device_profiles import resolve_settings, username_for_eud
 from raven.extensions import db, ldap_manager, logger
 from raven.models.DataPackage import DataPackage
-from raven.models.DeviceProfiles import DeviceProfiles
 from raven.models.Packages import Packages
 from raven.models.Plugins import Plugins
 
@@ -70,7 +69,60 @@ def get_ldap_attributes(prefs: Element):
                 subelement.text = user_info[field][0]
 
 
-def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = None):
+def _set_entry(pref: Element, key: str, value_class: str, value: str):
+    """Sets an entry in pref, replacing an existing entry with the same key (so a device profile
+    setting overrides one of the built-in entries instead of duplicating it).
+
+    A built-in entry keeps its own class: ATAK reads those keys with a fixed getter (getBoolean
+    for deviceProfileEnableOnConnect, ...), and storing e.g. a String there makes it throw on the
+    device. A value that doesn't fit the built-in class is dropped. Returns the entry or None."""
+    for entry in pref.findall("entry"):
+        if entry.get("key") == key:
+            builtin_class = entry.get("class")
+            if builtin_class != value_class:
+                if builtin_class == "class java.lang.Boolean" and value.strip().lower() in (
+                    "true",
+                    "false",
+                ):
+                    value = value.strip().lower()
+                elif builtin_class != "class java.lang.String":
+                    logger.warning(
+                        f"Device profile setting {key} has type {value_class}, but the server "
+                        f"sends it as {builtin_class}; ignoring it"
+                    )
+                    return None
+            entry.text = value
+            return entry
+    entry = SubElement(pref, "entry", {"key": key, "class": value_class})
+    entry.text = value
+    return entry
+
+
+# Entries device profiles may not override: the remote clear plugin fails closed without the
+# server's real key (an admin typo there would silently disable remote clear), and the update
+# server CA location/password describe the truststore this same zip ships.
+PROTECTED_KEYS = {
+    remote_clear.SERVER_PUBKEY_PREF_KEY,
+    "updateServerCaLocation",
+    "updateServerCaPassword",
+}
+
+
+def create_profile_zip(
+    enrollment=True,
+    syncSecago=-1,
+    clientUid: str | None = None,
+    username: str | None = None,
+):
+    """
+    Builds the device profile data package.
+
+    :param enrollment: Enrollment profile (True) or connection profile (False)
+    :param syncSecago: Connection only: seconds since the device last synced. Only settings from
+        profiles updated (and data packages/plugins published) within that window are sent.
+    :param clientUid: The device's uid, for device-targeted profiles
+    :param username: The account the request is for, for user- and group-targeted profiles
+    """
     # preference.pref
     prefs = Element("preferences")
     pref = SubElement(prefs, "preference", {"version": "1", "name": "com.atakmap.app_preferences"})
@@ -79,7 +131,6 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
 
     plugins = None
     data_packages = None
-    device_profiles = None
     zip_buffer = io.BytesIO()
     zipf = zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False)
 
@@ -157,10 +208,7 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
                     SubElement(contents, "Content", {"ignore": "false", "zipEntry": f"maps/{map}"})
 
         # Not inside the map sources block: with RAVEN_PROFILE_MAP_SOURCES off, enrollment used
-        # to skip these, leave device_profiles None and 500 on the settings loop
-        device_profiles = db.session.execute(
-            db.session.query(DeviceProfiles).filter_by(enrollment=True, active=True)
-        ).all()
+        # to skip these (and 500 on the old settings loop)
         plugins = db.session.execute(
             db.session.query(Packages).filter_by(install_on_enrollment=True)
         ).all()
@@ -182,9 +230,6 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
         )
         ravenclear_pubkey.text = remote_clear.public_key_der_b64()
 
-        device_profile_query = db.session.query(DeviceProfiles).filter_by(
-            connection=True, active=True
-        )
         data_package_query = db.session.query(DataPackage).filter_by(install_on_connection=True)
         plugins_query = db.session.query(Packages).filter_by(install_on_connection=True)
 
@@ -192,30 +237,32 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
             publish_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
                 seconds=syncSecago
             )
-            device_profile_query = device_profile_query.filter(
-                DeviceProfiles.publish_time >= publish_time
-            )
             data_package_query = data_package_query.filter(
                 DataPackage.submission_time >= publish_time
             )
             plugins_query = plugins_query.filter(Packages.publish_time >= publish_time)
-        if clientUid:
-            device_profile_query = device_profile_query.filter(
-                or_(DeviceProfiles.eud_uid == clientUid, DeviceProfiles.eud_uid.is_(None))
-            )
-            # TODO: Support data packages and plugins per EUD
-        else:
-            device_profile_query = device_profile_query.filter(DeviceProfiles.eud_uid.is_(None))
+        # TODO: Support data packages and plugins per EUD
 
-        device_profiles = db.session.execute(device_profile_query).all()
         data_packages = db.session.execute(data_package_query).all()
         plugins = db.session.execute(plugins_query).all()
 
-    for profile in device_profiles:
-        p = SubElement(
-            pref, "entry", {"key": profile[0].preference_key, "class": profile[0].value_class}
-        )
-        p.text = profile[0].preference_value
+    # Device profile settings (raven/device_profiles.py), merged for this user/device
+    phase = "enrollment" if enrollment else "connection"
+    settings = resolve_settings(phase, username, clientUid)
+    if not enrollment and syncSecago > 0:
+        cutoff = datetime.datetime.now(datetime.timezone.utc).replace(
+            tzinfo=None
+        ) - datetime.timedelta(seconds=syncSecago)
+        updated = _profile_update_times({s["profile_id"] for s in settings})
+        settings = [s for s in settings if (updated.get(s["profile_id"]) or cutoff) >= cutoff]
+    for setting in settings:
+        if setting["key"] in PROTECTED_KEYS:
+            logger.warning(
+                f"Device profile {setting['profile_name']!r} sets {setting['key']}, which is "
+                "reserved; ignoring it"
+            )
+            continue
+        _set_entry(pref, setting["key"], setting["value_class"], setting["value"])
 
     if plugins:
         for plugin in plugins:
@@ -268,6 +315,33 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
     return zip_buffer
 
 
+def _profile_update_times(profile_ids) -> dict:
+    from raven.models.DeviceProfileSet import DeviceProfileSet
+
+    if not profile_ids:
+        return {}
+    rows = (
+        db.session.query(DeviceProfileSet.id, DeviceProfileSet.updated_at)
+        .filter(DeviceProfileSet.id.in_(profile_ids))
+        .all()
+    )
+    return dict(rows)
+
+
+def _client_cert_username() -> str | None:
+    """The CN of the client cert nginx verified and forwarded (Raven issues certs with
+    CN = username), or None."""
+    try:
+        cert = verify_client_cert()
+    except BaseException as e:
+        # A malformed header is just an unverified caller
+        logger.warning(f"Unreadable client certificate header: {e}")
+        return None
+    if not cert:
+        return None
+    return cert.get_subject().commonName or None
+
+
 # EUDs hit this endpoint on the enrollment port (8446) right after a successful
 # /Marti/api/tls/signClient/v2. ATAK sends the same Basic credentials it enrolled with
 # (CertificateEnrollmentClient.executeDeviceProfileRequest -> DeviceProfileClient.getProfile(..,
@@ -277,12 +351,18 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
 # accepted (check_token_max=False) and this request doesn't count as another use.
 @device_profile_marti_api_blueprint.route("/Marti/api/tls/profile/enrollment")
 def enrollment_profile():
-    if not basic_auth(
+    username = basic_auth(
         request.headers.get("Authorization"), consume_token=False, check_token_max=False
-    ):
+    )
+    if not username:
         return "", 401
+    # Device-targeted settings only if the device isn't someone else's (the uid is self-declared)
+    client_uid = request.args.get("clientUid") or request.args.get("clientUID") or None
+    eud_username = username_for_eud(client_uid)
+    if eud_username and eud_username.lower() != str(username).lower():
+        client_uid = None
     try:
-        profile_zip = create_profile_zip()
+        profile_zip = create_profile_zip(username=username, clientUid=client_uid)
         profile_zip.seek(0)
         return Response(
             FileWrapper(profile_zip), mimetype="application/zip", direct_passthrough=True
@@ -293,22 +373,58 @@ def enrollment_profile():
         return "", 500
 
 
-# EUDs hit this endpoint when the app connects to the server if repoStartupSync is enabled
+def connection_caller(client_uid: str | None):
+    """Who a connection profile request is for: (allowed, username, eud_uid).
+
+    ATAK fetches the connection profile from the streaming connection's host on 8443 over TLS
+    with the device's client cert (nginx ssl_verify_client on, forwarded as X-Ssl-Cert), so
+    the caller is the cert's CN. Basic credentials are accepted too, for other clients.
+
+    The device-targeted settings only apply if the device (clientUid) is bound to that same
+    account, or to none: otherwise anyone with a cert could ask for another device's settings
+    by passing its uid.
+
+    With RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH off, unauthenticated callers get the old
+    behaviour: whatever clientUid they claim, and that EUD's account.
+    """
+    eud_username = username_for_eud(client_uid)
+    username = _client_cert_username()
+    if not username and request.headers.get("Authorization"):
+        username = basic_auth(request.headers.get("Authorization"), consume_token=False) or None
+
+    if not username:
+        if app.config.get("RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH", True):
+            return False, None, None
+        return True, eud_username, client_uid
+
+    if eud_username and eud_username.lower() != username.lower():
+        logger.warning(
+            f"Connection profile: {username} asked for device {client_uid}, which belongs to "
+            f"{eud_username}; ignoring its device settings"
+        )
+        return True, username, None
+    return True, username, client_uid
+
+
+# EUDs hit this endpoint when the app connects to the server if deviceProfileEnableOnConnect
+# ("Apply TAK Server profile updates") is on; the enrollment profile above turns it on.
 @device_profile_marti_api_blueprint.route("/api/connection")
 @device_profile_marti_api_blueprint.route("/Marti/api/device/profile/connection")
 def connection_profile():
     try:
         syncSecago = -1
-        client_uid = None
         if "syncSecago" in request.args:
             try:
                 syncSecago = int(request.args["syncSecago"])
             except ValueError:
                 pass
-        if "clientUid" in request.args:
-            client_uid = request.args["clientUid"]
+        client_uid = request.args.get("clientUid") or request.args.get("clientUID") or None
 
-        profile_zip = create_profile_zip(False, syncSecago, client_uid)
+        allowed, username, client_uid = connection_caller(client_uid)
+        if not allowed:
+            return "", 401
+
+        profile_zip = create_profile_zip(False, syncSecago, client_uid, username)
         profile_zip.seek(0)
         return Response(
             FileWrapper(profile_zip), mimetype="application/zip", direct_passthrough=True
