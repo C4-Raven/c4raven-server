@@ -33,6 +33,16 @@ this is derived from, paired with the [Raven UI](https://github.com/C4-Raven/c4r
   - Data Sync plugin
   - Fire Area Survey plugin
 - Federation Hub admin proxy — see [Federation Hub integration](#federation-hub-integration)
+- Security audit trail of logins, failed logins, enrollments and admin
+  changes, browsable and downloadable by admins
+- Live error log in the web UI
+- Scheduled jobs that admins can reschedule (once, every N minutes,
+  hourly, daily, weekly) or cancel from the web UI
+- Group policies: default access, auto-join for new users, membership
+  expiry, and locking
+- Device profiles: named sets of ATAK settings aimed at everyone or at
+  specific users, groups or devices, sent on enrollment and/or connection,
+  with preview, export and import
 
 ## Requirements
 
@@ -44,10 +54,13 @@ this is derived from, paired with the [Raven UI](https://github.com/C4-Raven/c4r
 ## Installation
 
 See [c4raven-server-setup](https://github.com/C4-Raven/c4raven-server-setup)
-for a fresh install (`.deb` or `install.sh`); the same repo's `update.sh`
-updates servers installed that way. [c4raven-updater](https://github.com/C4-Raven/c4raven-updater)
-is only for pre-existing servers on the older single-user layout
-(`~/.opentakserver_venv`, `~/ots`, `opentakserver.service`).
+for a fresh install (`install.sh`, `.deb`, `.rpm` or the offline bundle)
+and its [CHANGELOG](https://github.com/C4-Raven/c4raven-server-setup/blob/master/CHANGELOG.md)
+for what changed in each release. Servers installed from source are
+updated with that repo's `update.sh` or with
+[c4raven-updater](https://github.com/C4-Raven/c4raven-updater), which also
+handles the older single-user layout (`~/.opentakserver_venv`, `~/ots`,
+`opentakserver.service`) and can finish an install that stopped partway.
 
 ## Architecture
 
