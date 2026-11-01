@@ -239,13 +239,6 @@ def init_extensions(app):
     channel.close()
     rabbit_connection.close()
 
-    if not apscheduler.running:
-        add_new_jobs_to_config(app)
-        drop_removed_jobs_from_config(app)
-        apscheduler.init_app(app)
-        apscheduler.start(paused=False)
-        remove_obsolete_scheduler_jobs()
-
     try:
         fsqla.FsModels.set_db_info(db)
     except sqlalchemy.exc.InvalidRequestError:
@@ -267,6 +260,17 @@ def init_extensions(app):
     mail.init_app(app)
 
     babel.init_app(app, locale_selector=get_locale, timezone_selector=get_timezone)
+
+    # Start the scheduler last: a job can fire as soon as it starts (e.g.
+    # expire_group_memberships on a restart), and it needs every model --
+    # User included, which is only defined after FsModels.set_db_info above --
+    # to be registered, or SQLAlchemy can't resolve the 'User' relationship.
+    if not apscheduler.running:
+        add_new_jobs_to_config(app)
+        drop_removed_jobs_from_config(app)
+        apscheduler.init_app(app)
+        apscheduler.start(paused=False)
+        remove_obsolete_scheduler_jobs()
 
 
 def setup_logging(app):
