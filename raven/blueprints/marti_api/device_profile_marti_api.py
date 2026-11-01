@@ -156,15 +156,17 @@ def create_profile_zip(enrollment=True, syncSecago=-1, clientUid: str | None = N
                     zipf.writestr(f"maps/{map}", open(os.path.join(maps_path, map), "r").read())
                     SubElement(contents, "Content", {"ignore": "false", "zipEntry": f"maps/{map}"})
 
-            device_profiles = db.session.execute(
-                db.session.query(DeviceProfiles).filter_by(enrollment=True, active=True)
-            ).all()
-            plugins = db.session.execute(
-                db.session.query(Packages).filter_by(install_on_enrollment=True)
-            ).all()
-            data_packages = db.session.execute(
-                db.session.query(DataPackage).filter_by(install_on_enrollment=True)
-            ).all()
+        # Not inside the map sources block: with RAVEN_PROFILE_MAP_SOURCES off, enrollment used
+        # to skip these, leave device_profiles None and 500 on the settings loop
+        device_profiles = db.session.execute(
+            db.session.query(DeviceProfiles).filter_by(enrollment=True, active=True)
+        ).all()
+        plugins = db.session.execute(
+            db.session.query(Packages).filter_by(install_on_enrollment=True)
+        ).all()
+        data_packages = db.session.execute(
+            db.session.query(DataPackage).filter_by(install_on_enrollment=True)
+        ).all()
     else:
         # ravenclear: provision the server's public signing key to every
         # connected device. The device plugin fails CLOSED (ignores all remote
