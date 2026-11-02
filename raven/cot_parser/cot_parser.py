@@ -29,6 +29,7 @@ from raven.models.GroupUser import GroupUser
 from pika.channel import Channel
 from sqlalchemy import exc, insert, select, update
 
+from raven import metrics
 from raven.defaultconfig import DefaultConfig
 from raven.extensions import db, logger
 from raven.functions import *
@@ -1382,6 +1383,10 @@ class CoTController:
                 self.record_fileshare_recipients(event, uid)
                 self.route_cot(event, uid, body.get("user_id"), body.get("target_groups"))
                 self.rabbit_channel.basic_ack(delivery_tag=basic_deliver.delivery_tag)
+                metrics.inc(
+                    "raven_cot_parsed_total",
+                    metrics.CATEGORY_LABELS[metrics.cot_category(event.attrs.get("type"))],
+                )
 
                 # EUD went offline
                 if event.attrs["type"] == "t-x-d-d":
@@ -1412,6 +1417,7 @@ class CoTController:
         except BaseException as e:
             self.logger.error(f"Failed to parse CoT: {e}")
             self.logger.debug(traceback.format_exc())
+            metrics.inc("raven_cot_parse_errors_total")
             self.rabbit_channel.basic_nack(delivery_tag=basic_deliver.delivery_tag, requeue=False)
 
 
@@ -1508,6 +1514,9 @@ def main():
         )
     )
 
+    # Every parser process counts into these, inherited across the fork below
+    counters = metrics.install(metrics.SharedCounters(metrics.COT_PARSER_SERIES))
+
     processes = 0
     while processes < app.config.get("RAVEN_COT_PARSER_PROCESSES"):
         try:
@@ -1531,6 +1540,11 @@ def main():
             logger.error(f"cot_parser error: {e}")
             logger.debug(traceback.format_exc())
         processes += 1
+
+    # Started only after the last fork: the parsers share this module's db engine, so this
+    # process mustn't have opened (or be holding) a DB connection when they're forked.
+    flusher = metrics.MetricsFlusher(app, counters, "cot_parser")
+    flusher.start()
 
     for i, child in enumerate(child_processes):
         try:

@@ -164,6 +164,12 @@ class DefaultConfig:
     RAVEN_TURNSTILE_SITE_KEY = os.getenv("RAVEN_TURNSTILE_SITE_KEY", "")
     RAVEN_TURNSTILE_SECRET_KEY = os.getenv("RAVEN_TURNSTILE_SECRET_KEY", "")
 
+    # Prometheus scraping of /api/metrics. An administrator's web session can always read it;
+    # set this to also accept "Authorization: Bearer <token>" (empty = token auth disabled).
+    RAVEN_METRICS_TOKEN = os.getenv("RAVEN_METRICS_TOKEN", "")
+    # Seconds between each eud_handler / cot_parser service writing its message counters to the DB
+    RAVEN_METRICS_FLUSH_INTERVAL = int(os.getenv("RAVEN_METRICS_FLUSH_INTERVAL", 10))
+
     # Certificate Authority Settings
     RAVEN_CA_NAME = os.getenv("RAVEN_CA_NAME", "Raven-CA")
     RAVEN_CA_FOLDER = os.getenv("RAVEN_CA_FOLDER", os.path.join(RAVEN_DATA_FOLDER, "ca"))
@@ -362,6 +368,13 @@ class DefaultConfig:
         {
             "id": "expire_group_memberships",
             "func": "raven.blueprints.scheduled_jobs:expire_group_memberships",
+            "trigger": "interval",
+            "seconds": 0,
+            "minutes": 1,
+        },
+        {
+            "id": "record_metrics_sample",
+            "func": "raven.blueprints.scheduled_jobs:record_metrics_sample",
             "trigger": "interval",
             "seconds": 0,
             "minutes": 1,

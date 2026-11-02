@@ -39,6 +39,7 @@ from flask_security.models import fsqla
 from pika.channel import Channel
 from sqlalchemy import insert, update, select
 
+from raven import metrics
 from raven.EmailValidator import EmailValidator
 from raven.PasswordValidator import PasswordValidator
 from raven.defaultconfig import DefaultConfig
@@ -173,6 +174,7 @@ class EudHandler(socketserver.BaseRequestHandler):
                 self.logger.debug("no data")
                 break
 
+            metrics.inc("raven_bytes_received_total", "", len(data))
             cot += data.decode("utf-8")
             cot_list = re.split("</event>|</auth>", cot)
 
@@ -189,6 +191,7 @@ class EudHandler(socketserver.BaseRequestHandler):
                         self.handle_auth(c + "</auth>")
                 except ParseError as e:
                     self.logger.error(f"Failed to parse: {e}")
+                    metrics.inc("raven_cot_dropped_total", metrics.DROP_PARSE_ERROR)
                     cot = c
                     break
 
@@ -229,9 +232,11 @@ class EudHandler(socketserver.BaseRequestHandler):
         """Write to the device socket under send_lock (see setup())."""
         with self.send_lock:
             self.request.sendall(data)
+        metrics.inc("raven_bytes_sent_total", "", len(data))
 
     def setup(self):
         self.socket: socket = self.request
+        metrics.inc("raven_eud_connections_accepted_total")
 
         # Without this, a peer that vanishes without a clean FIN/RST (wifi
         # drop, app killed, phone put to sleep) leaves recv() in handle()
@@ -520,7 +525,12 @@ class EudHandler(socketserver.BaseRequestHandler):
                 return
             if body["uid"] != self.uid:
                 self._send(body["cot"].encode())
+                metrics.inc(
+                    "raven_cot_sent_total",
+                    metrics.CATEGORY_LABELS[metrics.cot_category_from_xml(body["cot"])],
+                )
         except BaseException as e:
+            metrics.inc("raven_cot_dropped_total", metrics.DROP_SEND_ERROR)
             self.logger.error(f"{self.callsign}: {e}, closing socket")
             self.close_connection()
             self.logger.error(traceback.format_exc())
@@ -605,6 +615,7 @@ class EudHandler(socketserver.BaseRequestHandler):
                     user = authenticate_eud_credentials(self.app, username, password)
                     if not user:
                         self.logger.warning("Failed login for user {}".format(username))
+                        metrics.inc("raven_eud_auth_failures_total")
                         self.close_connection()
                         return
 
@@ -616,12 +627,14 @@ class EudHandler(socketserver.BaseRequestHandler):
                                 self.common_name, user.username
                             )
                         )
+                        metrics.inc("raven_eud_auth_failures_total")
                         self.close_connection()
                         return
                 elif self.common_name:
                     user = self.app.security.datastore.find_user(username=self.common_name)
                     if not user:
                         self.logger.warning("User {} does not exist".format(self.common_name))
+                        metrics.inc("raven_eud_auth_failures_total")
                         self.close_connection()
                         return
 
@@ -629,6 +642,7 @@ class EudHandler(socketserver.BaseRequestHandler):
                     self.logger.warning(
                         "User {} is deactivated, disconnecting".format(user.username)
                     )
+                    metrics.inc("raven_eud_auth_failures_total")
                     self.close_connection()
                     return
 
@@ -671,10 +685,17 @@ class EudHandler(socketserver.BaseRequestHandler):
         # before accepting any data from them
         if self.is_ssl and not self.is_authenticated:
             self.logger.warning("EUD isn't authenticated, ignoring")
+            metrics.inc("raven_cot_dropped_total", metrics.DROP_UNAUTHENTICATED)
             return
 
         if self.pong(event):
             return
+
+        if event:
+            metrics.inc(
+                "raven_cot_received_total",
+                metrics.CATEGORY_LABELS[metrics.cot_category(event.attrs.get("type"))],
+            )
 
         if event and not self.uid:
             self.parse_device_info(event)

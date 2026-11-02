@@ -19,6 +19,7 @@ from sqlalchemy import func, or_, select
 from werkzeug.datastructures.file_storage import FileStorage
 from werkzeug.utils import secure_filename
 
+from raven import metrics
 from raven.audit import record_audit_event
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, logger
@@ -295,6 +296,7 @@ def data_package_share():
         else:
             file_hash = save_data_package_file(file)
 
+        metrics.record("raven_data_package_uploads_total")
         url = urlparse(request.url_root)
         return (
             "https://{}:{}/Marti/api/sync/metadata/{}/tool".format(
@@ -471,6 +473,7 @@ def download_data_package():
             details=f"Certificate package {file[0].filename} downloaded over Marti sync",
         )
     if os.path.exists(os.path.join(app.config.get("UPLOAD_FOLDER"), f"{file_hash}{extension}")):
+        metrics.record("raven_data_package_downloads_total")
         return send_from_directory(
             app.config.get("UPLOAD_FOLDER"),
             f"{file_hash}{extension}",
@@ -479,6 +482,7 @@ def download_data_package():
     elif os.path.exists(
         os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "missions", file[0].filename)
     ):
+        metrics.record("raven_data_package_downloads_total")
         return send_from_directory(
             os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "missions"), file[0].filename
         )

@@ -46,6 +46,11 @@ JOB_DESCRIPTIONS = {
         "unsubscribed from the group straight away and each removal is recorded in the "
         "Security Audit log."
     ),
+    "record_metrics_sample": (
+        "Saves a snapshot of the message counters (messages and bytes in and out, connected "
+        "devices) for the Dashboard's message rate chart, and deletes snapshots older than 24 "
+        "hours. Pausing it stops the chart; the Prometheus counters keep counting."
+    ),
     "get_airplanes_live_data": (
         "Legacy placeholder that does nothing. It only exists so old saved job entries still load."
     ),

@@ -17,6 +17,7 @@ from flask_security.models import fsqla
 from sqlalchemy import update
 from sqlalchemy.exc import ProgrammingError
 
+from raven import metrics
 from raven.EmailValidator import EmailValidator
 from raven.PasswordValidator import PasswordValidator
 from raven.defaultconfig import DefaultConfig
@@ -208,10 +209,32 @@ def main():
         )
         logger.info(f"Started TCP server on port {app.config.get('RAVEN_TCP_STREAMING_PORT')}")
 
+    # Counted by every connection's child process, flushed to the DB by this one. Installed
+    # before serve_forever() so each forked child inherits the shared counters.
+    transport = "ssl" if opts.ssl else "udp" if opts.udp else "tcp"
+    counters = metrics.install(metrics.SharedCounters(metrics.EUD_HANDLER_SERIES))
+
+    def open_connections():
+        # UDP forks a child per datagram, there's no connection to count
+        if opts.udp:
+            return {}
+        return {
+            ("raven_eud_connections", f'transport="{transport}"'): len(
+                socket_server.active_children or ()
+            )
+        }
+
+    flusher = metrics.MetricsFlusher(
+        app, counters, f"eud_handler_{transport}", f'transport="{transport}"', open_connections
+    )
+    flusher.start()
+
     try:
         socket_server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down server")
+    finally:
+        flusher.stop()
 
 
 if __name__ == "__main__":
