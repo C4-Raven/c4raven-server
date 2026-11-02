@@ -23,6 +23,7 @@ from sqlalchemy import String, Text, Unicode, UnicodeText, func, select
 
 from raven import __version__ as version
 from raven.audit import record_audit_event
+from raven.blueprints.marti_api.certificate_enrollment_api import enrollment_blocked_response
 from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
 from raven.cert_revocation import serial_from_pem
 from raven.cert_validity import resolve_cert_days
@@ -340,6 +341,15 @@ def certificate():
 
             # Use the stored spelling (the lookup is case-insensitive) for the CN and paths
             username = user.username
+
+            # A device whose cert was revoked can't get a new one here either until an admin
+            # allows it to enroll again (see certificate_api)
+            blocked = enrollment_blocked_response(
+                request.json.get("uid"), username, "certificate package"
+            )
+            if blocked:
+                return blocked
+
             # create_ca() writes the truststore to the CA folder root, not certs/raven/
             truststore_filename = os.path.join(
                 app.config.get("RAVEN_CA_FOLDER"), "truststore-root.p12"

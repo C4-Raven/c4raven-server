@@ -45,13 +45,19 @@ from raven.defaultconfig import DefaultConfig
 from raven.extensions import babel, logger
 
 
+# The real one, before the kicks fixture stubs it out
+_real_kick_revoked_sessions = cert_revocation.kick_revoked_sessions
+
+
 @pytest.fixture
 def kicks(monkeypatch):
     sent = []
 
     def fake_kick(app, serials, logger=None):
-        sent.extend(cert_revocation.normalize_serial(s) for s in serials)
-        return True
+        serials = [cert_revocation.normalize_serial(s) for s in serials]
+        sent.extend(serials)
+        # As if every one of them had a live streaming connection
+        return {"sent": True, "connected": serials}
 
     monkeypatch.setattr(cert_revocation, "kick_revoked_sessions", fake_kick)
     return sent
@@ -342,7 +348,8 @@ def test_revoke_certificate(app, kicks):
     )
     assert r.status_code == 200, r.json
     assert r.json["revoked"][0]["status"] == "revoked"
-    assert r.json["sessions_disconnected"] is True
+    assert r.json["kick_sent"] is True
+    assert r.json["sessions_disconnected"] == [serial]
 
     row = _rows(app, username="alice")[0]
     assert row["revoked_at"] and row["revocation_reason"] == "keyCompromise"
@@ -448,7 +455,9 @@ def test_legacy_row_without_file_cant_be_revoked(app):
 
 def test_reenrolling_after_revocation_gets_a_working_cert(app):
     r1, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
-    _client(app, "admin").post("/api/certificates/revoke_user", json={"username": "alice"})
+    _client(app, "admin").post(
+        "/api/certificates/revoke_user", json={"username": "alice", "reset_password": False}
+    )
     r2, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-new")
     assert r2.status_code == 200
     new_serial = format(_signed_cert(r2).serial_number, "X")
@@ -607,3 +616,412 @@ def test_eud_handler_drops_connection_on_revoke_message():
     assert closed == []
     handler.on_control_message(None, None, None, json.dumps({"action": "revoke", "serial": "186A0"}))
     assert closed == [True]
+
+
+# ---------------------------------------------------------------- review fixes (fix/certs)
+
+
+def _serial_of(response):
+    return format(_signed_cert(response).serial_number, "X")
+
+
+def _cert_id(app, serial):
+    return next(c["id"] for c in _rows(app) if c["serial_number"] == serial)
+
+
+def test_revoked_device_cant_reenroll_until_an_admin_allows_it(app):
+    """A lost phone with the user's saved credentials can't enroll for a fresh cert."""
+    r1, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-lost")
+    serial = _serial_of(r1)
+    admin = _client(app, "admin")
+    assert admin.post(f"/api/certificates/{_cert_id(app, serial)}/revoke", json={}).json[
+        "enrollment_blocked"
+    ] == ["ANDROID-lost"]
+
+    again, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-lost")
+    assert again.status_code == 403
+    assert "revoked" in again.json["error"]
+    blocked = _audit(app, "enroll_blocked")
+    assert len(blocked) == 1 and blocked[0]["success"] is False and "ANDROID-lost" in blocked[0]["details"]
+    # Nothing was issued for it
+    assert [c["serial_number"] for c in _rows(app, eud_uid="ANDROID-lost")] == [serial]
+
+    # The account is still active: a NEW phone enrolls fine
+    new_phone, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-new")
+    assert new_phone.status_code == 200
+
+    rows = admin.get("/api/certificates", query_string={"username": "alice"}).json["results"]
+    assert {c["eud_uid"]: c["enrollment_blocked"] for c in rows} == {
+        "ANDROID-lost": True, "ANDROID-new": False,
+    }
+    blocks = admin.get("/api/certificates/enrollment_blocks").json["results"]
+    assert [(b["eud_uid"], b["serial_number"], b["blocked_by"]) for b in blocks] == [
+        ("ANDROID-lost", serial, "admin")
+    ]
+
+    # Only an admin can lift it
+    assert _client(app, "alice").post(
+        "/api/certificates/allow_enrollment", json={"eud_uid": "ANDROID-lost"}
+    ).status_code == 403
+    assert admin.post(
+        "/api/certificates/allow_enrollment", json={"eud_uid": "ANDROID-other"}
+    ).status_code == 404
+    assert admin.post(
+        "/api/certificates/allow_enrollment", json={"eud_uid": "ANDROID-lost"}
+    ).status_code == 200
+    assert _audit(app, "enrollment_unblocked")[0]["actor"] == "admin"
+
+    found, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-lost")
+    assert found.status_code == 200
+
+
+def test_revoked_device_cant_get_a_certificate_package_either(app):
+    r1, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-lost")
+    _client(app, "admin").post(f"/api/certificates/{_cert_id(app, _serial_of(r1))}/revoke", json={})
+    r = _client(app, "alice").post(
+        "/api/certificate", json={"username": "alice", "uid": "ANDROID-lost"}
+    )
+    assert r.status_code == 403
+    assert _client(app, "alice").post("/api/certificate", json={"username": "alice"}).status_code == 200
+
+
+def test_revoking_a_replaced_cert_doesnt_block_the_device(app):
+    old, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+    _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+    r = _client(app, "admin").post(
+        f"/api/certificates/{_cert_id(app, _serial_of(old))}/revoke", json={"reason": "superseded"}
+    )
+    assert r.status_code == 200 and r.json["enrollment_blocked"] == []
+    assert _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")[0].status_code == 200
+
+
+def test_revoke_can_reset_the_password(app):
+    from raven.blueprints.marti_api.certificate_enrollment_api import basic_auth
+    from tests.test_cert_issuance_authz import _basic
+
+    r1, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+    r2, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a2")
+    admin = _client(app, "admin")
+
+    # Off by default for a single cert
+    r = admin.post(f"/api/certificates/{_cert_id(app, _serial_of(r1))}/revoke", json={})
+    assert r.json["password_reset"] is None
+    with app.test_request_context("/"):
+        assert basic_auth(_basic("alice", "alicepass")) == "alice"
+    assert _audit(app, "password_reset") == []
+
+    r = admin.post(
+        f"/api/certificates/{_cert_id(app, _serial_of(r2))}/revoke", json={"reset_password": True}
+    )
+    assert r.status_code == 200 and r.json["password_reset"] is True
+    with app.test_request_context("/"):
+        assert basic_auth(_basic("alice", "alicepass")) is False
+        user = app.security.datastore.find_user(username="alice")
+        assert user.active and user.force_password_change
+    events = _audit(app, "password_reset")
+    assert len(events) == 1 and events[0]["username"] == "alice" and events[0]["actor"] == "admin"
+    assert events[0]["category"] == "security"
+
+
+def test_revoke_all_resets_the_password_by_default(app):
+    from raven.blueprints.marti_api.certificate_enrollment_api import basic_auth
+    from tests.test_cert_issuance_authz import _basic
+
+    _sign(app, "bob", "bobpass", ["bob"], uid="ANDROID-b1")
+    r = _client(app, "admin").post("/api/certificates/revoke_user", json={"username": "bob"})
+    assert r.status_code == 200 and r.json["password_reset"] is True
+    with app.test_request_context("/"):
+        assert basic_auth(_basic("bob", "bobpass")) is False
+        assert app.security.datastore.find_user(username="bob").active
+    assert len(_audit(app, "password_reset")) == 1
+
+
+def test_reenrolling_keeps_the_revoked_row(app):
+    r1, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+    old = _serial_of(r1)
+    admin = _client(app, "admin")
+    admin.post(f"/api/certificates/{_cert_id(app, old)}/revoke", json={"reason": "keyCompromise"})
+    admin.post("/api/certificates/allow_enrollment", json={"eud_uid": "ANDROID-a1"})
+    r2, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+    assert r2.status_code == 200
+
+    rows = _rows(app, eud_uid="ANDROID-a1")
+    assert [(c["serial_number"], c["status"]) for c in rows] == [
+        (old, "revoked"), (_serial_of(r2), "valid"),
+    ]
+    assert rows[0]["revocation_reason"] == "keyCompromise"
+
+
+def test_reenrolling_never_overwrites_a_revoked_row_even_with_a_unique_eud_uid(app):
+    """A database with a unique constraint on certificates.eud_uid (the migration drops it)
+    takes the IntegrityError fallback: it may reuse a valid row but never the revoked one."""
+    from sqlalchemy import text
+
+    with app.app_context():
+        db.session.execute(text("CREATE UNIQUE INDEX uq_cert_eud ON certificates (eud_uid)"))
+        db.session.commit()
+    r1, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+    r2, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+    assert r2.status_code == 200
+    assert [c["serial_number"] for c in _rows(app, eud_uid="ANDROID-a1")] == [_serial_of(r2)]
+
+    admin = _client(app, "admin")
+    admin.post(f"/api/certificates/{_cert_id(app, _serial_of(r2))}/revoke", json={})
+    admin.post("/api/certificates/allow_enrollment", json={"eud_uid": "ANDROID-a1"})
+    r3, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+    assert r3.status_code == 500
+    rows = _rows(app, eud_uid="ANDROID-a1")
+    assert [(c["serial_number"], c["status"]) for c in rows] == [(_serial_of(r2), "revoked")]
+
+
+def _legacy_row(app, username, serial, common_name=None):
+    from raven.models.Certificate import Certificate
+
+    with app.app_context():
+        cert = Certificate(
+            common_name=common_name or username or "unknown",
+            username=username,
+            expiration_date=datetime.datetime.now() + datetime.timedelta(days=30),
+            server_address="localhost",
+            server_port=8089,
+            truststore_filename="x",
+            user_cert_filename="x",
+            cert_password="x",
+            serial_number=serial,
+        )
+        db.session.add(cert)
+        db.session.commit()
+        return cert.id
+
+
+def test_shared_legacy_serial_needs_confirmation(app, kicks):
+    alice_id = _legacy_row(app, "alice", "1869F")
+    _legacy_row(app, "bob", "1869F")
+    admin = _client(app, "admin")
+
+    for r in (
+        admin.post("/api/certificates/revoke", json={"serial": "1869f"}),
+        admin.post(f"/api/certificates/{alice_id}/revoke", json={}),
+    ):
+        assert r.status_code == 409
+        assert r.json["shared_serial"] == "1869F"
+        assert "alice" in r.json["error"] and "bob" in r.json["error"]
+    assert kicks == [] and _crl_serials(app) == set()
+
+    r = admin.post("/api/certificates/revoke", json={"serial": "1869F", "confirm_shared_serial": True})
+    assert r.status_code == 200
+    assert {c["status"] for c in _rows(app)} == {"revoked"}
+
+    # A unique legacy serial doesn't need it
+    carol_id = _legacy_row(app, "alice", "2710")
+    assert admin.post(f"/api/certificates/{carol_id}/revoke", json={}).status_code == 200
+
+
+def test_by_serial_revoke_checks_protected_common_name(app):
+    _legacy_row(app, None, "ABCDEF123456", common_name="Admin")
+    admin = _client(app, "admin")
+    assert admin.post("/api/certificates/revoke", json={"serial": "ABCDEF123456"}).status_code == 403
+    assert _crl_serials(app) == set()
+    assert _client(app, "Admin").post(
+        "/api/certificates/revoke", json={"serial": "ABCDEF123456"}
+    ).status_code == 200
+
+
+def test_ca_password_never_on_the_command_line(app, monkeypatch):
+    import subprocess as real_subprocess
+
+    from raven import certificate_authority
+
+    calls = []
+    real_call = real_subprocess.call
+
+    def spy(command, *args, **kwargs):
+        calls.append((command, kwargs.get("env") or {}))
+        return real_call(command, *args, **kwargs)
+
+    monkeypatch.setattr(certificate_authority.subprocess, "call", spy)
+    _issue_package(app, "alice")
+    openssl = [(c, env) for c, env in calls if "pass" in c]
+    assert openssl
+    for command, env in openssl:
+        assert CA_PASSWORD not in command, command
+        assert "pass:" not in command
+        assert env.get("RAVEN_CA_PASS") == CA_PASSWORD
+
+
+# ---------------------------------------------------------------- kick reaches every connection
+
+
+class _FakeChannel:
+    def __init__(self):
+        self.is_open = True
+        self.binds = []
+        self.consumers = []
+
+    def queue_declare(self, queue, **kwargs):
+        pass
+
+    def queue_bind(self, exchange, queue, routing_key):
+        self.binds.append((exchange, queue, routing_key))
+
+    def basic_consume(self, queue, on_message_callback, auto_ack):
+        self.consumers.append((queue, on_message_callback))
+        return "tag"
+
+
+def _handler(app, serial=None):
+    from raven.eud_handler.EudHandler import EudHandler
+
+    handler = EudHandler.__new__(EudHandler)
+    handler.app = app
+    handler.conn_token = "tok"
+    handler.cert_serial = serial
+    handler.uid = None  # never sent a contact event
+    handler.callsign = None
+    handler.rabbit_channel = None
+    closed = []
+    handler.close_connection = lambda: closed.append(True)
+    return handler, closed
+
+
+@pytest.mark.parametrize("channel_first", [True, False])
+def test_cert_control_queue_bound_without_a_uid(app, channel_first):
+    handler, closed = _handler(app)
+    channel = _FakeChannel()
+    if channel_first:
+        handler.rabbit_channel = channel
+        handler.bind_cert_control_queue()  # on_channel_open, serial not known yet
+        assert channel.binds == []
+        handler.cert_serial = "186A0"
+        handler.bind_cert_control_queue()  # after the handshake
+    else:
+        handler.cert_serial = "186A0"
+        handler.bind_cert_control_queue()  # channel not open yet
+        handler.rabbit_channel = channel
+        handler.bind_cert_control_queue()
+    handler.bind_cert_control_queue()  # idempotent
+    assert [b[2] for b in channel.binds] == [cert_revocation.CERT_ROUTING_PREFIX + "186A0"]
+    queue, callback = channel.consumers[0]
+    callback(None, None, None, json.dumps({"action": "revoke", "serial": "186A0"}))
+    assert closed == [True]
+
+
+def test_cert_control_queue_drops_cert_revoked_during_handshake(app):
+    pem = _issue_package(app, "alice")
+    serial = cert_revocation.serial_from_pem(pem)
+    _client(app, "admin").post(f"/api/certificates/{_rows(app, username='alice')[0]['id']}/revoke", json={})
+    handler, closed = _handler(app, serial)
+    handler.rabbit_channel = _FakeChannel()
+    handler.bind_cert_control_queue()
+    assert closed == [True]
+
+
+def test_kick_reports_which_sessions_were_live(app, monkeypatch):
+    import pika
+    from pika.exceptions import UnroutableError
+
+    published = []
+
+    class FakeChannel:
+        def confirm_delivery(self):
+            published.append("confirm")
+
+        def exchange_declare(self, *a, **k):
+            pass
+
+        def basic_publish(self, exchange, routing_key, body, properties=None, mandatory=False):
+            assert mandatory
+            published.append(routing_key)
+            if routing_key.endswith("DEAD"):
+                raise UnroutableError([])
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        is_open = True
+
+        def __init__(self, params):
+            pass
+
+        def channel(self):
+            return FakeChannel()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pika, "BlockingConnection", FakeConnection)
+    assert _real_kick_revoked_sessions(app, ["beef", "dead"]) == {"sent": True, "connected": ["BEEF"]}
+    assert published == ["confirm", "cert.BEEF", "cert.DEAD"]
+
+    def broken(params):
+        raise ConnectionError("no broker")
+
+    monkeypatch.setattr(pika, "BlockingConnection", broken)
+    assert _real_kick_revoked_sessions(app, ["beef"]) == {"sent": False, "connected": []}
+
+
+# ---------------------------------------------------------------- CRL expiry checks
+
+
+def test_streaming_port_checks_crl_expiry_even_when_unchanged(app, monkeypatch):
+    import time as time_module
+
+    folder = app.config["RAVEN_CA_FOLDER"]
+    server = _eud_server(app)
+    context = server._refresh_ssl_context()
+    assert server._refresh_ssl_context() is context
+
+    real = cert_revocation.crl_next_update
+    soon = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=5)
+    calls = []
+
+    def fake_next_update(ca_folder):
+        calls.append(ca_folder)
+        return soon if len(calls) <= 2 else real(ca_folder)
+
+    monkeypatch.setattr(cert_revocation, "crl_next_update", fake_next_update)
+    # Within the interval nothing is checked
+    assert server._refresh_ssl_context() is context
+    assert calls == []
+
+    before = os.stat(os.path.join(folder, "ca.crl")).st_ino
+    server._crl_checked_at = time_module.monotonic() - server.CRL_CHECK_INTERVAL - 1
+    reloaded = server._refresh_ssl_context()
+    assert os.stat(os.path.join(folder, "ca.crl")).st_ino != before
+    assert reloaded is not context
+
+
+def test_crl_regeneration_failure_is_audited(app, monkeypatch):
+    import time as time_module
+
+    server = _eud_server(app)
+    server.app_context = app
+    server._refresh_ssl_context()
+    expired = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    monkeypatch.setattr(cert_revocation, "crl_next_update", lambda folder: expired)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("bad CA password")
+
+    monkeypatch.setattr(cert_revocation, "ensure_crl", broken)
+    server._crl_checked_at = time_module.monotonic() - server.CRL_CHECK_INTERVAL - 1
+    server._refresh_ssl_context()
+    events = _audit(app, "crl_refresh_failed")
+    assert len(events) == 1 and events[0]["success"] is False
+    assert "bad CA password" in events[0]["details"] and "expired" in events[0]["details"]
+
+
+def test_refresh_crl_job_failure_is_audited(app, monkeypatch):
+    from raven.blueprints import scheduled_jobs
+    from raven.extensions import apscheduler
+
+    monkeypatch.setattr(apscheduler, "app", app, raising=False)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("openssl ca -gencrl failed")
+
+    monkeypatch.setattr(cert_revocation, "ensure_crl", broken)
+    scheduled_jobs.refresh_crl()
+    events = _audit(app, "crl_refresh_failed")
+    assert len(events) == 1 and "gencrl failed" in events[0]["details"]

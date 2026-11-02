@@ -12,7 +12,7 @@ on a server with large points/geochat/eud_stats tables the upgrade can take a wh
 inserts into each table while its index builds.
 
 Revision ID: 5c2e8a91d4b7
-Revises: 06e1c612e122
+Revises: b7e3c1d9a4f2
 Create Date: 2026-11-03 12:00:00.000000
 
 """
@@ -22,7 +22,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "5c2e8a91d4b7"
-down_revision = "06e1c612e122"
+down_revision = "b7e3c1d9a4f2"
 branch_labels = None
 depends_on = None
 

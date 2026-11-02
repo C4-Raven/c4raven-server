@@ -20,6 +20,7 @@ from raven.cert_validity import resolve_cert_days
 from raven.certificate_authority import CertificateAuthority
 from raven.extensions import db, ldap_manager, logger
 from raven.models.Certificate import Certificate
+from raven.models.EnrollmentBlock import EnrollmentBlock
 from raven.models.EUD import EUD
 from raven.models.Token import Token
 
@@ -92,6 +93,91 @@ def _client_uid():
     return request.args.get("clientUID") or request.args.get("clientUid")
 
 
+def enrollment_block(uid):
+    """The EnrollmentBlock for this device uid, or None if it may enroll.
+
+    A device is blocked when an admin revoked its certificate (see certificate_api), until an
+    admin clears it, so a lost phone can't enroll again with the user's saved credentials."""
+    if not uid:
+        return None
+    return db.session.get(EnrollmentBlock, uid)
+
+
+def enrollment_blocked_response(uid, username, via):
+    """403 + audit event if this device uid is blocked from enrolling, else None."""
+    block = enrollment_block(uid)
+    if not block:
+        return None
+    logger.warning(
+        f"Refused {via} for {username}: device {uid} is blocked from enrolling "
+        f"(cert {block.serial_number} revoked)"
+    )
+    record_audit_event(
+        "enrollment", "enroll_blocked", username=username, success=False,
+        details=f"Device {uid} tried to enroll ({via}) but its certificate "
+        f"{block.serial_number or ''} was revoked; an admin must allow it to enroll again",
+    )
+    return (
+        jsonify(
+            {
+                "success": False,
+                "error": "This device's certificate was revoked. An administrator must allow it "
+                "to enroll again before it can get a new certificate.",
+            }
+        ),
+        403,
+    )
+
+
+def _fill_certificate(certificate, uid, eud, user, common_name, cert_days, issued_serial):
+    certificate.common_name = common_name
+    certificate.username = user.username if user else None
+    certificate.eud_uid = uid
+    certificate.callsign = eud.callsign
+    certificate.expiration_date = datetime.datetime.today() + datetime.timedelta(days=cert_days)
+    certificate.server_address = urlparse(request.url_root).hostname
+    certificate.server_port = app.config.get("RAVEN_MARTI_HTTPS_PORT")
+    certificate.truststore_filename = os.path.join(
+        app.config.get("RAVEN_CA_FOLDER"), "truststore-root.p12"
+    )
+    certificate.user_cert_filename = os.path.join(
+        app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".pem"
+    )
+    certificate.csr = os.path.join(
+        app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".csr"
+    )
+    certificate.cert_password = app.config.get("RAVEN_CA_PASSWORD")
+    certificate.serial_number = issued_serial
+    certificate.revoked_at = None
+    certificate.revocation_reason = None
+
+
+def _record_enrolled_certificate(uid, eud, user, common_name, cert_days, issued_serial):
+    """Add a Certificate row for a cert just issued to this device.
+
+    Every enrollment gets its own row: a revoked row is the record of that revocation (the
+    Users page and the security audit show it), so it's never overwritten. The fallback below
+    is for a database that still has a unique constraint on certificates.eud_uid (migration
+    b7e3c1d9a4f2 drops it); it reuses the device's newest row only if that one isn't revoked."""
+    try:
+        certificate = Certificate()
+        _fill_certificate(certificate, uid, eud, user, common_name, cert_days, issued_serial)
+        db.session.add(certificate)
+        db.session.commit()
+    except sqlalchemy.exc.IntegrityError:
+        db.session.rollback()
+        certificate = (
+            db.session.query(Certificate)
+            .filter(Certificate.eud_uid == uid, Certificate.revoked_at.is_(None))
+            .order_by(Certificate.id.desc())
+            .first()
+        )
+        if certificate is None:
+            raise
+        _fill_certificate(certificate, uid, eud, user, common_name, cert_days, issued_serial)
+        db.session.commit()
+
+
 # require basic auth
 @certificate_authority_api_blueprint.route("/Marti/api/tls/config")
 def tls_config():
@@ -127,6 +213,10 @@ def sign_csr_v2():
             details=f"Certificate enrollment rejected (bad credentials), device {_client_uid()}",
         )
         return "", 401
+
+    blocked = enrollment_blocked_response(_client_uid(), username, "signClient")
+    if blocked:
+        return blocked
 
     try:
         if "clientUID" in request.args.keys():
@@ -224,63 +314,10 @@ def sign_csr_v2():
                 db.session.add(eud)
                 db.session.commit()
 
-        try:
-            certificate = Certificate()
-            if uid:
-                certificate.common_name = common_name
-                certificate.username = user.username if user else None
-                certificate.eud_uid = uid
-                certificate.callsign = eud.callsign
-                certificate.expiration_date = datetime.datetime.today() + datetime.timedelta(
-                    days=cert_days
-                )
-                certificate.server_address = urlparse(request.url_root).hostname
-                certificate.server_port = app.config.get("RAVEN_MARTI_HTTPS_PORT")
-                certificate.truststore_filename = os.path.join(
-                    app.config.get("RAVEN_CA_FOLDER"), "truststore-root.p12"
-                )
-                certificate.user_cert_filename = os.path.join(
-                    app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".pem"
-                )
-                certificate.csr = os.path.join(
-                    app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".csr"
-                )
-                certificate.cert_password = app.config.get("RAVEN_CA_PASSWORD")
-                certificate.serial_number = issued_serial
-                certificate.revoked_at = None
-                certificate.revocation_reason = None
-
-                db.session.add(certificate)
-                db.session.commit()
-        except sqlalchemy.exc.IntegrityError:
-            db.session.rollback()
-            if uid:
-                certificate = db.session.execute(
-                    db.session.query(Certificate).filter_by(eud_uid=eud.uid)
-                ).scalar_one()
-                certificate.common_name = common_name
-                certificate.username = user.username if user else None
-                certificate.callsign = eud.callsign
-                certificate.expiration_date = datetime.datetime.today() + datetime.timedelta(
-                    days=cert_days
-                )
-                certificate.server_address = urlparse(request.url_root).hostname
-                certificate.server_port = app.config.get("RAVEN_MARTI_HTTPS_PORT")
-                certificate.truststore_filename = os.path.join(
-                    app.config.get("RAVEN_CA_FOLDER"), "truststore-root.p12"
-                )
-                certificate.user_cert_filename = os.path.join(
-                    app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".pem"
-                )
-                certificate.csr = os.path.join(
-                    app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".csr"
-                )
-                certificate.cert_password = app.config.get("RAVEN_CA_PASSWORD")
-                certificate.serial_number = issued_serial
-                certificate.revoked_at = None
-                certificate.revocation_reason = None
-
-                db.session.commit()
+        if uid:
+            _record_enrolled_certificate(
+                uid, eud, user, common_name, cert_days, issued_serial
+            )
 
         # A token in the password field means ATAK's enroll QR (tak://...enroll?...&token=)
         qr = g.get("raven_auth_method") == "token"

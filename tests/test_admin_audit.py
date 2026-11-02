@@ -487,7 +487,7 @@ def test_new_labels_match_real_views():
     for view, module in views.items():
         assert callable(getattr(importlib.import_module(module), view)), view
         assert isinstance(ADMIN_ACTION_LABELS[view], str), view
-    assert ADMIN_ACTION_LABELS["allow_device_reenrollment"]
+    assert ADMIN_ACTION_LABELS["allow_enrollment"]
 
 
 def test_serial_is_a_target():

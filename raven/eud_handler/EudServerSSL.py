@@ -3,6 +3,7 @@ import os
 import socket
 import socketserver
 import ssl
+import time
 
 from raven.eud_handler.EudServer import EudServer
 
@@ -10,6 +11,8 @@ from raven.eud_handler.EudServer import EudServer
 class EudServerSSL(EudServer):
     allow_reuse_address = True
     daemon_threads = True
+    # Seconds between checks that ca.crl isn't (nearly) expired, see _check_crl_expiry()
+    CRL_CHECK_INTERVAL = 3600
 
     def __init__(self, server_address, eud_handler, logger, app_context):
         super().__init__(server_address, eud_handler, logger, app_context)
@@ -58,8 +61,47 @@ class EudServerSSL(EudServer):
             )
         return ssl_context
 
+    def _check_crl_expiry(self):
+        """Regenerate ca.crl if it's expired or close to it, and say so loudly.
+
+        An expired CRL fails every handshake on this port (VERIFY_CRL_CHECK_LEAF) and on nginx,
+        locking every device out. The daily refresh_crl job normally prevents that; this is the
+        streaming port's own safety net, run at least every CRL_CHECK_INTERVAL seconds even when
+        ca.crl hasn't changed. Returns True if ca.crl was rewritten."""
+        from raven.cert_revocation import CRL_REFRESH_DAYS, crl_next_update, ensure_crl, report_crl_failure
+
+        next_update = crl_next_update(self._ca_path())
+        if next_update is None:
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if next_update - now > datetime.timedelta(days=CRL_REFRESH_DAYS):
+            return False
+        expired = next_update <= now
+        log = self.logger.error if expired else self.logger.warning
+        log(
+            "The CA's CRL {} {}; regenerating it{}".format(
+                "EXPIRED at" if expired else "expires at",
+                next_update.isoformat(),
+                ": every client certificate is rejected until it is" if expired else "",
+            )
+        )
+        try:
+            return ensure_crl(
+                self._ca_path(), self.app_context.config.get("RAVEN_CA_PASSWORD"), self.logger
+            )
+        except BaseException as e:
+            report_crl_failure(
+                self.app_context,
+                "The SSL streaming port couldn't regenerate the {} CRL (next update {}): {}".format(
+                    "expired" if expired else "expiring", next_update.isoformat(), e
+                ),
+                self.logger,
+            )
+            return False
+
     def _refresh_ssl_context(self):
-        """Rebuild the SSL context if ca.crl changed since it was last loaded.
+        """Rebuild the SSL context if ca.crl changed since it was last loaded, and check the CRL
+        isn't about to expire at least every CRL_CHECK_INTERVAL seconds.
 
         Called from get_request() in the (single-threaded) accept loop: EudServer is a
         ForkingTCPServer, so connections run in child processes that each got their own copy
@@ -67,24 +109,22 @@ class EudServerSSL(EudServer):
         the reference here is therefore safe; an existing connection is never affected, it was
         already verified (and a revoked one is dropped through eud_control, see EudHandler)."""
         key = self._crl_stat_key()
-        if self._ssl_context is not None and key == self._crl_key:
+        now = time.monotonic()
+        checked_at = getattr(self, "_crl_checked_at", None)
+        due = checked_at is None or now - checked_at >= self.CRL_CHECK_INTERVAL
+        if self._ssl_context is not None and key == self._crl_key and not due:
             return self._ssl_context
 
-        if key is not None:
-            # An expired CRL would fail every handshake; regenerate it rather than lock everyone out
+        if key is not None and due:
+            self._crl_checked_at = now
             try:
-                from raven.cert_revocation import crl_next_update, ensure_crl
-
-                next_update = crl_next_update(self._ca_path())
-                if next_update and next_update <= datetime.datetime.now(datetime.timezone.utc):
-                    ensure_crl(
-                        self._ca_path(),
-                        self.app_context.config.get("RAVEN_CA_PASSWORD"),
-                        self.logger,
-                    )
+                if self._check_crl_expiry():
                     key = self._crl_stat_key()
             except BaseException as e:
-                self.logger.error(f"Failed to regenerate the expired CRL: {e}")
+                self.logger.error(f"Failed to check the CRL's expiry: {e}")
+
+        if self._ssl_context is not None and key == self._crl_key:
+            return self._ssl_context
 
         try:
             self._ssl_context = self._build_ssl_context()

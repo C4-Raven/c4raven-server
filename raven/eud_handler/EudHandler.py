@@ -152,6 +152,8 @@ class EudHandler(socketserver.BaseRequestHandler):
     last_rx_write = 0.0
     # Set once this connection has delivered the offline chat backlog
     offline_chat_delivered = False
+    # Set once the cert.<serial> control queue is bound (bind_cert_control_queue)
+    cert_control_bound = False
 
     def __init__(self, request: socket, client_address, server):
         # Do NOT set self.logger here. The class-level `logger = ots_logger`
@@ -483,6 +485,10 @@ class EudHandler(socketserver.BaseRequestHandler):
             "eud_control", durable=True, exchange_type="direct"
         )
 
+        # Reachable by client cert serial from the moment the channel is up, whatever the
+        # device sends (or doesn't), see bind_cert_control_queue()
+        self.bind_cert_control_queue()
+
         for message in self.cached_messages:
             self.publish_cot(message)
 
@@ -507,6 +513,57 @@ class EudHandler(socketserver.BaseRequestHandler):
                 json.dumps(message),
                 properties=pika.BasicProperties(expiration=self.app.config.get("RAVEN_RABBITMQ_TTL")),
             )
+
+    def request_cert_control_queue(self):
+        """Thread-safe entry to bind_cert_control_queue() for the handler thread (EudHandlerSSL
+        calls it once the TLS handshake has given it the cert serial). pika isn't thread-safe,
+        so the binding itself runs on the ioloop thread."""
+        try:
+            connection = getattr(self, "rabbit_connection", None)
+            if connection is not None and not connection.is_closed:
+                connection.ioloop.add_callback_threadsafe(self.bind_cert_control_queue)
+        except Exception as e:
+            self.logger.error(f"Failed to schedule the cert control queue binding: {e}")
+
+    def bind_cert_control_queue(self):
+        """Bind a private eud_control queue to "cert.<serial>" so revoking this connection's
+        client cert (certificate_api -> cert_revocation.kick_revoked_sessions) drops it.
+
+        Runs on the pika ioloop thread, from on_channel_open and again via
+        request_cert_control_queue() once the handshake has set cert_serial, because either can
+        happen first; it binds as soon as both the channel and the serial exist. Independent of
+        the device's uid, callsign and platform: a connection that never sends a contact event
+        (or is an ICU / Meshtastic / DMRCOT relay) must still be reachable."""
+        try:
+            if getattr(self, "cert_control_bound", False) or not self.cert_serial:
+                return
+            channel = getattr(self, "rabbit_channel", None)
+            if channel is None or not channel.is_open:
+                return
+            self.cert_control_bound = True
+            queue = f"ctl.cert.{self.cert_serial}.{self.conn_token}"
+            channel.queue_declare(queue=queue, exclusive=True, auto_delete=True)
+            channel.queue_bind(
+                exchange="eud_control",
+                queue=queue,
+                routing_key=CERT_ROUTING_PREFIX + self.cert_serial,
+            )
+            channel.basic_consume(
+                queue=queue, on_message_callback=self.on_control_message, auto_ack=True
+            )
+            # A revocation published before this binding existed was unroutable (and reported as
+            # such to the admin); catch it here instead of waiting for the next handshake
+            from raven.cert_revocation import is_revoked
+
+            if is_revoked(self.app.config.get("RAVEN_CA_FOLDER"), self.cert_serial):
+                self.logger.warning(
+                    "Client cert %s was revoked during the handshake, disconnecting",
+                    self.cert_serial,
+                )
+                self.close_connection()
+        except Exception as e:
+            self.logger.error(f"Failed to bind the cert control queue for {self.cert_serial}: {e}")
+            self.logger.error(traceback.format_exc())
 
     def on_channel_close(self, channel: Channel, error):
         self.logger.error(f"RabbitMQ channel closed for {self.callsign}, shut it down")
@@ -953,14 +1010,8 @@ class EudHandler(socketserver.BaseRequestHandler):
                         self.rabbit_channel.queue_bind(
                             exchange="eud_control", queue=control_queue, routing_key=self.uid
                         )
-                        # Also reachable by client cert serial, so revoking a cert
-                        # (certificate_api) drops exactly the connection(s) using it
-                        if self.cert_serial:
-                            self.rabbit_channel.queue_bind(
-                                exchange="eud_control",
-                                queue=control_queue,
-                                routing_key=CERT_ROUTING_PREFIX + self.cert_serial,
-                            )
+                        # The cert.<serial> binding (revocation kick) has its own
+                        # queue, see bind_cert_control_queue()
                         self.rabbit_channel.basic_consume(
                             queue=control_queue,
                             on_message_callback=self.on_control_message,

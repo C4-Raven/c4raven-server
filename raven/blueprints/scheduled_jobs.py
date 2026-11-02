@@ -293,7 +293,7 @@ def apply_data_retention():
 def refresh_crl():
     # Regenerates the CA's CRL before it expires (or if it's missing): nginx and the SSL
     # streaming port reject every client certificate once the CRL's nextUpdate has passed.
-    from raven.cert_revocation import ensure_crl
+    from raven.cert_revocation import crl_next_update, ensure_crl, report_crl_failure
 
     with apscheduler.app.app_context():
         try:
@@ -301,7 +301,15 @@ def refresh_crl():
                 app.config.get("RAVEN_CA_FOLDER"), app.config.get("RAVEN_CA_PASSWORD"), logger
             )
         except BaseException as e:
-            logger.error(f"Failed to refresh the CA's CRL: {e}")
+            next_update = crl_next_update(app.config.get("RAVEN_CA_FOLDER"))
+            report_crl_failure(
+                apscheduler.app,
+                "Failed to refresh the CA's CRL (it {}): {}".format(
+                    "is missing" if next_update is None else "expires " + next_update.isoformat(),
+                    e,
+                ),
+                logger,
+            )
 
 
 # Kept so a stale job row/config entry that still references this old function name doesn't

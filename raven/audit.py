@@ -238,7 +238,7 @@ ADMIN_ACTION_LABELS = {
     "revoke_certificate_by_serial": "Revoked certificate by serial",
     "revoke_all_user_certificates": "Revoked all user certificates",
     # Not in this tree yet: the name the certificates work is expected to give its re-enroll view
-    "allow_device_reenrollment": "Allowed device to enroll again",
+    "allow_enrollment": "Allowed device to enroll again",
     # Data packages, documents, app packages and plugins
     "upload_data_package": "Uploaded data package",
     "edit_data_package": "Edited data package",
