@@ -37,7 +37,7 @@ class RBLine(db.Model):
     stroke_style: Mapped[str] = mapped_column(String(255), nullable=True)
     labels_on: Mapped[bool] = mapped_column(Boolean, nullable=True)
     point_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("points.id", ondelete="CASCADE"), nullable=True
+        Integer, ForeignKey("points.id", ondelete="CASCADE"), nullable=True, index=True
     )
     cot_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("cot.id", ondelete="CASCADE"), nullable=True

@@ -8,6 +8,7 @@ import random
 import re
 import socketserver
 import sys
+import time
 import traceback
 import uuid
 from logging.handlers import TimedRotatingFileHandler
@@ -147,6 +148,10 @@ class EudHandler(socketserver.BaseRequestHandler):
     group_memberships = []
     # Client cert serial on the SSL port (EudHandlerSSL), normalized uppercase hex
     cert_serial = None
+    # time.monotonic() of the last euds.last_rx_at write (see note_rx)
+    last_rx_write = 0.0
+    # Set once this connection has delivered the offline chat backlog
+    offline_chat_delivered = False
 
     def __init__(self, request: socket, client_address, server):
         # Do NOT set self.logger here. The class-level `logger = ots_logger`
@@ -708,6 +713,11 @@ class EudHandler(socketserver.BaseRequestHandler):
             metrics.inc("raven_cot_dropped_total", metrics.DROP_UNAUTHENTICATED)
             return
 
+        # Not on the very first CoT: parse_device_info has to read the previous connection's
+        # last_rx_at before this one overwrites it
+        if self.uid:
+            self.note_rx()
+
         if self.pong(event):
             return
 
@@ -906,6 +916,10 @@ class EudHandler(socketserver.BaseRequestHandler):
                                     "queue": self.uid,
                                 }
                             )
+
+                        # The offline chat backlog goes out before the live queues are
+                        # consumed, so it reaches the device ahead of anything newer
+                        self.deliver_offline_chat(uid, platform)
 
                         self.consumer_tags.append(
                             self.rabbit_channel.basic_consume(
@@ -1109,26 +1123,9 @@ class EudHandler(socketserver.BaseRequestHandler):
                         "Failed to deliver queued clear commands for %s: %s", uid, e
                     )
 
-                # Deliver chat messages and DMs that were sent while this device
-                # was offline (cot_parser queued them, see raven/offline_chat.py).
-                # Written straight to the socket for the same reason as the clear
-                # commands above: a zombie handler's consumer can't take them.
-                # Each row is stamped delivered right after its write, so a
-                # failure part way leaves the rest for the next connection.
-                if platform not in offline_chat.NO_QUEUE_PLATFORMS:
-                    try:
-                        delivered = offline_chat.deliver_pending(db.session, uid, self._send)
-                        if delivered:
-                            self.logger.info(
-                                "Delivered %d chat message(s) queued while %s was offline",
-                                delivered,
-                                uid,
-                            )
-                    except Exception as e:
-                        db.session.rollback()
-                        self.logger.error(
-                            "Failed to deliver queued chat messages to %s: %s", uid, e
-                        )
+                # Normally already done before the live queues were consumed above;
+                # this covers a connection whose RabbitMQ channel wasn't open then.
+                self.deliver_offline_chat(uid, platform)
 
                 # If the RabbitMQ channel is open, publish the EUD info to socketio to be displayed on the web UI map.
                 # Also save the EUD's info for on_channel_open to publish
@@ -1153,6 +1150,59 @@ class EudHandler(socketserver.BaseRequestHandler):
                             expiration=self.app.config.get("RAVEN_RABBITMQ_TTL")
                         ),
                     )
+
+    def deliver_offline_chat(self, uid, platform):
+        """Writes the chat messages and DMs this device missed (cot_parser queued them, see
+        raven/offline_chat.py) straight to the socket, once per connection. Direct writes for
+        the same reason as the clear commands: a zombie handler's consumer can't take them.
+        Only what this connection's user is entitled to is sent. Each row is stamped delivered
+        right after its write, so a failure part way leaves the rest for the next connection.
+        Never raises."""
+        if self.offline_chat_delivered or platform in offline_chat.NO_QUEUE_PLATFORMS:
+            return
+        self.offline_chat_delivered = True
+        try:
+            with self.app.app_context():
+                try:
+                    delivered = offline_chat.deliver_pending(
+                        db.session,
+                        uid,
+                        self._send,
+                        user_id=self.user.id if self.user else None,
+                    )
+                    if delivered:
+                        self.logger.info(
+                            "Delivered %d chat message(s) queued while %s was offline",
+                            delivered,
+                            uid,
+                        )
+                except Exception as e:
+                    db.session.rollback()
+                    self.logger.error("Failed to deliver queued chat messages to %s: %s", uid, e)
+        except Exception as e:
+            self.logger.error("Failed to deliver queued chat messages to %s: %s", uid, e)
+
+    def note_rx(self):
+        """Records that data just arrived from this device (euds.last_rx_at), at most every
+        offline_chat.LAST_RX_WRITE_INTERVAL seconds, so the offline chat queue can tell what
+        the device got live. Closes the DB connection again, like handle_cot does after
+        identification. Never raises."""
+        now = time.monotonic()
+        if self.last_rx_write and now - self.last_rx_write < offline_chat.LAST_RX_WRITE_INTERVAL:
+            return
+        self.last_rx_write = now
+        try:
+            with self.app.app_context():
+                try:
+                    offline_chat.record_rx(db.session, self.uid)
+                except Exception as e:
+                    db.session.rollback()
+                    self.logger.debug(f"Failed to record last_rx_at for {self.uid}: {e}")
+                finally:
+                    db.session.close()
+                    db.engine.dispose()
+        except Exception as e:
+            self.logger.debug(f"Failed to record last_rx_at for {self.uid}: {e}")
 
     def unbind_rabbitmq_queues(self):
         if (

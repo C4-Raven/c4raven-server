@@ -28,7 +28,7 @@ class Point(db.Model):
     speed: Mapped[float] = mapped_column(Float, nullable=True)
     location_source: Mapped[str] = mapped_column(String(255), nullable=True)
     battery: Mapped[float] = mapped_column(Float, nullable=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, index=True)
     azimuth: Mapped[float] = mapped_column(Float, nullable=True)
     # Camera field of view from TAK ICU and OpenTAK ICU
     fov: Mapped[float] = mapped_column(Float, nullable=True)

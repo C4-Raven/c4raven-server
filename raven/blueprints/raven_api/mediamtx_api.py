@@ -30,6 +30,7 @@ from raven.forms.MediaMTXPathConfig import MediaMTXPathConfig
 from raven.group_isolation import assign_uploader_groups, can_publish, can_see, is_admin
 from raven.models.VideoRecording import VideoRecording
 from raven.models.VideoStream import VideoStream
+from raven.recordings import contained_recording_path
 
 mediamtx_api_blueprint = Blueprint("mediamtx_api_blueprint", __name__)
 
@@ -110,6 +111,18 @@ def start_web_copy(path: str, rtsp_port) -> str | None:
 
     logger.info(f"{path} is MPEG-TS over RTSP, copying it to {web_path} for browsers")
     return web_path
+
+
+def _segment_path_allowed(segment_path) -> bool:
+    """MediaMTX only ever reports segments under the recordings folder. Anything else is a
+    forged webhook call; storing it would let the retention job or the admin delete endpoint
+    remove (and ffprobe read) an arbitrary file, so no row is created for it."""
+    if contained_recording_path(segment_path) and bleach.clean(segment_path) == segment_path:
+        return True
+    logger.warning(
+        f"MediaMTX webhook: refusing segment_path outside the recordings folder: {segment_path!r}"
+    )
+    return False
 
 
 @mediamtx_api_blueprint.route("/api/mediamtx/webhook")
@@ -291,6 +304,8 @@ def mediamtx_webhook():
         connection_id = bleach.clean(request.args.get("connection_id"))
         rtsp_port = bleach.clean(request.args.get("rtsp_port"))
     elif event == "segment_record":
+        if not _segment_path_allowed(request.args.get("segment_path")):
+            return "", 400
         recording = VideoRecording()
         recording.segment_path = bleach.clean(request.args.get("segment_path"))
         recording.path = bleach.clean(request.args.get("path"))
@@ -310,6 +325,8 @@ def mediamtx_webhook():
                 )
                 db.session.commit()
     elif event == "segment_record_complete":
+        if not _segment_path_allowed(request.args.get("segment_path")):
+            return "", 400
         segment_path = bleach.clean(request.args.get("segment_path"))
         with app.app_context():
             recording = db.session.execute(

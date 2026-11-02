@@ -16,11 +16,11 @@ class Alert(db.Model):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     uid: Mapped[str] = mapped_column(String(255))
     sender_uid: Mapped[str] = mapped_column(String(255), ForeignKey("euds.uid", ondelete="CASCADE"))
-    start_time: Mapped[datetime] = mapped_column(DateTime)
+    start_time: Mapped[datetime] = mapped_column(DateTime, index=True)
     cancel_time: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     alert_type: Mapped[str] = mapped_column(String(255))
     point_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("points.id", ondelete="CASCADE"), nullable=True
+        Integer, ForeignKey("points.id", ondelete="CASCADE"), nullable=True, index=True
     )
     cot_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("cot.id", ondelete="CASCADE"), nullable=True
