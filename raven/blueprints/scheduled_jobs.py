@@ -290,6 +290,20 @@ def apply_data_retention():
             logger.error(f"Data retention failed: {e}")
 
 
+def refresh_crl():
+    # Regenerates the CA's CRL before it expires (or if it's missing): nginx and the SSL
+    # streaming port reject every client certificate once the CRL's nextUpdate has passed.
+    from raven.cert_revocation import ensure_crl
+
+    with apscheduler.app.app_context():
+        try:
+            ensure_crl(
+                app.config.get("RAVEN_CA_FOLDER"), app.config.get("RAVEN_CA_PASSWORD"), logger
+            )
+        except BaseException as e:
+            logger.error(f"Failed to refresh the CA's CRL: {e}")
+
+
 # Kept so a stale job row/config entry that still references this old function name doesn't
 # fail to load. (The ADS-B and AIS feed jobs that replaced it have since been removed.)
 def get_airplanes_live_data():

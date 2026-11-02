@@ -437,6 +437,7 @@ def test_new_job_added_to_old_config_snapshot():
         "expire_group_memberships",
         "record_metrics_sample",
         "apply_data_retention",
+        "refresh_crl",
     ]
 
 

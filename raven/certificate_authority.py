@@ -1,7 +1,7 @@
 import io
 import os
-import random
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -353,7 +353,11 @@ class CertificateAuthority:
             os.path.join(
                 self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".pem"
             ),
-            random.randint(10000, 100000),
+            # Revocation is by serial (raven.cert_revocation), so serials must not collide or
+            # revoking one cert also revokes another. The old randint(10000, 100000) made a
+            # clash likely within a few hundred certs; 63 random bits (positive, as RFC 5280
+            # wants) makes it negligible.
+            secrets.randbits(63) or 1,
             self.app.config.get("RAVEN_CA_PASSWORD"),
             extensions,
             config_file,

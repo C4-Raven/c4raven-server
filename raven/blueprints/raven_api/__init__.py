@@ -4,6 +4,7 @@ from flask import jsonify, request
 
 from raven.blueprints.raven_api.api import api_blueprint
 from raven.blueprints.raven_api.casevac_api import casevac_api_blueprint
+from raven.blueprints.raven_api.certificate_api import certificate_api_blueprint
 from raven.blueprints.raven_api.data_package_api import data_package_api
 from raven.blueprints.raven_api.device_profile_api import device_profile_api_blueprint
 from raven.blueprints.raven_api.device_profile_tools_api import device_profile_tools_api_blueprint
@@ -35,6 +36,7 @@ from .tak_gov_link_api import tak_gov_link_blueprint
 raven_api = Blueprint("raven_api", __name__)
 raven_api.register_blueprint(api_blueprint)
 raven_api.register_blueprint(casevac_api_blueprint)
+raven_api.register_blueprint(certificate_api_blueprint)
 raven_api.register_blueprint(data_package_api)
 raven_api.register_blueprint(device_profile_api_blueprint)
 raven_api.register_blueprint(device_profile_tools_api_blueprint)

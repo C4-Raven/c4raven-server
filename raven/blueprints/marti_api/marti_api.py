@@ -12,6 +12,7 @@ from OpenSSL.crypto import X509
 from simplekml import Document, GxMultiTrack, GxTrack, Icon, IconStyle, Kml, Style
 
 from raven import __version__ as version
+from raven.cert_revocation import is_revoked
 from raven.extensions import db, logger
 from raven.functions import datetime_from_iso8601_string, iso8601_string_from_datetime
 from raven.models.EUD import EUD
@@ -38,9 +39,13 @@ def verify_client_cert() -> X509 | bool:
 
     try:
         ctx.verify_certificate()
-        return cert
     except crypto.X509StoreContextError:
         return False
+
+    # Also refused app-wide by certificate_api.reject_revoked_client_cert
+    if is_revoked(app.config.get("RAVEN_CA_FOLDER"), cert.get_serial_number()):
+        return False
+    return cert
 
 
 @marti_api.route("/Marti/api/clientEndPoints", methods=["GET"])
