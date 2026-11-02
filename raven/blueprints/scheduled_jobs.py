@@ -277,6 +277,19 @@ def record_metrics_sample():
             logger.error(f"Failed to record a metrics sample: {e}")
 
 
+def apply_data_retention():
+    # Deletes data older than each type's retention setting (the Data retention tab), in
+    # batches. Also expires chat messages held for offline devices (48 hours by default).
+    from raven.retention import apply_retention
+
+    with apscheduler.app.app_context():
+        try:
+            apply_retention()
+        except BaseException as e:
+            db.session.rollback()
+            logger.error(f"Data retention failed: {e}")
+
+
 # Kept so a stale job row/config entry that still references this old function name doesn't
 # fail to load. (The ADS-B and AIS feed jobs that replaced it have since been removed.)
 def get_airplanes_live_data():

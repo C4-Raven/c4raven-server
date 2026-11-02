@@ -73,6 +73,9 @@ from raven.models.CITrap import CITrap
 # Needed so User.supporting_documents (a string relationship target) resolves in this
 # standalone process -- see the same import in eud_handler.py.
 from raven.models.SupportingDocument import SupportingDocument  # noqa: F401
+from raven import offline_chat
+from raven.models.OfflineChatMessage import OfflineChatMessage  # noqa: F401
+from raven.models.RetentionSetting import RetentionSetting  # noqa: F401
 from raven.proto import atak_pb2
 
 
@@ -605,6 +608,14 @@ class CoTController:
                             )
                         except exc.IntegrityError:
                             self.db.session.rollback()
+
+    def queue_offline_chat(self, event, uid, user_id):
+        # Keep a copy of chat messages for addressed devices that are offline right now, to be
+        # delivered when they reconnect (raven/offline_chat.py)
+        if not uid or not event.find("__chat"):
+            return
+        with self.context:
+            offline_chat.queue_offline_chat(self.db.session, event, uid, user_id)
 
     def parse_video(self, event, cot_pk):
         video = event.find("__video")
@@ -1373,6 +1384,7 @@ class CoTController:
                 cot_pk = self.insert_cot(soup, event, uid)
                 point_pk = self.parse_point(event, uid, cot_pk)
                 self.parse_geochat(event, cot_pk, point_pk)
+                self.queue_offline_chat(event, uid, body.get("user_id"))
                 self.parse_video(event, cot_pk)
                 self.parse_alert(event, uid, point_pk, cot_pk)
                 self.parse_casevac(event, uid, point_pk, cot_pk)

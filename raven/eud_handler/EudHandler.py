@@ -58,7 +58,9 @@ from raven.models.DeviceProfiles import DeviceProfiles
 from raven.models.EUD import EUD
 from raven.models.EUDStats import EUDStats
 from raven.models.PendingClearCommand import PendingClearCommand
-from raven import remote_clear
+from raven.models.OfflineChatMessage import OfflineChatMessage  # noqa: F401
+from raven.models.RetentionSetting import RetentionSetting  # noqa: F401
+from raven import offline_chat, remote_clear
 from raven.models.Group import Group
 from raven.models.GroupMission import GroupMission
 from raven.models.GroupUser import GroupUser
@@ -1080,6 +1082,27 @@ class EudHandler(socketserver.BaseRequestHandler):
                     self.logger.error(
                         "Failed to deliver queued clear commands for %s: %s", uid, e
                     )
+
+                # Deliver chat messages and DMs that were sent while this device
+                # was offline (cot_parser queued them, see raven/offline_chat.py).
+                # Written straight to the socket for the same reason as the clear
+                # commands above: a zombie handler's consumer can't take them.
+                # Each row is stamped delivered right after its write, so a
+                # failure part way leaves the rest for the next connection.
+                if platform not in offline_chat.NO_QUEUE_PLATFORMS:
+                    try:
+                        delivered = offline_chat.deliver_pending(db.session, uid, self._send)
+                        if delivered:
+                            self.logger.info(
+                                "Delivered %d chat message(s) queued while %s was offline",
+                                delivered,
+                                uid,
+                            )
+                    except Exception as e:
+                        db.session.rollback()
+                        self.logger.error(
+                            "Failed to deliver queued chat messages to %s: %s", uid, e
+                        )
 
                 # If the RabbitMQ channel is open, publish the EUD info to socketio to be displayed on the web UI map.
                 # Also save the EUD's info for on_channel_open to publish
