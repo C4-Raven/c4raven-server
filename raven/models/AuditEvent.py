@@ -23,7 +23,8 @@ class AuditEvent(db.Model):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
-    # auth, enrollment, certificate, user_admin, security
+    # auth, enrollment, certificate, user_admin, group_admin, security, admin (every admin web
+    # API request, written by raven.audit's admin action hook)
     category: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     # The account the event is about
@@ -34,6 +35,8 @@ class AuditEvent(db.Model):
     user_agent: Mapped[str] = mapped_column(String(512), nullable=True)
     success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     details: Mapped[str] = mapped_column(Text, nullable=True)
+    # One readable line, e.g. "Created group: Ops". Set on admin events.
+    summary: Mapped[str] = mapped_column(String(255), nullable=True)
 
     def to_json(self):
         return {
@@ -47,4 +50,5 @@ class AuditEvent(db.Model):
             "user_agent": self.user_agent,
             "success": bool(self.success),
             "details": self.details,
+            "summary": self.summary,
         }
