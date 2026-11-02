@@ -32,6 +32,11 @@ def create_ca():
         ca.create_ca()
     else:
         logger.warning("Certificate authority already exists")
+    # nginx's ssl_crl needs ca.crl to exist (and be current), including on a CA created before
+    # certificate revocation was added, so the installers' create-ca step makes sure of it
+    from raven.cert_revocation import ensure_crl
+
+    ensure_crl(app.config.get("RAVEN_CA_FOLDER"), app.config.get("RAVEN_CA_PASSWORD"), logger)
     sys.exit()
 
 
