@@ -39,7 +39,10 @@ from raven.models.GroupUser import GroupUser
 from raven.models.Mission import Mission
 from raven.models.MissionChange import MissionChange
 from raven.models.MissionContentMission import MissionContentMission
+from raven.models.MissionExternalData import MissionExternalData
+from raven.models.MissionFeed import MissionFeed
 from raven.models.MissionInvitation import InvitationTypeEnum, MissionInvitation
+from raven.models.MissionLayer import MissionLayer
 from raven.models.MissionLogEntry import MissionLogEntry
 from raven.models.MissionRole import MissionRole
 from raven.models.MissionUID import MissionUID
@@ -371,6 +374,19 @@ def delete_mission():
     db.session.execute(
         sqlalchemy.delete(MissionChange).where(MissionChange.mission_name == mission_name)
     )
+    db.session.execute(
+        sqlalchemy.delete(MissionExternalData).where(
+            MissionExternalData.mission_name == mission_name
+        )
+    )
+    db.session.execute(sqlalchemy.delete(MissionFeed).where(MissionFeed.mission_name == mission_name))
+    # Children before parents: parent_uid is a foreign key, and sqlite doesn't cascade
+    db.session.execute(
+        sqlalchemy.delete(MissionLayer).where(
+            MissionLayer.mission_name == mission_name, MissionLayer.parent_uid.isnot(None)
+        )
+    )
+    db.session.execute(sqlalchemy.delete(MissionLayer).where(MissionLayer.mission_name == mission_name))
 
     chatroom: Chatroom | None = db.session.execute(
         db.session.query(Chatroom).where(Chatroom.name == mission_name)
@@ -465,3 +481,7 @@ def invite_eud():
         return error
 
     return jsonify({"success": True})
+
+
+# The mission detail page's routes register on data_sync_api too
+from raven.blueprints.raven_api import mission_detail_api  # noqa: E402,F401

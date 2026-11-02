@@ -62,6 +62,21 @@ class Mission(db.Model):
     mission_logs = relationship(
         "MissionLogEntry", cascade="all, delete-orphan", back_populates="mission"
     )
+    layers = relationship(
+        "MissionLayer", cascade="all, delete-orphan", back_populates="mission", passive_deletes=True
+    )
+    external_data_items = relationship(
+        "MissionExternalData",
+        cascade="all, delete-orphan",
+        back_populates="mission",
+        order_by="MissionExternalData.id",
+    )
+    feed_items = relationship(
+        "MissionFeed",
+        cascade="all, delete-orphan",
+        back_populates="mission",
+        order_by="MissionFeed.id",
+    )
     owner = relationship("EUD", back_populates="owned_missions")
     groups = relationship(
         "Group",
@@ -110,8 +125,12 @@ class Mission(db.Model):
             "keywords": self.keywords if self.keywords else [],
             "creatorUid": self.creator_uid or "",
             "createTime": iso8601_string_from_datetime(self.create_time) or "",
-            "externalData": self.external_data if self.external_data else [],
-            "feeds": self.feeds if self.feeds else [],
+            # The external_data/feeds JSON columns predate the mission_external_data/mission_feeds
+            # tables and are only a fallback for missions that still carry them
+            "externalData": [item.to_json() for item in self.external_data_items]
+            or (self.external_data if self.external_data else []),
+            "feeds": [feed.to_json() for feed in self.feed_items]
+            or (self.feeds if self.feeds else []),
             "mapLayers": self.map_layers if self.map_layers else [],
             "inviteOnly": self.invite_only if self.invite_only is not None else False,
             "expiration": self.expiration if self.expiration is not None else -1,
@@ -121,7 +140,11 @@ class Mission(db.Model):
             "passwordProtected": (
                 self.password_protected if self.password_protected is not None else False
             ),
-            "missionChanges": [mission_change.to_json() for mission_change in self.mission_changes],
+            "missionChanges": [
+                mission_change.to_json()
+                for mission_change in self.mission_changes
+                if not mission_change.hidden_from_marti()
+            ],
             "qr_code": f"{url}:{app.config.get('RAVEN_SSL_STREAMING_PORT')}:ssl,{url}-{app.config.get('RAVEN_MARTI_HTTPS_PORT')}-ssl-{self.name},{self.name}",
             "owner": self.owner.to_json() if self.owner else None,
             "groups": [],
@@ -153,3 +176,10 @@ class Mission(db.Model):
             return_value["logs"] = [log.to_json() for log in self.mission_logs]
 
         return return_value
+
+
+# Imported here so the relationships above resolve in every process that loads Mission (cot_parser,
+# eud_handler), not only in the web app where the blueprints happen to import them
+from raven.models.MissionExternalData import MissionExternalData  # noqa: E402,F401
+from raven.models.MissionFeed import MissionFeed  # noqa: E402,F401
+from raven.models.MissionLayer import MissionLayer  # noqa: E402,F401

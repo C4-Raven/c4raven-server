@@ -5,7 +5,7 @@ from xml.etree.ElementTree import Element, SubElement
 
 import sqlalchemy.exc
 from bs4 import BeautifulSoup
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, update
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, update
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from raven.extensions import db, logger
@@ -26,6 +26,13 @@ class MissionChange(db.Model):
     CREATE_DATA_FEED = "CREATE_DATA_FEED"
     DELETE_DATA_FEED = "DELETE_DATA_FEED"
     CHANGE = "CHANGE"
+    # Layer (folder) tree edits. TAK Server has no MissionChangeType for these and its clients
+    # deserialize "type" into a closed enum, so they're kept out of every Marti response
+    # (hidden_from_marti()) and only show in the web UI's change log.
+    ADD_MISSION_LAYER = "ADD_MISSION_LAYER"
+    UPDATE_MISSION_LAYER = "UPDATE_MISSION_LAYER"
+    REMOVE_MISSION_LAYER = "REMOVE_MISSION_LAYER"
+    MARTI_HIDDEN_TYPES = (ADD_MISSION_LAYER, UPDATE_MISSION_LAYER, REMOVE_MISSION_LAYER)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     content_uid: Mapped[str] = mapped_column(
@@ -40,6 +47,11 @@ class MissionChange(db.Model):
     mission_uid: Mapped[str] = mapped_column(
         String(255), ForeignKey("mission_uids.uid", ondelete="CASCADE"), nullable=True
     )
+    # Snapshots (to_json() of the row at the time) so a REMOVE change still describes what was
+    # removed after the row itself is gone
+    external_data: Mapped[JSON] = mapped_column(JSON, nullable=True)
+    mission_feed: Mapped[JSON] = mapped_column(JSON, nullable=True)
+    mission_layer: Mapped[JSON] = mapped_column(JSON, nullable=True)
     content_resource = relationship(
         "MissionContent", back_populates="mission_changes", uselist=False
     )
@@ -56,7 +68,13 @@ class MissionChange(db.Model):
             "server_time": self.server_time,
             "mission_uid": self.mission_uid,
             "content_uid": self.content_uid,
+            "external_data": self.external_data,
+            "mission_feed": self.mission_feed,
+            "mission_layer": self.mission_layer,
         }
+
+    def hidden_from_marti(self) -> bool:
+        return self.change_type in self.MARTI_HIDDEN_TYPES
 
     def to_json(self):
         json = {
@@ -89,6 +107,15 @@ class MissionChange(db.Model):
 
         if self.uid:
             json["details"] = self.uid.to_details_json()
+
+        if self.external_data:
+            json["externalData"] = self.external_data
+
+        if self.mission_feed:
+            json["missionFeed"] = self.mission_feed
+
+        if self.mission_layer:
+            json["missionLayer"] = self.mission_layer
 
         return json
 
@@ -129,7 +156,9 @@ def generate_mission_change_cot(
     )
 
     if not mission:
-        mission = db.session.execute(db.session.query(Mission).filter_by(name=mission_name)).scalar()
+        mission = db.session.execute(
+            db.session.query(Mission).filter_by(name=mission_name)
+        ).scalar()
 
     detail = SubElement(event, "detail")
     mission_element = SubElement(
@@ -189,7 +218,9 @@ def generate_mission_change_cot(
 
         if point and point.attrs.get("lat") is not None and point.attrs.get("lon") is not None:
             SubElement(
-                details_tag, "location", {"lon": point.attrs.get("lon"), "lat": point.attrs.get("lat")}
+                details_tag,
+                "location",
+                {"lon": point.attrs.get("lon"), "lat": point.attrs.get("lat")},
             )
         # SubElement(mission_change_element, "contentUid").text = cot_event.attrs['uid']
 
@@ -212,6 +243,18 @@ def generate_mission_change_cot(
 
     if mission_change.mission_uid:
         SubElement(mission_change_element, "contentUid").text = mission_change.mission_uid
+
+    if mission_change.external_data:
+        external_data_element = SubElement(mission_change_element, "externalData")
+        for key in ("id", "name", "notes", "tool", "urlData", "urlView"):
+            SubElement(external_data_element, key).text = str(
+                mission_change.external_data.get(key) or ""
+            )
+
+    if mission_change.mission_feed:
+        feed_element = SubElement(mission_change_element, "missionFeed")
+        for key in ("uid", "dataFeedUid", "name", "filterBbox", "filterType", "filterCallsign"):
+            SubElement(feed_element, key).text = str(mission_change.mission_feed.get(key) or "")
 
     SubElement(mission_change_element, "missionGuid").text = mission.guid
     SubElement(mission_change_element, "creatorUid").text = mission_change.creator_uid
