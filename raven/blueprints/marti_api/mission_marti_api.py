@@ -24,7 +24,10 @@ from flask_security import current_user, hash_password, verify_password
 from sqlalchemy import insert, or_, update
 from werkzeug.utils import secure_filename
 
-from raven.blueprints.marti_api.data_package_marti_api import save_data_package_file
+from raven.blueprints.marti_api.data_package_marti_api import (
+    DataPackageUploadError,
+    save_data_package_file,
+)
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, logger
 from raven.functions import datetime_from_iso8601_string, iso8601_string_from_datetime
@@ -2126,9 +2129,12 @@ def upload_content():
         "iTAK" in request.user_agent.string
         and request.content_type == "application/x-zip-compressed"
     ):
-        file_hash = save_data_package_file(
-            request.data, secure_filename(file_name) + ".zip", username, creator_uid
-        )
+        try:
+            file_hash = save_data_package_file(
+                request.data, secure_filename(file_name) + ".zip", username, creator_uid
+            )
+        except DataPackageUploadError as e:
+            return e.response()
 
         response = {
             "UID": str(uuid.uuid4()),

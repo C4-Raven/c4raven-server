@@ -69,7 +69,36 @@ def get_missions():
         if group_filters:
             query = query.outerjoin(GroupMission).where(or_(*group_filters)).distinct(Mission.name)
 
-    return paginate(query, Mission)
+    response = paginate(query, Mission)
+    if current_user.has_role("administrator") or isinstance(response, tuple):
+        return response
+    return _redact_unviewable_missions(response)
+
+
+# What a mission's list entry carries beyond its name and settings: the files (with the hashes
+# that download them), map items and change log. Missions the user can't open on the detail
+# page (mission_detail_api._can_view) are listed without these.
+_MISSION_DETAIL_KEYS = ("contents", "uids", "missionChanges", "externalData", "feeds")
+
+
+def _redact_unviewable_missions(response):
+    from raven.blueprints.raven_api.mission_detail_api import _can_view
+
+    data = response.get_json()
+    names = [row.get("name") for row in data.get("results", [])]
+    missions = {
+        mission.name: mission
+        for mission in db.session.execute(
+            db.session.query(Mission).filter(Mission.name.in_(names))
+        ).scalars()
+    }
+    for row in data.get("results", []):
+        mission = missions.get(row.get("name"))
+        if mission is None or not _can_view(mission):
+            for key in _MISSION_DETAIL_KEYS:
+                if key in row:
+                    row[key] = []
+    return jsonify(data)
 
 
 @data_sync_api.route("/api/missions", methods=["PUT", "POST"])

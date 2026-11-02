@@ -101,9 +101,12 @@ def _write_access(mission_name, mission_guid, permission: str):
             return role
         eud_uid = role.clientUid
 
-    # A valid token without a role row (e.g. the row was cleaned up) falls back to the mission's
-    # default role, which is what the subscription that issued the token would have granted
-    role_type = role.role_type if role else (mission.default_role or MissionRole.MISSION_SUBSCRIBER)
+    # A token without a role row (unsubscribed, kicked, or the row was cleaned up) gets nothing:
+    # falling back to the mission's default role let a removed subscriber keep writing
+    if not role:
+        logger.warning(f"{eud_uid} has no role on mission {mission.name}")
+        return _error(gettext("You are not subscribed to this mission"), 403)
+    role_type = role.role_type
     if permission not in ROLE_PERMISSIONS.get(role_type, MissionRole.READ_ONLY_ROLE["permissions"]):
         logger.warning(f"{eud_uid} ({role_type}) lacks {permission} on mission {mission.name}")
         return _error(

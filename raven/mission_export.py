@@ -40,23 +40,50 @@ def latest_mission_cots(mission_name: str) -> list[CoT]:
     )
 
 
+def _sha256_of(path: str) -> str | None:
+    sha256 = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while chunk := f.read(CHUNK_SIZE):
+                sha256.update(chunk)
+    except OSError:
+        return None
+    return sha256.hexdigest()
+
+
 def content_file_path(content) -> str | None:
-    """Where a MissionContent's file is on disk, looked up the same way /Marti/sync/content does"""
-    _, extension = os.path.splitext(secure_filename(content.filename or ""))
+    """Where a MissionContent's file is on disk, looked up the same way /Marti/sync/content does.
+
+    A candidate only counts if its bytes hash to the content's hash: UPLOAD_FOLDER/<hash><ext>
+    could be written under any name by older versions (?hash= on missionupload), and
+    missions/<file name> is shared by every content with the same file name. Hashing costs a read
+    of the file, which the archive does anyway."""
+    if not content.filename or not content.hash:
+        return None
+    _, extension = os.path.splitext(secure_filename(content.filename))
     candidates = [
-        os.path.join(app.config.get("UPLOAD_FOLDER") or "", f"{content.hash}{extension}"),
         os.path.join(
-            app.config.get("RAVEN_DATA_FOLDER"), "missions", secure_filename(content.filename or "")
+            app.config.get("UPLOAD_FOLDER") or "", f"{secure_filename(content.hash)}{extension}"
+        ),
+        os.path.join(
+            app.config.get("RAVEN_DATA_FOLDER"), "missions", secure_filename(content.filename)
         ),
     ]
     for path in candidates:
-        if content.filename and os.path.isfile(path):
+        if not os.path.isfile(path):
+            continue
+        if _sha256_of(path) == content.hash.lower():
             return path
+        logger.warning(f"{path} doesn't match the hash of mission content {content.uid}, skipping it")
     return None
 
 
+def _unique_dir(uid: str) -> str:
+    return hashlib.sha1(uid.encode()).hexdigest()
+
+
 def _safe_dir(uid: str) -> str:
-    return secure_filename(uid) or hashlib.sha1(uid.encode()).hexdigest()
+    return secure_filename(uid) or _unique_dir(uid)
 
 
 def _parameter(parent: Element, name: str, value) -> None:
@@ -95,6 +122,9 @@ def archive_entries(mission: Mission) -> tuple[bytes, list[tuple[str, str | byte
             continue
         entry = f"{_safe_dir(content.uid or content.hash)}/{secure_filename(content.filename)}"
         if entry in used:
+            # Two uids that sanitise to the same folder (e.g. "a b" and "a_b")
+            entry = f"{_unique_dir(content.uid or content.hash)}/{secure_filename(content.filename)}"
+        if entry in used:
             continue
         used.add(entry)
         entries.append((entry, path))
@@ -106,6 +136,8 @@ def archive_entries(mission: Mission) -> tuple[bytes, list[tuple[str, str | byte
         if not cot.xml:
             continue
         entry = f"{_safe_dir(cot.uid)}/{_safe_dir(cot.uid)}.cot"
+        if entry in used:
+            entry = f"{_unique_dir(cot.uid)}/{_unique_dir(cot.uid)}.cot"
         if entry in used:
             continue
         used.add(entry)
@@ -156,7 +188,7 @@ def stream_archive(manifest: bytes, entries: list[tuple[str, str | bytes]]):
                 archive.writestr(name, source)
             else:
                 try:
-                    with open(source, "rb") as f, archive.open(name, "w") as out:
+                    with open(source, "rb") as f, archive.open(name, "w", force_zip64=True) as out:
                         while chunk := f.read(CHUNK_SIZE):
                             out.write(chunk)
                             data = sink.drain()

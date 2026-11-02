@@ -138,6 +138,49 @@ def _actor():
     return getattr(current_user, "username", None)
 
 
+def _items_only_in_group(group: Group) -> dict[str, int]:
+    """Data packages and video streams tagged with `group` and no other group. Deleting the
+    group would leave them with no groups, which raven/group_isolation.py treats as visible to
+    everyone, so a group with any of these can't be deleted until they're retagged."""
+    from raven.models.DataPackage import DataPackage
+    from raven.models.VideoStream import VideoStream
+
+    counts = {}
+    for label, model in (("data packages", DataPackage), ("video streams", VideoStream)):
+        counts[label] = db.session.execute(
+            sqlalchemy.select(sqlalchemy.func.count())
+            .select_from(model)
+            .where(
+                model.groups.any(Group.id == group.id),
+                ~model.groups.any(Group.id != group.id),
+            )
+        ).scalar_one()
+    return counts
+
+
+def _orphaned_items_response(group: Group):
+    """An error response if deleting `group` would make items public, else None"""
+    counts = _items_only_in_group(group)
+    if not any(counts.values()):
+        return None
+    summary = ", ".join(f"{count} {label}" for label, count in counts.items() if count)
+    return (
+        jsonify(
+            {
+                "success": False,
+                "error": gettext(
+                    "%(group_name)s is the only group of %(summary)s. Deleting it would make them "
+                    "visible to everyone -- give them another group first",
+                    group_name=group.name,
+                    summary=summary,
+                ),
+                "orphaned_items": counts,
+            }
+        ),
+        409,
+    )
+
+
 def _find_group(group_name):
     if not group_name:
         return None
@@ -817,6 +860,9 @@ def delete_group():
         return _error(gettext("No such group: %(group_name)s", group_name=group_name), 404)
     if group.locked:
         return _locked_response(group)
+    orphaned = _orphaned_items_response(group)
+    if orphaned:
+        return orphaned
 
     try:
         memberships: dict = {}
@@ -1152,6 +1198,9 @@ def remove_user_visibility():
         )
 
     group = group[0]
+    orphaned = _orphaned_items_response(group)
+    if orphaned:
+        return orphaned
     GroupUser.query.filter_by(group_id=group.id).delete()
     db.session.delete(group)
     db.session.commit()

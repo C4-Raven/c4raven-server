@@ -94,32 +94,57 @@ def video():
                     address_tag.string.replace_with(address_tag.string.split("@")[-1])
                 return str(feed)
 
-            v = VideoStream()
-            apply_fields(v)
-            assign_uploader_groups(v, cert_user())
-            path_config = MediaMTXPathConfig(None).serialize()
-            path_config["sourceOnDemand"] = False
-            v.mediamtx_settings = json.dumps(path_config)
+            user = cert_user()
+            # Look the feed up by path (the primary key) and by uid (which TAK clients key their
+            # feed list on, but has no unique constraint) instead of waiting for an
+            # IntegrityError: a uid already used by another path used to 500 or duplicate it
+            v = db.session.execute(db.select(VideoStream).filter_by(path=path)).scalar_one_or_none()
+            uid_owner = None
+            if tag_text("uid"):
+                uid_owner = db.session.execute(
+                    db.select(VideoStream).filter_by(uid=tag_text("uid"))
+                ).scalars().first()
+
+            # Another group's feed: not this client's to change
+            if (v is not None and not can_see(v, user)) or (
+                uid_owner is not None and not can_see(uid_owner, user)
+            ):
+                return "", 403
+            if uid_owner is not None and (v is None or uid_owner.path != v.path):
+                # Changing either feed would give two feeds the same uid
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": gettext("A different video stream already uses this uid"),
+                        }
+                    ),
+                    409,
+                )
+
+            if v is None:
+                v = VideoStream()
+                apply_fields(v)
+                assign_uploader_groups(v, user)
+                path_config = MediaMTXPathConfig(None).serialize()
+                path_config["sourceOnDemand"] = False
+                v.mediamtx_settings = json.dumps(path_config)
+                db.session.add(v)
+            else:
+                apply_fields(v)
             v.xml = sanitized_feed_xml()
 
-            with app.app_context():
-                try:
-                    db.session.add(v)
-                    db.session.commit()
-                    logger.debug("Inserted Video")
-                except sqlalchemy.exc.IntegrityError as e:
-                    db.session.rollback()
-                    v = db.session.execute(
-                        db.select(VideoStream).filter_by(path=path)
-                    ).scalar_one()
-                    # Another group's feed on the same path: not this client's to change
-                    if not can_see(v, cert_user()):
-                        return "", 403
-                    apply_fields(v)
-                    v.xml = sanitized_feed_xml()
-
-                    db.session.commit()
-                    logger.debug("Updated video")
+            # The request's own session: this used to run in a nested app context, whose
+            # session isn't the one the uploader's groups were loaded in (a 500 for any user
+            # with groups)
+            try:
+                db.session.commit()
+                logger.debug("Saved video")
+            except sqlalchemy.exc.IntegrityError:
+                # A concurrent request created the same path
+                db.session.rollback()
+                error = gettext("Invalid video connection")
+                return jsonify({"success": False, "error": error}), 409
 
         return "", 200
 
