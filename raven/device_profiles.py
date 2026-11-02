@@ -1,29 +1,40 @@
 """
-Device profiles: named bundles of ATAK settings sent to devices at enrollment and/or on
-connection (models: raven/models/DeviceProfileSet.py, DeviceProfileTarget.py,
-DeviceProfileSetting.py; admin API: raven/blueprints/raven_api/device_profile_api.py; delivered
-by raven/blueprints/marti_api/device_profile_marti_api.py).
+Device profiles: named bundles of ATAK settings and files sent to devices at enrollment and/or
+on connection, or on request for a tool (models: raven/models/DeviceProfileSet.py,
+DeviceProfileTarget.py, DeviceProfileSetting.py, DeviceProfileFile.py; admin API:
+raven/blueprints/raven_api/device_profile_api.py; delivered by
+raven/blueprints/marti_api/device_profile_marti_api.py).
 
-resolve_settings() is the one place that decides what a device gets:
+resolve_settings() / resolve_files() are the one place that decides what a device gets:
 take the enabled profiles for the phase whose targets match the request (everyone, one of the
-user's groups, the user, the device uid), then merge by key with precedence
+user's groups, the user, the device uid), then merge with precedence
 device > user > group > everyone. Within the same precedence the most recently updated profile
 wins. A profile that matches the request in several ways counts at its most specific match.
+Settings merge by key; files merge by their path in the zip, so a more specific profile can
+replace e.g. a group's maps/basemap.xml with its own.
+
+Phases: "enrollment" and "connection" take the profiles without a tool name that have that flag
+on; "tool" takes the profiles whose tool name matches (as official TAK Server's
+/Marti/api/device/profile/tool/{toolName}), whatever their enrollment/connection flags.
 """
 
 import datetime
+import hashlib
 import math
+import os
 import re
+import uuid
 
 from sqlalchemy import func, or_
 
 from raven.extensions import db
 from raven.functions import iso8601_string_from_datetime
+from raven.models.DeviceProfileFile import DeviceProfileFile
 from raven.models.DeviceProfileSet import DeviceProfileSet, utcnow
 from raven.models.DeviceProfileSetting import DeviceProfileSetting
 from raven.models.DeviceProfileTarget import TARGET_KINDS, DeviceProfileTarget
 
-PHASES = ("enrollment", "connection")
+PHASES = ("enrollment", "connection", "tool")
 
 STRING = "class java.lang.String"
 BOOLEAN = "class java.lang.Boolean"
@@ -40,6 +51,18 @@ MAX_NAME_LENGTH = 255
 MAX_KEY_LENGTH = 255
 MAX_VALUE_LENGTH = 10000
 MAX_TARGET_LENGTH = 255
+MAX_TOOL_LENGTH = 255
+MAX_FILENAME_LENGTH = 255
+MAX_ZIP_PATH_LENGTH = 512
+MAX_FOLDER_DEPTH = 4
+
+# Tool names go in a URL path segment; keep them to what official TAK's tools use
+_TOOL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# Zip folders the server writes itself (create_profile_zip): the manifest, and the folder holding
+# preference.pref, the truststore and the enrollment/connection data packages and plugins
+SERVER_ZIP_FOLDER = "5c2bfcae3d98c9f4d262172df99ebac5"
+RESERVED_ZIP_FOLDERS = {"manifest", SERVER_ZIP_FOLDER}
+FILES_FOLDER_NAME = "device_profile_files"
 
 _INT_RANGES = {INTEGER: (-(2**31), 2**31 - 1), LONG: (-(2**63), 2**63 - 1)}
 
@@ -149,6 +172,23 @@ def validate_setting(setting) -> dict:
 # --- profile input ---
 
 
+def validate_tool(tool) -> str | None:
+    """A tool name ("mission", "com.example.plugin"...) or None for an enrollment/connection
+    profile. Raises ProfileValidationError."""
+    if tool is None:
+        return None
+    if not isinstance(tool, str):
+        raise ProfileValidationError("tool must be a string")
+    tool = tool.strip()
+    if not tool:
+        return None
+    if len(tool) > MAX_TOOL_LENGTH or not _TOOL_RE.fullmatch(tool):
+        raise ProfileValidationError(
+            "Tool names can only use letters, numbers, dots, dashes and underscores"
+        )
+    return tool
+
+
 def _bool_field(data: dict, name: str, default: bool) -> bool:
     value = data.get(name, default)
     if value is None:
@@ -171,7 +211,8 @@ def find_user(username: str):
 def validate_profile_input(data, profile_id: int | None = None) -> dict:
     """Validates a ProfileInput (see the device profiles contract) and returns it cleaned up:
     {name, description, enabled, apply_on_enrollment, apply_on_connection, target_everyone,
-    targets:[{kind, value}], settings:[{key, value, value_class}]}.
+    tool, targets:[{kind, value}], settings:[{key, value, value_class}]}. Files are managed by
+    their own endpoints, not through ProfileInput.
 
     Groups and users must exist (usernames are stored as the account's own spelling); device uids
     needn't, so a profile can be set up before the device first connects.
@@ -210,6 +251,7 @@ def validate_profile_input(data, profile_id: int | None = None) -> dict:
         "apply_on_enrollment": _bool_field(data, "apply_on_enrollment", True),
         "apply_on_connection": _bool_field(data, "apply_on_connection", False),
         "target_everyone": _bool_field(data, "target_everyone", False),
+        "tool": validate_tool(data.get("tool")),
     }
 
     targets_in = data.get("targets") or []
@@ -269,8 +311,9 @@ def apply_profile_input(profile: DeviceProfileSet, cleaned: dict) -> DeviceProfi
         "apply_on_enrollment",
         "apply_on_connection",
         "target_everyone",
+        "tool",
     ):
-        setattr(profile, field, cleaned[field])
+        setattr(profile, field, cleaned.get(field))
     now = utcnow()
     if profile.created_at is None:
         profile.created_at = now
@@ -321,11 +364,13 @@ def profile_to_dict(profile: DeviceProfileSet, callsigns: dict | None = None) ->
         "apply_on_enrollment": bool(profile.apply_on_enrollment),
         "apply_on_connection": bool(profile.apply_on_connection),
         "target_everyone": bool(profile.target_everyone),
+        "tool": profile.tool or None,
         "targets": [
             {"kind": t.kind, "value": t.value, "label": _target_label(t, callsigns)}
             for t in profile.targets
         ],
         "settings": [s.to_json() for s in profile.settings],
+        "files": [file_to_dict(f) for f in profile.files],
         "created_at": iso8601_string_from_datetime(profile.created_at) if profile.created_at else None,
         "updated_at": iso8601_string_from_datetime(profile.updated_at) if profile.updated_at else None,
     }
@@ -380,16 +425,27 @@ def match_level(profile: DeviceProfileSet, username, groups, eud_uid) -> int | N
     return best
 
 
-def matching_profiles(phase: str, username: str | None, eud_uid: str | None):
+def matching_profiles(
+    phase: str, username: str | None, eud_uid: str | None, tool: str | None = None
+):
     """[(level, profile)] for the enabled profiles of phase that match, least specific first
-    (so later entries win)."""
+    (so later entries win). phase "tool" needs tool."""
     if phase not in PHASES:
         raise ValueError(f"phase must be one of {PHASES}")
     query = db.session.query(DeviceProfileSet).filter(DeviceProfileSet.enabled.is_(True))
-    if phase == "enrollment":
-        query = query.filter(DeviceProfileSet.apply_on_enrollment.is_(True))
+    if phase == "tool":
+        if not tool:
+            return []
+        query = query.filter(func.lower(DeviceProfileSet.tool) == tool.strip().lower())
     else:
-        query = query.filter(DeviceProfileSet.apply_on_connection.is_(True))
+        # A tool profile only ever goes out through the tool endpoint
+        query = query.filter(
+            or_(DeviceProfileSet.tool.is_(None), DeviceProfileSet.tool == "")
+        )
+        if phase == "enrollment":
+            query = query.filter(DeviceProfileSet.apply_on_enrollment.is_(True))
+        else:
+            query = query.filter(DeviceProfileSet.apply_on_connection.is_(True))
 
     groups = user_group_names(username)
     matches = []
@@ -402,11 +458,13 @@ def matching_profiles(phase: str, username: str | None, eud_uid: str | None):
     return matches
 
 
-def resolve_settings(phase: str, username: str | None, eud_uid: str | None) -> list[dict]:
-    """What a device gets for phase ("enrollment" or "connection"), after merging:
+def resolve_settings(
+    phase: str, username: str | None, eud_uid: str | None, tool: str | None = None
+) -> list[dict]:
+    """What a device gets for phase ("enrollment", "connection" or "tool"), after merging:
     [{key, value, value_class, profile_id, profile_name}], sorted by key."""
     merged = {}
-    for _level, profile in matching_profiles(phase, username, eud_uid):
+    for _level, profile in matching_profiles(phase, username, eud_uid, tool):
         for setting in profile.settings:
             merged[setting.key] = {
                 "key": setting.key,
@@ -416,6 +474,229 @@ def resolve_settings(phase: str, username: str | None, eud_uid: str | None) -> l
                 "profile_name": profile.name,
             }
     return [merged[key] for key in sorted(merged)]
+
+
+def resolve_files(
+    phase: str, username: str | None, eud_uid: str | None, tool: str | None = None
+) -> list[dict]:
+    """The profile files a device gets for phase, merged by zip path with the same precedence
+    as settings: [{id, filename, zip_path, size, sha256, path (on disk), profile_id,
+    profile_name}], sorted by zip path."""
+    merged = {}
+    for _level, profile in matching_profiles(phase, username, eud_uid, tool):
+        for f in profile.files:
+            merged[f.zip_path.lower()] = {
+                "id": f.id,
+                "filename": f.filename,
+                "zip_path": f.zip_path,
+                "size": f.size,
+                "sha256": f.sha256,
+                "path": stored_file_path(f),
+                "profile_id": profile.id,
+                "profile_name": profile.name,
+            }
+    return [merged[key] for key in sorted(merged)]
+
+
+# --- files ---
+
+
+def file_to_dict(f: DeviceProfileFile) -> dict:
+    return {
+        "id": f.id,
+        "filename": f.filename,
+        "zip_path": f.zip_path,
+        "size": f.size,
+        "sha256": f.sha256,
+        "content_type": f.content_type,
+        "uploaded_by": f.uploaded_by,
+        "created_at": iso8601_string_from_datetime(f.created_at) if f.created_at else None,
+    }
+
+
+def files_folder() -> str:
+    """Where profile files are stored, next to the data packages' uploads folder."""
+    from flask import current_app
+
+    folder = os.path.join(current_app.config.get("RAVEN_DATA_FOLDER"), FILES_FOLDER_NAME)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def stored_file_path(f: DeviceProfileFile) -> str:
+    return os.path.join(files_folder(), f.stored_name)
+
+
+def safe_file_name(name) -> str:
+    """A filename safe on disk and in a zip: no directories, ASCII letters/numbers/._- only
+    (werkzeug's secure_filename), keeping the extension where it can. Raises
+    ProfileValidationError if nothing usable is left."""
+    from werkzeug.utils import secure_filename
+
+    if not isinstance(name, str):
+        name = ""
+    # Browsers on Windows may send the full path
+    name = secure_filename(name.replace("\\", "/").rsplit("/", 1)[-1])
+    if not name or name.startswith("."):
+        raise ProfileValidationError("That file needs a name made of letters and numbers")
+    if len(name) > MAX_FILENAME_LENGTH:
+        stem, ext = os.path.splitext(name)
+        name = stem[: MAX_FILENAME_LENGTH - len(ext)] + ext
+    return name
+
+
+def safe_zip_folder(folder) -> str:
+    """The folder a file goes in inside the zip ("" for the top level): relative, each part
+    cleaned like a filename, no "..", at most MAX_FOLDER_DEPTH deep and not one of the folders
+    the server writes itself. Raises ProfileValidationError."""
+    from werkzeug.utils import secure_filename
+
+    if folder is None:
+        return ""
+    if not isinstance(folder, str):
+        raise ProfileValidationError("folder must be a string")
+    raw_parts = [p for p in folder.replace("\\", "/").split("/") if p.strip()]
+    parts = []
+    for raw in raw_parts:
+        if raw.strip() in (".", ".."):
+            raise ProfileValidationError("The folder can't contain . or ..")
+        part = secure_filename(raw)
+        if not part:
+            raise ProfileValidationError(f'"{raw[:50]}" is not a valid folder name')
+        parts.append(part)
+    if len(parts) > MAX_FOLDER_DEPTH:
+        raise ProfileValidationError(f"Folders can be at most {MAX_FOLDER_DEPTH} levels deep")
+    if parts and parts[0].lower() in RESERVED_ZIP_FOLDERS:
+        raise ProfileValidationError(f'The "{parts[0]}" folder is reserved for the server')
+    return "/".join(parts)
+
+
+def file_limits() -> dict:
+    from flask import current_app
+
+    config = current_app.config
+    mb = 1024 * 1024
+    return {
+        "max_file_bytes": int(config.get("RAVEN_DEVICE_PROFILE_MAX_FILE_MB", 100)) * mb,
+        "max_total_bytes": int(config.get("RAVEN_DEVICE_PROFILE_MAX_TOTAL_MB", 500)) * mb,
+        "max_files": int(config.get("RAVEN_DEVICE_PROFILE_MAX_FILES", 50)),
+    }
+
+
+def _megabytes(size: int) -> str:
+    return f"{size / (1024 * 1024):.0f} MB"
+
+
+def add_profile_file(
+    profile: DeviceProfileSet, stream, filename, folder=None, content_type=None, actor=None
+) -> tuple[DeviceProfileFile, DeviceProfileFile | None]:
+    """Stores stream (a file-like object) as a file of profile and returns (the new row, the row
+    it replaced or None), added to the session but not committed. A file already at the same zip
+    path is replaced (remove the old bytes once the caller commits, see delete_stored_files()).
+    Bumps the profile's updated_at so connected devices fetch it again. Raises
+    ProfileValidationError (nothing is left on disk then)."""
+    filename = safe_file_name(filename)
+    folder = safe_zip_folder(folder)
+    zip_path = f"{folder}/{filename}" if folder else filename
+    if len(zip_path) > MAX_ZIP_PATH_LENGTH:
+        raise ProfileValidationError("That file's path is too long")
+
+    limits = file_limits()
+    replacing = next((f for f in profile.files if f.zip_path.lower() == zip_path.lower()), None)
+    others = [f for f in profile.files if f is not replacing]
+    if len(others) >= limits["max_files"]:
+        raise ProfileValidationError(
+            f"A profile can have at most {limits['max_files']} files"
+        )
+    room = limits["max_total_bytes"] - sum(f.size or 0 for f in others)
+    cap = min(limits["max_file_bytes"], room)
+
+    stored_name = uuid.uuid4().hex
+    path = os.path.join(files_folder(), stored_name)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with open(path, "xb") as out:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > cap:
+                    if size > limits["max_file_bytes"]:
+                        raise ProfileValidationError(
+                            f"Files can be at most {_megabytes(limits['max_file_bytes'])}"
+                        )
+                    raise ProfileValidationError(
+                        f"A profile's files can add up to at most "
+                        f"{_megabytes(limits['max_total_bytes'])}"
+                    )
+                digest.update(chunk)
+                out.write(chunk)
+        if size == 0:
+            raise ProfileValidationError("That file is empty")
+    except BaseException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+
+    if replacing is not None:
+        profile.files.remove(replacing)
+        # Delete the old row before inserting one with the same (profile_id, zip_path)
+        db.session.flush()
+    row = DeviceProfileFile(
+        filename=filename,
+        zip_path=zip_path,
+        stored_name=stored_name,
+        size=size,
+        sha256=digest.hexdigest(),
+        content_type=(content_type or "")[:255] or None,
+        uploaded_by=actor,
+        created_at=utcnow(),
+    )
+    profile.files.append(row)
+    profile.updated_at = utcnow()
+    return row, replacing
+
+
+def delete_stored_files(stored_names) -> None:
+    """Removes profile files from disk. Call after the commit that dropped their rows."""
+    from raven.extensions import logger
+
+    folder = files_folder()
+    for name in stored_names:
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            continue
+        try:
+            os.remove(os.path.join(folder, name))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning(f"Could not remove device profile file {name}: {e}")
+
+
+def copy_profile_files(source: DeviceProfileSet, target: DeviceProfileSet) -> None:
+    """Gives target its own copy of each of source's files (so deleting one profile's file
+    can't remove the other's bytes). Doesn't commit."""
+    import shutil
+
+    for f in source.files:
+        stored_name = uuid.uuid4().hex
+        shutil.copyfile(stored_file_path(f), os.path.join(files_folder(), stored_name))
+        target.files.append(
+            DeviceProfileFile(
+                filename=f.filename,
+                zip_path=f.zip_path,
+                stored_name=stored_name,
+                size=f.size,
+                sha256=f.sha256,
+                content_type=f.content_type,
+                uploaded_by=f.uploaded_by,
+                created_at=utcnow(),
+            )
+        )
 
 
 def username_for_eud(eud_uid: str | None) -> str | None:

@@ -230,6 +230,11 @@ class DefaultConfig:
     RAVEN_AISHUB_IMO_LIST = ""
 
     RAVEN_PROFILE_MAP_SOURCES = True
+    # Files attached to device profiles (stored under RAVEN_DATA_FOLDER/device_profile_files).
+    # nginx's client_max_body_size (100M on /api) caps a single upload too.
+    RAVEN_DEVICE_PROFILE_MAX_FILE_MB = int(os.getenv("RAVEN_DEVICE_PROFILE_MAX_FILE_MB", 100))
+    RAVEN_DEVICE_PROFILE_MAX_TOTAL_MB = int(os.getenv("RAVEN_DEVICE_PROFILE_MAX_TOTAL_MB", 500))
+    RAVEN_DEVICE_PROFILE_MAX_FILES = int(os.getenv("RAVEN_DEVICE_PROFILE_MAX_FILES", 50))
 
     RAVEN_ENABLE_MUMBLE_AUTHENTICATION = False
 

@@ -1,7 +1,8 @@
 """
 Device profile helper endpoints: preview, export, import and extras (admin only).
 
-- GET  /api/device-profiles/preview  what a given user/device would receive for a phase
+- GET  /api/device-profiles/preview  what a given user/device would receive for a phase (or,
+  with phase=tool&tool=<name>, from /Marti/api/device/profile/tool/<name>)
 - GET  /api/device-profiles/<id>/export  a profile as an ATAK .pref file
 - POST /api/device-profiles/import  parse an ATAK .pref/.xml (or a data package .zip holding
   .pref files) into settings. Nothing is saved; secrets, the server connection list and device
@@ -22,6 +23,7 @@ from raven import remote_clear
 from raven.device_profiles import (
     ProfileValidationError,
     profile_to_dict,
+    resolve_files,
     resolve_settings,
     username_for_eud,
     validate_setting,
@@ -306,20 +308,32 @@ def export_device_profile(profile_id):
 @roles_accepted("administrator")
 def preview_device_profile():
     phase = request.args.get("phase", "enrollment")
-    if phase not in ("enrollment", "connection"):
-        return jsonify({"success": False, "error": "phase must be enrollment or connection"}), 400
+    if phase not in ("enrollment", "connection", "tool"):
+        return (
+            jsonify({"success": False, "error": "phase must be enrollment, connection or tool"}),
+            400,
+        )
+    tool = (request.args.get("tool") or "").strip() or None
+    if phase == "tool" and not tool:
+        return jsonify({"success": False, "error": "Choose a tool to preview"}), 400
     username = request.args.get("username") or None
     eud_uid = request.args.get("eud_uid") or None
     if not username and eud_uid:
         # Like a connection request: the device's bound user decides user/group profiles
         username = username_for_eud(eud_uid)
 
-    settings = resolve_settings(phase, username, eud_uid)
-    data_packages, plugins = _extras_for_phase(phase)
+    settings = resolve_settings(phase, username, eud_uid, tool)
+    files = [
+        {k: f[k] for k in ("id", "filename", "zip_path", "size", "profile_id", "profile_name")}
+        for f in resolve_files(phase, username, eud_uid, tool)
+    ]
+    # A tool profile's zip carries only its own settings and files
+    data_packages, plugins = ([], []) if phase == "tool" else _extras_for_phase(phase)
     return jsonify(
         {
             "username": username,
             "settings": settings,
+            "files": files,
             "data_packages": [{"name": dp.filename} for dp in data_packages],
             "plugins": [{"name": p.name} for p in plugins],
         }
