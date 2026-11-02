@@ -29,6 +29,11 @@ class Certificate(db.Model):
     user_cert_filename: Mapped[str] = mapped_column(String(255))
     csr: Mapped[str] = mapped_column(String(255), nullable=True)
     cert_password: Mapped[str] = mapped_column(String(255))
+    # Uppercase hex, no leading zeros (raven.cert_revocation.normalize_serial). NULL for rows
+    # issued before it was recorded; certificate_api fills it in from disk where it can.
+    serial_number: Mapped[str] = mapped_column(String(64), nullable=True, index=True)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    revocation_reason: Mapped[str] = mapped_column(String(64), nullable=True)
     user = relationship("User", back_populates="certificate", uselist=False)
     eud = relationship("EUD", cascade="all, delete", back_populates="certificate", uselist=False)
     data_package = relationship("DataPackage", back_populates="certificate", uselist=False)
@@ -43,6 +48,34 @@ class Certificate(db.Model):
             "user_cert_filename": self.user_cert_filename,
             "cert_password": self.cert_password,
             "eud_uid": self.eud_uid,
+            "serial_number": self.serial_number,
+            "revoked_at": iso8601_string_from_datetime(self.revoked_at) if self.revoked_at else None,
+            "revocation_reason": self.revocation_reason,
+        }
+
+    @property
+    def status(self):
+        if self.revoked_at:
+            return "revoked"
+        if self.expiration_date and self.expiration_date < datetime.now():
+            return "expired"
+        return "valid"
+
+    def revocation_json(self):
+        """For the admin certificate list (certificate_api). Leaves out the cert password."""
+        return {
+            "id": self.id,
+            "common_name": self.common_name,
+            "username": self.username,
+            "callsign": self.callsign,
+            "eud_uid": self.eud_uid,
+            "serial_number": self.serial_number,
+            "expiration_date": iso8601_string_from_datetime(self.expiration_date)
+            if self.expiration_date
+            else None,
+            "revoked_at": iso8601_string_from_datetime(self.revoked_at) if self.revoked_at else None,
+            "revocation_reason": self.revocation_reason,
+            "status": self.status,
         }
 
     def to_json(self):
@@ -56,4 +89,7 @@ class Certificate(db.Model):
             "data_package_filename": self.data_package.filename if self.data_package else None,
             "data_package_hash": self.data_package.hash if self.data_package else None,
             "eud_uid": self.eud_uid,
+            "serial_number": self.serial_number,
+            "revoked_at": iso8601_string_from_datetime(self.revoked_at) if self.revoked_at else None,
+            "revocation_reason": self.revocation_reason,
         }

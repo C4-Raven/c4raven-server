@@ -99,7 +99,7 @@ def drop_removed_jobs_from_config(app):
 # Jobs added to DefaultConfig.JOBS after release. config.yml snapshots JOBS on first run, so
 # an existing install's config would never pick them up; add_new_jobs_to_config() appends
 # them. As with every config job, one already in the persistent job store is left as is.
-ADDED_SCHEDULER_JOB_IDS = ("expire_group_memberships",)
+ADDED_SCHEDULER_JOB_IDS = ("expire_group_memberships", "refresh_crl")
 
 
 def add_new_jobs_to_config(app):
@@ -187,6 +187,14 @@ def init_extensions(app):
 
     ca = CertificateAuthority(logger, app)
     ca.create_ca()
+    # nginx (ssl_crl) and the SSL streaming port won't accept any client cert without a current
+    # CRL, so make sure there is one (CAs older than revocation support, or an expiring CRL)
+    try:
+        from raven.cert_revocation import ensure_crl
+
+        ensure_crl(app.config.get("RAVEN_CA_FOLDER"), app.config.get("RAVEN_CA_PASSWORD"), logger)
+    except BaseException as e:
+        logger.error(f"Failed to check the CA's CRL: {e}")
 
     cors = CORS(
         app,

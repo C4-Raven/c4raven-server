@@ -24,6 +24,7 @@ from sqlalchemy import String, Text, Unicode, UnicodeText, func, select
 from raven import __version__ as version
 from raven.audit import record_audit_event
 from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
+from raven.cert_revocation import serial_from_pem
 from raven.cert_validity import resolve_cert_days
 from raven.certificate_authority import CertificateAuthority
 from raven.extensions import babel, db, ldap_manager, logger
@@ -353,6 +354,15 @@ def certificate():
             ca = CertificateAuthority(logger, app)
             filenames = ca.issue_certificate(username, False, days=cert_days)
             file_hash = None
+            # Recorded so the cert can be revoked later (certificate_api): the PEM on disk is
+            # overwritten by the next cert issued for this user
+            with open(
+                os.path.join(
+                    app.config.get("RAVEN_CA_FOLDER"), "certs", username, username + ".pem"
+                ),
+                "rb",
+            ) as f:
+                issued_serial = serial_from_pem(f.read())
 
             for filename in filenames:
                 file_hash = hashlib.sha256(
@@ -438,6 +448,7 @@ def certificate():
                 cert.user_cert_filename = user_filename
                 cert.cert_password = app.config.get("RAVEN_CA_PASSWORD")
                 cert.data_package_id = data_package.id if data_package else None
+                cert.serial_number = issued_serial
 
                 db.session.add(cert)
                 db.session.commit()

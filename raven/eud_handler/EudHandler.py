@@ -41,6 +41,7 @@ from sqlalchemy import insert, update, select
 
 from raven.EmailValidator import EmailValidator
 from raven.PasswordValidator import PasswordValidator
+from raven.cert_revocation import CERT_ROUTING_PREFIX
 from raven.defaultconfig import DefaultConfig
 from raven.extensions import logger as ots_logger, db, ldap_manager
 from raven.functions import iso8601_string_from_datetime, datetime_from_iso8601_string
@@ -141,6 +142,8 @@ class EudHandler(socketserver.BaseRequestHandler):
     bound_queues = []
     phone_number = None
     group_memberships = []
+    # Client cert serial on the SSL port (EudHandlerSSL), normalized uppercase hex
+    cert_serial = None
 
     def __init__(self, request: socket, client_address, server):
         # Do NOT set self.logger here. The class-level `logger = ots_logger`
@@ -541,9 +544,22 @@ class EudHandler(socketserver.BaseRequestHandler):
           in handle() returns and the normal close path runs. ATAK
           reconnects on its own, which (for example) lets a freshly queued
           clear command be delivered on that reconnect.
+        * ``revoke`` with ``serial`` (routed by ``cert.<serial>``, no uid):
+          this connection's client cert was revoked. Close it for good with
+          the normal close path (the device shows Disconnected); its
+          reconnect then fails the handshake against the new CRL.
         """
         try:
             body = json.loads(body)
+            if body.get("action") == "revoke":
+                if self.cert_serial and body.get("serial") == self.cert_serial:
+                    self.logger.warning(
+                        "Client cert %s of %s was revoked, disconnecting",
+                        self.cert_serial,
+                        self.callsign or self.uid,
+                    )
+                    self.close_connection()
+                return
             if body.get("uid") != self.uid:
                 return
             action = body.get("action")
@@ -898,6 +914,14 @@ class EudHandler(socketserver.BaseRequestHandler):
                         self.rabbit_channel.queue_bind(
                             exchange="eud_control", queue=control_queue, routing_key=self.uid
                         )
+                        # Also reachable by client cert serial, so revoking a cert
+                        # (certificate_api) drops exactly the connection(s) using it
+                        if self.cert_serial:
+                            self.rabbit_channel.queue_bind(
+                                exchange="eud_control",
+                                queue=control_queue,
+                                routing_key=CERT_ROUTING_PREFIX + self.cert_serial,
+                            )
                         self.rabbit_channel.basic_consume(
                             queue=control_queue,
                             on_message_callback=self.on_control_message,

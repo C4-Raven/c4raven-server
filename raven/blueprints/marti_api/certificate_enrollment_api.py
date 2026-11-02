@@ -15,6 +15,7 @@ from flask_security import verify_password
 from OpenSSL import crypto
 
 from raven.audit import record_audit_event
+from raven.cert_revocation import serial_from_pem
 from raven.cert_validity import resolve_cert_days
 from raven.certificate_authority import CertificateAuthority
 from raven.extensions import db, ldap_manager, logger
@@ -178,6 +179,7 @@ def sign_csr_v2():
         signed_csr = cert_authority.sign_csr(
             csr.encode(), common_name, False, subject=subject, days=cert_days
         ).decode("utf-8")
+        issued_serial = serial_from_pem(signed_csr)
         signed_csr = signed_csr.replace("-----BEGIN CERTIFICATE-----\n", "")
         signed_csr = signed_csr.replace("\n-----END CERTIFICATE-----\n", "")
 
@@ -244,6 +246,9 @@ def sign_csr_v2():
                     app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".csr"
                 )
                 certificate.cert_password = app.config.get("RAVEN_CA_PASSWORD")
+                certificate.serial_number = issued_serial
+                certificate.revoked_at = None
+                certificate.revocation_reason = None
 
                 db.session.add(certificate)
                 db.session.commit()
@@ -271,6 +276,9 @@ def sign_csr_v2():
                     app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".csr"
                 )
                 certificate.cert_password = app.config.get("RAVEN_CA_PASSWORD")
+                certificate.serial_number = issued_serial
+                certificate.revoked_at = None
+                certificate.revocation_reason = None
 
                 db.session.commit()
 

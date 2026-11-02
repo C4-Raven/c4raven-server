@@ -46,6 +46,12 @@ JOB_DESCRIPTIONS = {
         "unsubscribed from the group straight away and each removal is recorded in the "
         "Security Audit log."
     ),
+    "refresh_crl": (
+        "Regenerates the certificate revocation list (CRL) when it's missing or within 30 days of "
+        "expiring. nginx and the SSL streaming port reject every client certificate once the CRL "
+        "has expired, so this keeps devices able to connect. Revoking a certificate regenerates "
+        "the CRL straight away regardless."
+    ),
     "get_airplanes_live_data": (
         "Legacy placeholder that does nothing. It only exists so old saved job entries still load."
     ),

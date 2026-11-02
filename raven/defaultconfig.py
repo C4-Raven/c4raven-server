@@ -366,4 +366,12 @@ class DefaultConfig:
             "seconds": 0,
             "minutes": 1,
         },
+        {
+            "id": "refresh_crl",
+            "func": "raven.blueprints.scheduled_jobs:refresh_crl",
+            "trigger": "cron",
+            "day": "*",
+            "hour": 3,
+            "minute": 17,
+        },
     ]
