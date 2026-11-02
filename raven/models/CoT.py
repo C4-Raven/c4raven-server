@@ -12,15 +12,15 @@ class CoT(db.Model):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     how: Mapped[str] = mapped_column(String(255), nullable=True)
-    type: Mapped[str] = mapped_column(String(255), nullable=True)
-    uid: Mapped[str] = mapped_column(String(255), nullable=True)
+    type: Mapped[str] = mapped_column(String(255), nullable=True, index=True)
+    uid: Mapped[str] = mapped_column(String(255), nullable=True, index=True)
     sender_callsign: Mapped[str] = mapped_column(String(255), nullable=True)
     sender_device_name: Mapped[str] = mapped_column(String(255), nullable=True)
     sender_uid: Mapped[str] = mapped_column(
-        String(255), ForeignKey("euds.uid", ondelete="CASCADE"), nullable=True
+        String(255), ForeignKey("euds.uid", ondelete="CASCADE"), nullable=True, index=True
     )
     recipients: Mapped[JSON] = mapped_column(JSON, nullable=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, index=True)
     start: Mapped[datetime] = mapped_column(DateTime)
     stale: Mapped[datetime] = mapped_column(DateTime)
     xml: Mapped[str] = mapped_column(TEXT)
