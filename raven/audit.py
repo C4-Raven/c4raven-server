@@ -234,10 +234,16 @@ ADMIN_ACTION_LABELS = {
     "new_vpn_qr_string": "Created VPN enrollment QR code",
     "delete_token": "Deleted enrollment QR code",
     "certificate": "Generated certificate package",
+    "revoke_certificate": "Revoked certificate",
+    "revoke_certificate_by_serial": "Revoked certificate by serial",
+    "revoke_all_user_certificates": "Revoked all user certificates",
+    # Not in this tree yet: the name the certificates work is expected to give its re-enroll view
+    "allow_device_reenrollment": "Allowed device to enroll again",
     # Data packages, documents, app packages and plugins
     "upload_data_package": "Uploaded data package",
     "edit_data_package": "Edited data package",
     "delete_data_package": "Deleted data package",
+    "edit_data_package_groups": "Changed data package groups",
     "upload_supporting_document": "Uploaded supporting document",
     "delete_supporting_document": "Deleted supporting document",
     "add_package": "Uploaded app package",
@@ -257,9 +263,12 @@ ADMIN_ACTION_LABELS = {
     "import_device_profile": "Imported device profile",
     "add_device_profile": "Added device profile setting",
     "delete_device_profile": "Deleted device profile setting",
+    "upload_profile_files": "Uploaded device profile file",
+    "delete_profile_file": "Deleted device profile file",
     # Video
     "add_update_stream": {"POST": "Added video stream", "PATCH": "Updated video stream"},
     "delete_stream": "Deleted video stream",
+    "edit_video_stream_groups": "Changed video stream groups",
     "download_recording": {"DELETE": "Deleted video recording"},
     # Missions, markers, CASEVAC
     "create_edit_mission": {"POST": "Created mission", "PUT": "Edited mission"},
@@ -293,6 +302,8 @@ ADMIN_ACTION_LABELS = {
     "disconnect_connection": "Disconnected federation connection",
     "restart_broker": "Restarted federation broker",
     "verify_admin_cert_2fa": "Verified federation admin certificate",
+    # Data retention
+    "put_retention": "Changed data retention settings",
 }
 
 # Request fields shown as the event's target, first present wins (after any URL parameters)
@@ -309,6 +320,7 @@ _TARGET_FIELDS = (
     "package_name",
     "path",
     "hash",
+    "serial",
     "id",
     "job_id",
     "filter_id",
@@ -344,6 +356,8 @@ _REDACTED_WORDS = frozenset(
         "keystore",
         "privkey",
         "private",
+        "jwt",
+        "hmac",
     )
 )
 _REDACTED_EXACT = frozenset(("key", "code", "auth", "sig", "pin"))
@@ -355,6 +369,20 @@ _REDACTED_SQUASHED = (
     "privatekey",
     "apikey",
     "accesskey",
+    "passphrase",
+)
+# A name ending in "key" (client_key, sshKey, encryption_key) is key material, except these
+# names of a key rather than for one
+_NON_SECRET_KEY_PREFIXES = frozenset(
+    ("preference", "pref", "setting", "settings", "sort", "lookup", "map", "group", "public")
+)
+# Request shapes that carry a setting as a name field and a value field, e.g. the device profile
+# API's {"preference_key": "caPassword0", "preference_value": "..."}. When the name field names a
+# secret, the value field is redacted too.
+_PAIR_FIELDS = (
+    ("preference_key", "preference_value"),
+    ("key", "value"),
+    ("name", "value"),
 )
 # Certificate / key material: redacted unless the value is a plain number or flag
 # (e.g. certificate_validity days)
@@ -363,6 +391,8 @@ _MATERIAL_WORDS = frozenset(
 )
 _REDACTED = "[redacted]"
 _URL_USERINFO = re.compile(r"([a-z][a-z0-9+.\-]*://)[^/@\s]+@", re.IGNORECASE)
+# name=value parameters in a URL query string inside a value (srt://h?passphrase=..., rtsp://...?token=)
+_URL_QUERY_PARAM = re.compile(r"([?&;])([^=&;#\s?]+)=([^&;#\s]*)")
 _MAX_VALUE = 120
 _MAX_LIST_ITEMS = 5
 _MAX_DETAILS = 2000
@@ -380,9 +410,17 @@ def is_sensitive_key(key, value=None) -> bool:
         return True
     if any(part in squashed for part in _REDACTED_SQUASHED):
         return True
+    if len(words) > 1 and words[-1] in ("key", "keys") and words[-2] not in _NON_SECRET_KEY_PREFIXES:
+        return True
     if any(w in _MATERIAL_WORDS for w in words):
         return not isinstance(value, (bool, int, float)) or value is None
     return False
+
+
+def _mask_query_param(match):
+    if is_sensitive_key(match.group(2)):
+        return f"{match.group(1)}{match.group(2)}=***"
+    return match.group(0)
 
 
 def _safe_scalar(value):
@@ -391,7 +429,10 @@ def _safe_scalar(value):
     text = str(value)
     if "-----BEGIN" in text:
         return _REDACTED
-    text = _URL_USERINFO.sub(r"\1***@", text).replace("\n", " ").replace("\r", " ")
+    text = _URL_USERINFO.sub(r"\1***@", text)
+    if "=" in text:
+        text = _URL_QUERY_PARAM.sub(_mask_query_param, text)
+    text = text.replace("\n", " ").replace("\r", " ")
     if len(text) > _MAX_VALUE:
         text = text[: _MAX_VALUE - 1] + "…"
     return text
@@ -414,6 +455,21 @@ def _safe_value(key, value):
     return _safe_scalar(value)
 
 
+def _redact_pairs(source, fields):
+    """Redacts the value half of a name/value pair whose name is a secret's (see _PAIR_FIELDS)."""
+    try:
+        for name_field, value_field in _PAIR_FIELDS:
+            if value_field not in fields or name_field not in source:
+                continue
+            name = source.get(name_field)
+            if isinstance(name, str) and name and is_sensitive_key(name):
+                fields[value_field] = _REDACTED
+    except BaseException:
+        for _, value_field in _PAIR_FIELDS:
+            if value_field in fields:
+                fields[value_field] = _REDACTED
+
+
 def admin_request_fields():
     """The current request's URL parameters, query string, JSON/form fields and uploaded file
     names, as {name: safe value}, secrets redacted. Never raises."""
@@ -428,12 +484,14 @@ def admin_request_fields():
         if isinstance(data, dict):
             for key, value in data.items():
                 fields.setdefault(key, _safe_value(key, value))
+            _redact_pairs(data, fields)
         elif isinstance(data, list):
             fields.setdefault("body", f"[{len(data)} items]")
         elif request.mimetype in ("multipart/form-data", "application/x-www-form-urlencoded"):
             for key in request.form:
                 values = request.form.getlist(key)
                 fields.setdefault(key, _safe_value(key, values[0] if len(values) == 1 else values))
+            _redact_pairs(request.form, fields)
             for key, storage in request.files.items(multi=True):
                 fields.setdefault(key, f"<file {_safe_scalar(storage.filename) or '?'}>")
     except BaseException as e:

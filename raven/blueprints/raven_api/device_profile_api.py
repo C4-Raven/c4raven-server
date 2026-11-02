@@ -313,7 +313,8 @@ def upload_profile_files(profile_id):
         return _profile_error(gettext("Choose a file to upload"))
 
     actor = getattr(current_user, "username", None)
-    added, replaced_names = [], []
+    # stored: every file written by this request, for cleanup if it fails
+    added, stored, replaced_names = [], [], []
     try:
         for upload in uploads:
             row, replaced = add_profile_file(
@@ -324,13 +325,17 @@ def upload_profile_files(profile_id):
                 content_type=upload.mimetype,
                 actor=actor,
             )
-            added.append(row)
+            stored.append(row.stored_name)
             if replaced is not None:
                 replaced_names.append(replaced.stored_name)
+                # The same path twice in one upload: the later file wins and the earlier row
+                # never gets an id, so it isn't reported
+                added = [a for a in added if a is not replaced]
+            added.append(row)
         db.session.commit()
     except (ProfileValidationError, IntegrityError, OSError) as e:
         db.session.rollback()
-        delete_stored_files([row.stored_name for row in added])
+        delete_stored_files(stored)
         if isinstance(e, ProfileValidationError):
             return _profile_error(str(e))
         logger.error(f"Failed to store a device profile file: {e}")

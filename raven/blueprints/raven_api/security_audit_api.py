@@ -792,6 +792,10 @@ def security_audit_download():
         return jsonify({"success": False, "error": "Failed to build security audit"}), 500
 
 
+# Most rows each filter menu (actors, actions) is built from
+_FILTER_MENU_LIMIT = 1000
+
+
 @security_audit_api_blueprint.route("/api/security/audit/events")
 @roles_accepted("administrator")
 def security_audit_events():
@@ -811,13 +815,25 @@ def security_audit_events():
         scope = _events_query(
             cutoff, category=filters["category"], start=filters["start"], end=filters["end"]
         )
+        # Grouped (one row per actor / action, not per distinct summary) and bounded, so a
+        # long window with many targets doesn't pull every summary ever written
         actors = set()
-        pairs = scope.with_entities(AuditEvent.actor, AuditEvent.username).distinct()
+        pairs = (
+            scope.with_entities(AuditEvent.actor, AuditEvent.username)
+            .order_by(None)
+            .group_by(AuditEvent.actor, AuditEvent.username)
+            .limit(_FILTER_MENU_LIMIT)
+        )
         for actor, username in pairs:
             if actor or username:
                 actors.add(actor or username)
         actions = {}
-        pairs = scope.with_entities(AuditEvent.action, AuditEvent.summary).distinct()
+        pairs = (
+            scope.with_entities(AuditEvent.action, func.min(AuditEvent.summary))
+            .order_by(None)
+            .group_by(AuditEvent.action)
+            .limit(_FILTER_MENU_LIMIT)
+        )
         for action, summary in pairs:
             # The summary minus its target ("Created group: Ops" -> "Created group")
             if action not in actions or not actions[action]:

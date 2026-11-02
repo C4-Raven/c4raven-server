@@ -385,3 +385,124 @@ def test_hook_never_breaks_the_request(app, admin, monkeypatch):
     assert r.status_code == 200
     with app.app_context():
         assert db.session.query(AuditEvent).filter_by(action="group_created").count() == 1
+
+
+# --- redaction of values (review findings) ---
+
+
+def _fields(path, **kwargs):
+    from raven import audit
+
+    with Flask("x").test_request_context(path, method="POST", **kwargs):
+        return audit.admin_request_fields()
+
+
+def test_device_profile_pair_value_redacted_when_key_names_a_secret():
+    fields = _fields(
+        "/api/profiles",
+        data={"preference_key": "caPassword0", "preference_value": SECRET, "eud_uid": "x"},
+    )
+    assert fields["preference_key"] == "caPassword0"
+    assert fields["preference_value"] == "[redacted]"
+    for key in ("clientPassword0", "enrollmentPassword", "updateServerCaPassword"):
+        fields = _fields("/api/profiles", json={"preference_key": key, "preference_value": SECRET})
+        assert fields["preference_value"] == "[redacted]", key
+    # An ordinary setting's value is still shown
+    fields = _fields(
+        "/api/profiles", json={"preference_key": "locationCallsign", "preference_value": "ALPHA"}
+    )
+    assert fields["preference_value"] == "ALPHA"
+    # Other name/value shapes
+    assert _fields("/api/x", json={"key": "apiToken", "value": SECRET})["value"] == "[redacted]"
+    assert _fields("/api/x", json={"name": "ssh_key", "value": SECRET})["value"] == "[redacted]"
+    assert _fields("/api/x", json={"name": "color", "value": "red"})["value"] == "red"
+
+
+def test_device_profile_set_settings_are_only_counted():
+    fields = _fields(
+        "/api/device-profiles",
+        json={
+            "name": "Ops",
+            "settings": [
+                {"key": "clientPassword0", "value": SECRET, "value_class": "String"},
+                {"key": "locationCallsign", "value": "ALPHA", "value_class": "String"},
+            ],
+        },
+    )
+    assert fields["settings"] == "[2 items]"
+    assert SECRET not in repr(fields)
+
+
+def test_secret_query_parameters_inside_values_are_masked():
+    fields = _fields(
+        "/api/mediamtx/stream/add",
+        json={"path": "cam", "source": f"srt://h:8890?streamid=publish:cam&passphrase={SECRET}"},
+    )
+    assert fields["source"] == "srt://h:8890?streamid=publish:cam&passphrase=***"
+    fields = _fields(
+        "/api/mediamtx/stream/add", json={"source": f"rtsp://h/live?token={SECRET}&x=1"}
+    )
+    assert fields["source"] == "rtsp://h/live?token=***&x=1"
+    fields = _fields("/api/x", json={"urls": [f"https://h/a?access_token={SECRET}", "plain"]})
+    assert SECRET not in fields["urls"] and "plain" in fields["urls"]
+
+
+def test_more_sensitive_key_names():
+    for key in (
+        "jwt",
+        "id_jwt",
+        "client_key",
+        "clientKey",
+        "ssh_key",
+        "encryption_key",
+        "hmac",
+        "hmac_key",
+        "passphrase",
+        "srt_passphrase",
+    ):
+        assert is_sensitive_key(key, "x"), key
+    for key in ("preference_key", "sort_key", "name", "monkey"):
+        assert not is_sensitive_key(key, "x"), key
+    fields = _fields(
+        "/api/x?apiKey=zzz&access_token=yyy&jwt=QQQ",
+        json={"clientKey": "k", "truststorePass": "t", "values": ["s1", "s2"]},
+    )
+    for key in ("apiKey", "access_token", "jwt", "clientKey", "truststorePass"):
+        assert fields[key] == "[redacted]", key
+
+
+def test_new_labels_match_real_views():
+    import importlib
+
+    views = {
+        "revoke_certificate": "raven.blueprints.raven_api.certificate_api",
+        "revoke_certificate_by_serial": "raven.blueprints.raven_api.certificate_api",
+        "revoke_all_user_certificates": "raven.blueprints.raven_api.certificate_api",
+        "edit_data_package_groups": "raven.blueprints.raven_api.data_package_api",
+        "edit_video_stream_groups": "raven.blueprints.raven_api.video_api",
+        "upload_profile_files": "raven.blueprints.raven_api.device_profile_api",
+        "delete_profile_file": "raven.blueprints.raven_api.device_profile_api",
+        "put_retention": "raven.blueprints.raven_api.retention_api",
+    }
+    for view, module in views.items():
+        assert callable(getattr(importlib.import_module(module), view)), view
+        assert isinstance(ADMIN_ACTION_LABELS[view], str), view
+    assert ADMIN_ACTION_LABELS["allow_device_reenrollment"]
+
+
+def test_serial_is_a_target():
+    from raven import audit
+
+    with Flask("x").test_request_context(
+        "/api/certificates/revoke", method="POST", json={"serial": "0A1B2C", "reason": "lost"}
+    ):
+        assert audit._admin_target(audit.admin_request_fields()) == "0A1B2C"
+
+
+def test_filter_menus_group_by_action(app, admin):
+    for name in ("Ops", "Blue", "Red", "Green"):
+        admin.post("/api/groups", json={"name": name})
+    data = admin.get("/api/security/audit/events").get_json()
+    add_group = [a for a in data["actions"] if a["action"] == "add_group"]
+    assert add_group == [{"action": "add_group", "label": "Created group"}]
+    assert data["actors"] == ["admin"]

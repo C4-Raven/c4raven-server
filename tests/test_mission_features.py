@@ -729,3 +729,24 @@ def test_web_delete_mission_removes_new_rows(app, owner):
         assert db.session.query(MissionLayer).count() == 0
         assert db.session.query(MissionExternalData).count() == 0
         assert db.session.query(MissionFeed).count() == 0
+
+
+TAK_LAYER_FIELDS = {
+    "uid", "name", "type", "parentUid", "after", "children", "uids", "contents", "maplayers"
+}
+
+
+def test_marti_layers_carry_only_tak_fields_web_keeps_extras(app, owner):
+    """Strict TAK clients reject unknown MissionLayer fields; the web page still gets who/when."""
+    parent = create_layer(owner, "Alpha")
+    create_layer(owner, "Child", parentUid=parent["uid"])
+    assert set(parent) == TAK_LAYER_FIELDS
+    root = tree(owner)[0]
+    assert set(root) == TAK_LAYER_FIELDS
+    assert set(root["children"][0]) == TAK_LAYER_FIELDS
+
+    data = web_client(app, "admin").get("/api/missions/detail", query_string={"name": MISSION}).json
+    web_root = data["layers"][0]
+    assert set(web_root) == TAK_LAYER_FIELDS | {"creatorUid", "createTime"}
+    assert web_root["creatorUid"] == OWNER
+    assert set(web_root["children"][0]) == TAK_LAYER_FIELDS | {"creatorUid", "createTime"}

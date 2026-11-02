@@ -1,7 +1,7 @@
 import datetime
-import io
 import os
 import re
+import tempfile
 import traceback
 import uuid
 import zipfile
@@ -21,6 +21,7 @@ from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
 from raven.device_profiles import (
     SERVER_ZIP_FOLDER,
     ProfileValidationError,
+    file_limits,
     resolve_files,
     resolve_settings,
     username_for_eud,
@@ -116,11 +117,24 @@ PROTECTED_KEYS = {
 }
 
 
+# Profile zips are built in memory up to this size, then in a temporary file on disk: with
+# plugins, data packages and profile files (up to RAVEN_DEVICE_PROFILE_MAX_TOTAL_MB each) they
+# can be far too big to hold in RAM per request
+ZIP_SPOOL_BYTES = 8 * 1024 * 1024
+
+
+def _zip_spool():
+    """A seekable file to build a profile zip in, deleted once it's closed (FileWrapper closes it
+    when the response is done)."""
+    return tempfile.SpooledTemporaryFile(max_size=ZIP_SPOOL_BYTES, mode="w+b")
+
+
 def create_profile_zip(
     enrollment=True,
     syncSecago=-1,
     clientUid: str | None = None,
     username: str | None = None,
+    authenticated: bool = True,
 ):
     """
     Builds the device profile data package.
@@ -130,6 +144,9 @@ def create_profile_zip(
         profiles updated (and data packages/plugins published) within that window are sent.
     :param clientUid: The device's uid, for device-targeted profiles
     :param username: The account the request is for, for user- and group-targeted profiles
+    :param authenticated: False when username was only taken from the device's claimed uid
+        (RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH off): group-restricted data packages are then
+        filtered as for an anonymous caller, not as that account
 
     Settings go in preference.pref; profile files go in at their own zip paths (a profile file
     at the same path as one of the built-in map sources replaces it).
@@ -140,12 +157,29 @@ def create_profile_zip(
 
     get_ldap_attributes(pref)
 
+    # Auto-installed data packages are still limited to the groups that may see them
+    profile_user = (
+        app.security.datastore.find_user(username=username)
+        if username and authenticated
+        else None
+    )
+    zip_buffer = _zip_spool()
+    try:
+        _build_profile_zip(
+            zip_buffer, prefs, pref, enrollment, syncSecago, clientUid, username, profile_user
+        )
+    except BaseException:
+        zip_buffer.close()
+        raise
+    return zip_buffer
+
+
+def _build_profile_zip(
+    zip_buffer, prefs, pref, enrollment, syncSecago, clientUid, username, profile_user
+):
     plugins = None
     data_packages = None
-    # Auto-installed data packages are still limited to the groups that may see them
-    profile_user = app.security.datastore.find_user(username=username) if username else None
-    zip_buffer = io.BytesIO()
-    zipf = zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False)
+    zipf = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED, False)
 
     # MANIFEST file
     manifest = Element("MissionPackageManifest", {"version": "2"})
@@ -327,8 +361,7 @@ def create_profile_zip(
             app.config.get("RAVEN_CA_NAME"),
         ),
     )
-
-    return zip_buffer
+    zipf.close()
 
 
 def _apply_settings(pref: Element, settings: list[dict]):
@@ -344,7 +377,11 @@ def _apply_settings(pref: Element, settings: list[dict]):
 
 def _add_profile_files(zipf: zipfile.ZipFile, contents: Element, profile_files: list[dict]):
     """Writes resolve_files() output into the zip and lists each one in the manifest. A file
-    missing from disk is skipped (and logged) rather than failing the whole profile."""
+    missing from disk is skipped (and logged) rather than failing the whole profile, and so are
+    files past RAVEN_DEVICE_PROFILE_MAX_TOTAL_MB in all: each profile is held to that on upload,
+    but one device can match several profiles."""
+    max_total = file_limits()["max_total_bytes"]
+    total = 0
     for f in profile_files:
         if not os.path.isfile(f["path"]):
             logger.error(
@@ -352,6 +389,14 @@ def _add_profile_files(zipf: zipfile.ZipFile, contents: Element, profile_files: 
                 f"{f['path']}; leaving it out"
             )
             continue
+        size = os.path.getsize(f["path"])
+        if total + size > max_total:
+            logger.error(
+                f"Device profile {f['profile_name']!r}: leaving out {f['zip_path']}, the files "
+                f"of the profiles merged for this device are over {max_total} bytes in all"
+            )
+            continue
+        total += size
         zipf.write(f["path"], f["zip_path"])
         SubElement(contents, "Content", {"ignore": "false", "zipEntry": f["zip_path"]})
 
@@ -431,7 +476,7 @@ def enrollment_profile():
 
 
 def connection_caller(client_uid: str | None):
-    """Who a connection profile request is for: (allowed, username, eud_uid).
+    """Who a connection profile request is for: (allowed, username, eud_uid, authenticated).
 
     ATAK fetches the connection profile from the streaming connection's host on 8443 over TLS
     with the device's client cert (nginx ssl_verify_client on, forwarded as X-Ssl-Cert), so
@@ -442,7 +487,9 @@ def connection_caller(client_uid: str | None):
     by passing its uid.
 
     With RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH off, unauthenticated callers get the old
-    behaviour: whatever clientUid they claim, and that EUD's account.
+    behaviour: whatever clientUid they claim, and that EUD's account, for the profile settings.
+    authenticated is False then: the account is only claimed, so nothing that's restricted by
+    group (data packages) is sent as if it were that account.
     """
     eud_username = username_for_eud(client_uid)
     username = _client_cert_username()
@@ -451,16 +498,16 @@ def connection_caller(client_uid: str | None):
 
     if not username:
         if app.config.get("RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH", True):
-            return False, None, None
-        return True, eud_username, client_uid
+            return False, None, None, False
+        return True, eud_username, client_uid, False
 
     if eud_username and eud_username.lower() != username.lower():
         logger.warning(
             f"Connection profile: {username} asked for device {client_uid}, which belongs to "
             f"{eud_username}; ignoring its device settings"
         )
-        return True, username, None
-    return True, username, client_uid
+        return True, username, None, True
+    return True, username, client_uid, True
 
 
 # EUDs hit this endpoint when the app connects to the server if deviceProfileEnableOnConnect
@@ -477,11 +524,13 @@ def connection_profile():
                 pass
         client_uid = request.args.get("clientUid") or request.args.get("clientUID") or None
 
-        allowed, username, client_uid = connection_caller(client_uid)
+        allowed, username, client_uid, authenticated = connection_caller(client_uid)
         if not allowed:
             return "", 401
 
-        profile_zip = create_profile_zip(False, syncSecago, client_uid, username)
+        profile_zip = create_profile_zip(
+            False, syncSecago, client_uid, username, authenticated=authenticated
+        )
         profile_zip.seek(0)
         return Response(
             FileWrapper(profile_zip), mimetype="application/zip", direct_passthrough=True
@@ -495,7 +544,17 @@ def connection_profile():
 def create_tool_profile_zip(settings: list[dict], profile_files: list[dict], tool: str):
     """The data package for a tool profile: only what the tool's profiles carry (no server
     connection details, truststore, data packages or plugins), as official TAK Server sends."""
-    zip_buffer = io.BytesIO()
+    zip_buffer = _zip_spool()
+    try:
+        _build_tool_profile_zip(zip_buffer, settings, profile_files, tool)
+    except BaseException:
+        zip_buffer.close()
+        raise
+    zip_buffer.seek(0)
+    return zip_buffer
+
+
+def _build_tool_profile_zip(zip_buffer, settings, profile_files, tool):
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED, False) as zipf:
         manifest = Element("MissionPackageManifest", {"version": "2"})
         config = SubElement(manifest, "Configuration")
@@ -516,8 +575,6 @@ def create_tool_profile_zip(settings: list[dict], profile_files: list[dict], too
                 zipf.writestr(pref_entry, tostring(prefs))
         _add_profile_files(zipf, contents, profile_files)
         zipf.writestr("MANIFEST/manifest.xml", tostring(manifest))
-    zip_buffer.seek(0)
-    return zip_buffer
 
 
 # Tool-specific profiles (official TAK Server: GET /Marti/api/device/profile/tool/{toolName}).
@@ -534,7 +591,7 @@ def tool_profile(tool):
                 pass
         client_uid = request.args.get("clientUid") or request.args.get("clientUID") or None
 
-        allowed, username, client_uid = connection_caller(client_uid)
+        allowed, username, client_uid, _authenticated = connection_caller(client_uid)
         if not allowed:
             return "", 401
         try:

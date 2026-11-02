@@ -59,6 +59,8 @@ QUEUES = ("cot_parser",)
 _live_cache = {"at": 0.0, "values": None}
 _live_lock = threading.Lock()
 _bad_token_audited = {}
+# Most IPs remembered by _audit_bad_token at once
+BAD_TOKEN_AUDIT_MAX_IPS = 1024
 
 
 def _queue_stats():
@@ -195,6 +197,13 @@ def _audit_bad_token():
     now = time.monotonic()
     if now - _bad_token_audited.get(ip, -BAD_TOKEN_AUDIT_SECONDS) < BAD_TOKEN_AUDIT_SECONDS:
         return
+    if len(_bad_token_audited) >= BAD_TOKEN_AUDIT_MAX_IPS:
+        # Forget IPs whose quiet period is over; if that's not enough, the oldest
+        for old_ip, at in list(_bad_token_audited.items()):
+            if now - at >= BAD_TOKEN_AUDIT_SECONDS:
+                del _bad_token_audited[old_ip]
+        while len(_bad_token_audited) >= BAD_TOKEN_AUDIT_MAX_IPS:
+            del _bad_token_audited[min(_bad_token_audited, key=_bad_token_audited.get)]
     _bad_token_audited[ip] = now
     record_audit_event(
         "security",
@@ -271,12 +280,16 @@ def metrics_summary():
     ]
     latest = history[-1] if history else None
 
+    # Non-administrators get the traffic numbers only: no DB size, queue depth, stream count or
+    # names of the services that stopped reporting
+    is_admin = bool(current_user.has_role("administrator"))
+
     interval = max(1, int(app.config.get("RAVEN_METRICS_FLUSH_INTERVAL") or 10))
     stale_before = metrics._now() - timedelta(seconds=interval * metrics.STALE_INTERVALS)
     sources = []
     for row in rows:
         name, _labels, _kind, _value, updated = row
-        if name != "raven_metrics_last_flush_timestamp_seconds":
+        if not is_admin or name != "raven_metrics_last_flush_timestamp_seconds":
             continue
         for source in metrics.by_label([row], name, "source"):
             sources.append(
@@ -287,7 +300,10 @@ def metrics_summary():
                 }
             )
 
-    live = _live_values()
+    if is_admin:
+        live = _live_values()
+    else:
+        live = {"queues": {}, "video_streams_active": None, "database_size": None}
     queue = live["queues"].get("cot_parser")
 
     return jsonify(

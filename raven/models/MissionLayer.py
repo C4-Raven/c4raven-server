@@ -59,18 +59,25 @@ class MissionLayer(db.Model):
     def to_json(
         self, children: list | None = None, uids: list | None = None, contents: list | None = None
     ):
+        """TAK Server's MissionLayer JSON, with only its fields: strict clients reject others."""
         return {
             "uid": self.uid,
             "name": self.name,
             "type": self.type,
             "parentUid": self.parent_uid,
             "after": self.after,
-            "creatorUid": self.creator_uid or "",
-            "createTime": (
-                iso8601_string_from_datetime(self.create_time) if self.create_time else ""
-            ),
             "children": children if children is not None else [],
             "uids": uids if uids is not None else [],
             "contents": contents if contents is not None else [],
             "maplayers": [],
         }
+
+    def to_web_json(
+        self, children: list | None = None, uids: list | None = None, contents: list | None = None
+    ):
+        """to_json() plus who made the layer and when, for the web UI's mission page."""
+        return dict(
+            self.to_json(children=children, uids=uids, contents=contents),
+            creatorUid=self.creator_uid or "",
+            createTime=iso8601_string_from_datetime(self.create_time) if self.create_time else "",
+        )

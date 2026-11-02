@@ -265,18 +265,22 @@ def _ordered(siblings: list[MissionLayer]) -> list[MissionLayer]:
     return ordered
 
 
-def _layer_json(layer: MissionLayer, by_parent: dict, items: dict, contents: dict) -> dict:
+def _layer_json(
+    layer: MissionLayer, by_parent: dict, items: dict, contents: dict, web: bool = False
+) -> dict:
     children = [
-        _layer_json(child, by_parent, items, contents)
+        _layer_json(child, by_parent, items, contents, web)
         for child in _ordered(by_parent.get(layer.uid, []))
     ]
     uids = [items[uid].to_json() for uid in (layer.uids or []) if uid in items]
     files = [contents[h].to_json() for h in (layer.hashes or []) if h in contents]
-    return layer.to_json(children=children, uids=uids, contents=files)
+    render = layer.to_web_json if web else layer.to_json
+    return render(children=children, uids=uids, contents=files)
 
 
-def layer_tree(mission: Mission, root_uid: str | None = None) -> list[dict]:
-    """The mission's layers as nested MissionLayer JSON: the root layers, or just root_uid's subtree"""
+def layer_tree(mission: Mission, root_uid: str | None = None, web: bool = False) -> list[dict]:
+    """The mission's layers as nested MissionLayer JSON: the root layers, or just root_uid's
+    subtree. web: with the web UI's extra fields (MissionLayer.to_web_json), not for TAK clients"""
     layers = list(mission.layers)
     by_parent = {}
     for layer in layers:
@@ -287,7 +291,7 @@ def layer_tree(mission: Mission, root_uid: str | None = None) -> list[dict]:
         roots = [layer for layer in layers if layer.uid == root_uid]
     else:
         roots = _ordered(by_parent.get(None, []))
-    return [_layer_json(layer, by_parent, items, contents) for layer in roots]
+    return [_layer_json(layer, by_parent, items, contents, web) for layer in roots]
 
 
 def _find_layer(mission: Mission, layer_uid: str) -> MissionLayer | None:
