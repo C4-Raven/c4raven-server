@@ -417,3 +417,50 @@ def test_preview_device_only(app, admin):
     assert r.status_code == 200
     assert r.json["settings"][0]["value"] == "Green"
     assert r.json["settings"][0]["profile_name"] == "Phone"
+
+
+def _add_file(app, profile_id, zip_path):
+    from raven.models.DeviceProfileFile import DeviceProfileFile
+
+    with app.app_context():
+        profile = db.session.get(DeviceProfileSet, profile_id)
+        profile.files.append(
+            DeviceProfileFile(
+                filename=zip_path.rsplit("/", 1)[-1],
+                zip_path=zip_path,
+                stored_name=f"stored-{profile_id}-{zip_path.replace('/', '-')}",
+                size=4,
+                sha256="0" * 64,
+                created_at=datetime(2026, 1, 1),
+            )
+        )
+        db.session.commit()
+
+
+def test_preview_files_and_tool(app, admin):
+    add_extras(app)
+    everyone = make_profile(app, "Everyone", [("locationTeam", "Cyan", STR)])
+    _add_file(app, everyone, "maps/base.xml")
+    alice = make_profile(app, "Alice", [], everyone=False, targets=[("user", "alice")])
+    _add_file(app, alice, "maps/base.xml")
+    _add_file(app, alice, "alice.pref")
+    tool = make_profile(app, "Mission", [("missionX", "1", STR)])
+    with app.app_context():
+        db.session.get(DeviceProfileSet, tool).tool = "mission"
+        db.session.commit()
+    _add_file(app, tool, "mission.pref")
+
+    r = admin.get("/api/device-profiles/preview", query_string={"username": "alice", "phase": "enrollment"})
+    assert r.status_code == 200, r.json
+    files = {f["zip_path"]: f["profile_name"] for f in r.json["files"]}
+    assert files == {"alice.pref": "Alice", "maps/base.xml": "Alice"}
+    assert "missionX" not in {s["key"] for s in r.json["settings"]}
+
+    r = admin.get("/api/device-profiles/preview", query_string={"username": "alice", "phase": "tool", "tool": "Mission"})
+    assert r.status_code == 200, r.json
+    assert [s["key"] for s in r.json["settings"]] == ["missionX"]
+    assert [f["zip_path"] for f in r.json["files"]] == ["mission.pref"]
+    assert r.json["data_packages"] == [] and r.json["plugins"] == []
+
+    r = admin.get("/api/device-profiles/preview", query_string={"username": "alice", "phase": "tool"})
+    assert r.status_code == 400

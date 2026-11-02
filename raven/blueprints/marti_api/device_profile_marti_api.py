@@ -18,7 +18,14 @@ from raven import remote_clear
 from raven.blueprints.marti_api.certificate_enrollment_api import basic_auth
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
-from raven.device_profiles import resolve_settings, username_for_eud
+from raven.device_profiles import (
+    SERVER_ZIP_FOLDER,
+    ProfileValidationError,
+    resolve_files,
+    resolve_settings,
+    username_for_eud,
+    validate_tool,
+)
 from raven.extensions import db, ldap_manager, logger
 from raven.group_isolation import filter_by_groups
 from raven.models.DataPackage import DataPackage
@@ -123,6 +130,9 @@ def create_profile_zip(
         profiles updated (and data packages/plugins published) within that window are sent.
     :param clientUid: The device's uid, for device-targeted profiles
     :param username: The account the request is for, for user- and group-targeted profiles
+
+    Settings go in preference.pref; profile files go in at their own zip paths (a profile file
+    at the same path as one of the built-in map sources replaces it).
     """
     # preference.pref
     prefs = Element("preferences")
@@ -201,12 +211,22 @@ def create_profile_zip(
     )
     enable_channels.text = "true" if app.config.get("RAVEN_ENABLE_CHANNELS") else "false"
 
+    # Device profile settings and files (raven/device_profiles.py), merged for this user/device
+    phase = "enrollment" if enrollment else "connection"
+    settings = resolve_settings(phase, username, clientUid)
+    profile_files = resolve_files(phase, username, clientUid)
+    if not enrollment and syncSecago > 0:
+        settings, profile_files = _recently_updated(settings, profile_files, syncSecago)
+    profile_paths = {f["zip_path"].lower() for f in profile_files}
+
     if enrollment:
         # Add the maps to the zip
         if app.config.get("RAVEN_PROFILE_MAP_SOURCES") and enrollment:
             maps_path = os.path.join(os.path.dirname(raven.__file__), "maps")
             for root, dirs, map_files in os.walk(maps_path):
                 for map in map_files:
+                    if f"maps/{map}".lower() in profile_paths:
+                        continue
                     zipf.writestr(f"maps/{map}", open(os.path.join(maps_path, map), "r").read())
                     SubElement(contents, "Content", {"ignore": "false", "zipEntry": f"maps/{map}"})
 
@@ -257,23 +277,8 @@ def create_profile_zip(
         data_packages = db.session.execute(data_package_query).all()
         plugins = db.session.execute(plugins_query).all()
 
-    # Device profile settings (raven/device_profiles.py), merged for this user/device
-    phase = "enrollment" if enrollment else "connection"
-    settings = resolve_settings(phase, username, clientUid)
-    if not enrollment and syncSecago > 0:
-        cutoff = datetime.datetime.now(datetime.timezone.utc).replace(
-            tzinfo=None
-        ) - datetime.timedelta(seconds=syncSecago)
-        updated = _profile_update_times({s["profile_id"] for s in settings})
-        settings = [s for s in settings if (updated.get(s["profile_id"]) or cutoff) >= cutoff]
-    for setting in settings:
-        if setting["key"] in PROTECTED_KEYS:
-            logger.warning(
-                f"Device profile {setting['profile_name']!r} sets {setting['key']}, which is "
-                "reserved; ignoring it"
-            )
-            continue
-        _set_entry(pref, setting["key"], setting["value_class"], setting["value"])
+    _apply_settings(pref, settings)
+    _add_profile_files(zipf, contents, profile_files)
 
     if plugins:
         for plugin in plugins:
@@ -324,6 +329,47 @@ def create_profile_zip(
     )
 
     return zip_buffer
+
+
+def _apply_settings(pref: Element, settings: list[dict]):
+    for setting in settings:
+        if setting["key"] in PROTECTED_KEYS:
+            logger.warning(
+                f"Device profile {setting['profile_name']!r} sets {setting['key']}, which is "
+                "reserved; ignoring it"
+            )
+            continue
+        _set_entry(pref, setting["key"], setting["value_class"], setting["value"])
+
+
+def _add_profile_files(zipf: zipfile.ZipFile, contents: Element, profile_files: list[dict]):
+    """Writes resolve_files() output into the zip and lists each one in the manifest. A file
+    missing from disk is skipped (and logged) rather than failing the whole profile."""
+    for f in profile_files:
+        if not os.path.isfile(f["path"]):
+            logger.error(
+                f"Device profile {f['profile_name']!r}: file {f['zip_path']} is missing from "
+                f"{f['path']}; leaving it out"
+            )
+            continue
+        zipf.write(f["path"], f["zip_path"])
+        SubElement(contents, "Content", {"ignore": "false", "zipEntry": f["zip_path"]})
+
+
+def _recently_updated(settings: list[dict], profile_files: list[dict], sync_secago: int):
+    """Only what comes from profiles updated within the last sync_secago seconds (a device
+    that synced since then already has the rest)."""
+    cutoff = datetime.datetime.now(datetime.timezone.utc).replace(
+        tzinfo=None
+    ) - datetime.timedelta(seconds=sync_secago)
+    updated = _profile_update_times(
+        {s["profile_id"] for s in settings} | {f["profile_id"] for f in profile_files}
+    )
+
+    def recent(item):
+        return (updated.get(item["profile_id"]) or cutoff) >= cutoff
+
+    return [s for s in settings if recent(s)], [f for f in profile_files if recent(f)]
 
 
 def _profile_update_times(profile_ids) -> dict:
@@ -442,5 +488,74 @@ def connection_profile():
         )
     except BaseException as e:
         logger.error(f"Failed to send enrollment package: {e}")
+        logger.debug(traceback.format_exc())
+        return "", 500
+
+
+def create_tool_profile_zip(settings: list[dict], profile_files: list[dict], tool: str):
+    """The data package for a tool profile: only what the tool's profiles carry (no server
+    connection details, truststore, data packages or plugins), as official TAK Server sends."""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED, False) as zipf:
+        manifest = Element("MissionPackageManifest", {"version": "2"})
+        config = SubElement(manifest, "Configuration")
+        SubElement(config, "Parameter", {"name": "uid", "value": str(uuid.uuid4())})
+        SubElement(config, "Parameter", {"name": "name", "value": f"Device Profile ({tool})"})
+        SubElement(config, "Parameter", {"name": "onReceiveDelete", "value": "true"})
+        contents = SubElement(manifest, "Contents")
+
+        if settings:
+            prefs = Element("preferences")
+            pref = SubElement(
+                prefs, "preference", {"version": "1", "name": "com.atakmap.app_preferences"}
+            )
+            _apply_settings(pref, settings)
+            if len(pref):
+                pref_entry = f"{SERVER_ZIP_FOLDER}/preference.pref"
+                SubElement(contents, "Content", {"ignore": "false", "zipEntry": pref_entry})
+                zipf.writestr(pref_entry, tostring(prefs))
+        _add_profile_files(zipf, contents, profile_files)
+        zipf.writestr("MANIFEST/manifest.xml", tostring(manifest))
+    zip_buffer.seek(0)
+    return zip_buffer
+
+
+# Tool-specific profiles (official TAK Server: GET /Marti/api/device/profile/tool/{toolName}).
+# Same caller rules as the connection profile. 204 No Content when no enabled profile for the
+# tool applies to this caller (or nothing changed within syncSecago), like official TAK.
+@device_profile_marti_api_blueprint.route("/Marti/api/device/profile/tool/<tool>")
+def tool_profile(tool):
+    try:
+        syncSecago = -1
+        if "syncSecago" in request.args:
+            try:
+                syncSecago = int(request.args["syncSecago"])
+            except ValueError:
+                pass
+        client_uid = request.args.get("clientUid") or request.args.get("clientUID") or None
+
+        allowed, username, client_uid = connection_caller(client_uid)
+        if not allowed:
+            return "", 401
+        try:
+            tool = validate_tool(tool)
+        except ProfileValidationError:
+            tool = None
+        if not tool:
+            return "", 204
+
+        settings = resolve_settings("tool", username, client_uid, tool)
+        profile_files = resolve_files("tool", username, client_uid, tool)
+        if syncSecago > 0:
+            settings, profile_files = _recently_updated(settings, profile_files, syncSecago)
+        if not settings and not profile_files:
+            return "", 204
+
+        profile_zip = create_tool_profile_zip(settings, profile_files, tool)
+        return Response(
+            FileWrapper(profile_zip), mimetype="application/zip", direct_passthrough=True
+        )
+    except BaseException as e:
+        logger.error(f"Failed to send tool profile {tool!r}: {e}")
         logger.debug(traceback.format_exc())
         return "", 500

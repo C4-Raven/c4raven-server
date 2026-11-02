@@ -681,3 +681,238 @@ def test_enrollment_sends_packages_and_settings_with_map_sources_on_or_off(admin
         names = z.namelist()
     assert "5c2bfcae3d98c9f4d262172df99ebac5/welcome.zip" in names
     assert any(n.startswith("maps/") for n in names) is map_sources
+
+
+# --- files in profiles ---
+
+
+def upload(admin, profile_id, files, folder=None):
+    """files: [(name, bytes)]"""
+    data = {"file": [(io.BytesIO(body), name) for name, body in files]}
+    if folder is not None:
+        data["folder"] = folder
+    return admin.post(
+        f"/api/device-profiles/{profile_id}/files", data=data, content_type="multipart/form-data"
+    )
+
+
+def zip_manifest(response):
+    """(zip names, manifest Content zipEntry list, manifest Configuration parameters)"""
+    assert response.status_code == 200, response.data
+    with zipfile.ZipFile(io.BytesIO(response.data)) as z:
+        names = z.namelist()
+        root = ElementTree.fromstring(z.read("MANIFEST/manifest.xml"))
+        bodies = {n: z.read(n) for n in names}
+    entries = [c.get("zipEntry") for c in root.iter("Content")]
+    params = {p.get("name"): p.get("value") for p in root.find("Configuration").iter("Parameter")}
+    return names, entries, params, bodies
+
+
+def test_group_targeted_profile_reaches_group_member_only(admin, app):
+    profile = create(
+        admin,
+        name="Team kit",
+        target_everyone=False,
+        targets=[{"kind": "group", "value": "team"}],
+        settings=[{"key": "locationTeam", "value": "Green", "value_class": STR}],
+    )
+    assert upload(admin, profile["id"], [("team.pref", b"<preferences/>")]).status_code == 200
+    client = app.test_client()
+
+    # alice is in "team"
+    r = client.get("/Marti/api/tls/profile/enrollment", headers=basic("alice", "goodpass"))
+    assert pref_entries(r)["locationTeam"] == ("Green", STR)
+    names, entries, _, _ = zip_manifest(r)
+    assert "team.pref" in names and "team.pref" in entries
+
+    # bob isn't
+    r = client.get("/Marti/api/tls/profile/enrollment", headers=basic("bob", "goodpass"))
+    assert "locationTeam" not in pref_entries(r)
+    names, entries, _, _ = zip_manifest(r)
+    assert "team.pref" not in names and "team.pref" not in entries
+
+
+def test_files_in_zip_with_manifest_and_precedence(admin, app, monkeypatch):
+    everyone = create(admin, name="Everyone")
+    alice = create(
+        admin,
+        name="Alice",
+        target_everyone=False,
+        targets=[{"kind": "user", "value": "alice"}],
+        settings=[{"key": "locationTeam", "value": "Red", "value_class": STR}],
+    )
+    r = upload(admin, everyone["id"], [("basemap.xml", b"everyone"), ("ca.p12", b"\x00\x01")], folder="maps")
+    assert r.status_code == 200, r.json
+    assert [f["zip_path"] for f in r.json["files"]] == ["maps/basemap.xml", "maps/ca.p12"]
+    assert upload(admin, alice["id"], [("basemap.xml", b"alice")], folder="maps").status_code == 200
+    # Unsafe names are cleaned, not trusted
+    r = upload(admin, everyone["id"], [("../../etc/passwd.pref", b"x")], folder="a/b")
+    assert r.json["files"][0]["zip_path"] == "a/b/passwd.pref"
+
+    monkeypatch.setattr(marti, "verify_client_cert", lambda: _FakeCert("alice"))
+    r = app.test_client().get("/Marti/api/device/profile/connection?syncSecago=-1")
+    names, entries, params, bodies = zip_manifest(r)
+    assert params["onReceiveDelete"] == "true" and params["uid"]
+    # Settings still go in the .pref file, listed in the manifest
+    assert "5c2bfcae3d98c9f4d262172df99ebac5/preference.pref" in entries
+    assert pref_entries(r)["locationTeam"] == ("Red", STR)
+    for path in ("maps/basemap.xml", "maps/ca.p12", "a/b/passwd.pref"):
+        assert path in names and path in entries
+    # Same zip path: the user-targeted profile beats everyone
+    assert bodies["maps/basemap.xml"] == b"alice"
+    assert len(names) == len(set(names))
+
+    monkeypatch.setattr(marti, "verify_client_cert", lambda: _FakeCert("bob"))
+    _, _, _, bodies = zip_manifest(app.test_client().get("/Marti/api/device/profile/connection"))
+    assert bodies["maps/basemap.xml"] == b"everyone"
+
+
+def test_file_validation_replace_remove_and_audit(admin, app):
+    profile = create(admin, name="Files")
+    pid = profile["id"]
+    folder = os.path.join(app.config["RAVEN_DATA_FOLDER"], "device_profile_files")
+
+    assert upload(admin, pid, [("a.pref", b"")]).status_code == 400  # empty
+    assert upload(admin, pid, [("x.pref", b"x")], folder="MANIFEST").status_code == 400
+    assert upload(admin, pid, [("x.pref", b"x")], folder="5c2bfcae3d98c9f4d262172df99ebac5").status_code == 400
+    assert upload(admin, pid, [("x.pref", b"x")], folder="a/../b").status_code == 400
+    assert upload(admin, pid, [("...", b"x")]).status_code == 400
+    assert upload(admin, 9999, [("a.pref", b"x")]).status_code == 404
+    assert admin.post(f"/api/device-profiles/{pid}/files").status_code == 400
+
+    app.config["RAVEN_DEVICE_PROFILE_MAX_FILE_MB"] = 1
+    r = upload(admin, pid, [("big.bin", b"x" * (1024 * 1024 + 1))])
+    assert r.status_code == 400 and "at most" in r.json["error"]
+    app.config["RAVEN_DEVICE_PROFILE_MAX_FILES"] = 1
+    assert upload(admin, pid, [("one.pref", b"1")]).status_code == 200
+    assert upload(admin, pid, [("two.pref", b"2")]).status_code == 400
+    # Nothing left behind by the rejected uploads
+    assert len(os.listdir(folder)) == 1
+
+    # Same path replaces (doesn't count against the limit) and drops the old bytes
+    r = upload(admin, pid, [("one.pref", b"new")])
+    assert r.status_code == 200
+    files = r.json["profile"]["files"]
+    assert len(files) == 1 and files[0]["size"] == 3
+    assert len(os.listdir(folder)) == 1
+
+    fid = files[0]["id"]
+    d = admin.get(f"/api/device-profiles/{pid}/files/{fid}")
+    assert d.status_code == 200 and d.data == b"new"
+    assert admin.get(f"/api/device-profiles/9999/files/{fid}").status_code == 404
+
+    # Duplicating copies the bytes, so removing from one leaves the other intact
+    copy = admin.post(f"/api/device-profiles/{pid}/duplicate").json["profile"]
+    assert [f["zip_path"] for f in copy["files"]] == ["one.pref"]
+    assert len(os.listdir(folder)) == 2
+
+    r = admin.delete(f"/api/device-profiles/{pid}/files/{fid}")
+    assert r.status_code == 200 and r.json["profile"]["files"] == []
+    assert len(os.listdir(folder)) == 1
+    assert admin.get(f"/api/device-profiles/{copy['id']}/files/{copy['files'][0]['id']}").data == b"new"
+
+    # Deleting a profile removes its files from disk
+    admin.delete(f"/api/device-profiles/{copy['id']}")
+    assert os.listdir(folder) == []
+
+    actions = [a for a, _ in audit_actions(app)]
+    assert actions.count("profile_file_added") == 2
+    assert actions.count("profile_file_removed") == 1
+    assert all(actor == "admin" for _, actor in audit_actions(app))
+
+    # Non-admins can't upload
+    r = upload(_login(app, "alice"), pid, [("a.pref", b"x")])
+    assert r.status_code in (401, 403)
+
+
+def test_profile_file_overrides_builtin_map_source(admin, app):
+    app.config["RAVEN_PROFILE_MAP_SOURCES"] = True
+    builtin = sorted(
+        os.listdir(os.path.join(os.path.dirname(device_profiles.__file__), "maps"))
+    )[0]
+    profile = create(admin, name="Maps")
+    upload(admin, profile["id"], [(builtin, b"mine")], folder="maps")
+    r = app.test_client().get("/Marti/api/tls/profile/enrollment", headers=basic("bob", "goodpass"))
+    names, entries, _, bodies = zip_manifest(r)
+    assert names.count(f"maps/{builtin}") == 1 and entries.count(f"maps/{builtin}") == 1
+    assert bodies[f"maps/{builtin}"] == b"mine"
+
+
+# --- tool profiles ---
+
+
+def test_tool_profile_endpoint(admin, app, monkeypatch):
+    url = "/Marti/api/device/profile/tool/mission"
+    client = app.test_client()
+    assert client.get(url).status_code == 401
+
+    monkeypatch.setattr(marti, "verify_client_cert", lambda: _FakeCert("alice"))
+    # Nothing for the tool yet
+    assert client.get(url).status_code == 204
+
+    # Bad tool names are rejected on save
+    r = admin.post("/api/device-profiles", json=profile_input(name="Bad", tool="mis sion"))
+    assert r.status_code == 400
+
+    team = create(
+        admin,
+        name="Mission tool",
+        tool="Mission",
+        target_everyone=False,
+        targets=[{"kind": "group", "value": "team"}],
+        settings=[{"key": "missionSetting", "value": "on", "value_class": STR}],
+    )
+    assert team["tool"] == "Mission"
+    upload(admin, team["id"], [("mission.pref", b"<preferences/>")])
+    create(admin, name="Other tool", tool="other", settings=[{"key": "otherSetting", "value": "1", "value_class": STR}])
+
+    # Tool profiles never ride along on enrollment/connection
+    entries = pref_entries(client.get("/Marti/api/device/profile/connection"))
+    assert "missionSetting" not in entries and "otherSetting" not in entries
+    names, _, _, _ = zip_manifest(client.get("/Marti/api/device/profile/connection"))
+    assert "mission.pref" not in names
+
+    # alice (in team) gets it; the tool name matches case-insensitively
+    r = client.get("/Marti/api/device/profile/tool/MISSION?clientUid=ANDROID-alice")
+    names, entries_list, params, _ = zip_manifest(r)
+    assert params["name"] == "Device Profile (MISSION)"
+    assert "mission.pref" in names and "mission.pref" in entries_list
+    entries = pref_entries(r)
+    assert entries == {"missionSetting": ("on", STR)}  # only the tool's own settings
+
+    # bob isn't in team: nothing applies
+    monkeypatch.setattr(marti, "verify_client_cert", lambda: _FakeCert("bob"))
+    assert client.get(url).status_code == 204
+    assert pref_entries(client.get("/Marti/api/device/profile/tool/other")) == {"otherSetting": ("1", STR)}
+
+    # syncSecago: unchanged since the last sync -> 204
+    with app.app_context():
+        p = db.session.query(DeviceProfileSet).filter_by(name="Other tool").one()
+        p.updated_at = datetime.datetime(2020, 1, 1)
+        db.session.commit()
+    assert client.get("/Marti/api/device/profile/tool/other?syncSecago=3600").status_code == 204
+    assert client.get("/Marti/api/device/profile/tool/other?syncSecago=-1").status_code == 200
+
+    # Disabled -> 204
+    monkeypatch.setattr(marti, "verify_client_cert", lambda: _FakeCert("alice"))
+    body = profile_input(
+        name="Mission tool",
+        tool="Mission",
+        enabled=False,
+        target_everyone=False,
+        targets=[{"kind": "group", "value": "team"}],
+    )
+    assert admin.put(f"/api/device-profiles/{team['id']}", json=body).status_code == 200
+    assert client.get(url).status_code == 204
+
+    # Clearing the tool name makes it an ordinary profile again
+    body.update(enabled=True, tool="", apply_on_connection=True)
+    r = admin.put(f"/api/device-profiles/{team['id']}", json=body)
+    assert r.json["profile"]["tool"] is None
+    assert "locationTeam" in pref_entries(client.get("/Marti/api/device/profile/connection"))
+    assert client.get(url).status_code == 204
+
+    # Audit records the tool
+    with app.app_context():
+        details = [e.details for e in db.session.query(AuditEvent).filter_by(action="profile_created")]
+    assert any("tool Mission" in d for d in details)
