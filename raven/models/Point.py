@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from raven.extensions import db
@@ -11,6 +11,8 @@ from raven.functions import iso8601_string_from_datetime
 
 class Point(db.Model):
     __tablename__ = "points"
+    # For the message search area filters
+    __table_args__ = (Index("ix_points_latitude_longitude", "latitude", "longitude"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     uid: Mapped[str] = mapped_column(String(255))
@@ -31,7 +33,7 @@ class Point(db.Model):
     # Camera field of view from TAK ICU and OpenTAK ICU
     fov: Mapped[float] = mapped_column(Float, nullable=True)
     cot_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("cot.id", ondelete="CASCADE"), nullable=True
+        Integer, ForeignKey("cot.id", ondelete="CASCADE"), nullable=True, index=True
     )
     cot = relationship("CoT", back_populates="point")
 

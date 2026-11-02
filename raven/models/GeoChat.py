@@ -15,7 +15,7 @@ class GeoChat(db.Model):
     remarks: Mapped[str] = mapped_column(String(255))
     timestamp: Mapped[datetime] = mapped_column(DateTime)
     point_id: Mapped[int] = mapped_column(Integer, ForeignKey("points.id"))
-    cot_id: Mapped[int] = mapped_column(Integer, ForeignKey("cot.id"))
+    cot_id: Mapped[int] = mapped_column(Integer, ForeignKey("cot.id"), index=True)
     point = relationship("Point", cascade="all", back_populates="geochat", uselist=False)
     cot = relationship("CoT", cascade="all", back_populates="geochat")
     chatroom = relationship("Chatroom", back_populates="geochats")

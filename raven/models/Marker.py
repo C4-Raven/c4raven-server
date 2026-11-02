@@ -38,7 +38,7 @@ class Marker(db.Model):
     )
     remarks: Mapped[str] = mapped_column(String(255), nullable=True)
     cot_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("cot.id", ondelete="CASCADE"), nullable=True
+        Integer, ForeignKey("cot.id", ondelete="CASCADE"), nullable=True, index=True
     )
     mil_std_2525c: Mapped[str] = mapped_column(String(255), nullable=True)
     point = relationship("Point", cascade="all, delete", back_populates="marker")
