@@ -20,6 +20,7 @@ from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
 from raven.device_profiles import resolve_settings, username_for_eud
 from raven.extensions import db, ldap_manager, logger
+from raven.group_isolation import filter_by_groups
 from raven.models.DataPackage import DataPackage
 from raven.models.Packages import Packages
 from raven.models.Plugins import Plugins
@@ -131,6 +132,8 @@ def create_profile_zip(
 
     plugins = None
     data_packages = None
+    # Auto-installed data packages are still limited to the groups that may see them
+    profile_user = app.security.datastore.find_user(username=username) if username else None
     zip_buffer = io.BytesIO()
     zipf = zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False)
 
@@ -213,7 +216,11 @@ def create_profile_zip(
             db.session.query(Packages).filter_by(install_on_enrollment=True)
         ).all()
         data_packages = db.session.execute(
-            db.session.query(DataPackage).filter_by(install_on_enrollment=True)
+            filter_by_groups(
+                db.session.query(DataPackage).filter_by(install_on_enrollment=True),
+                DataPackage,
+                profile_user,
+            )
         ).all()
     else:
         # ravenclear: provision the server's public signing key to every
@@ -230,7 +237,11 @@ def create_profile_zip(
         )
         ravenclear_pubkey.text = remote_clear.public_key_der_b64()
 
-        data_package_query = db.session.query(DataPackage).filter_by(install_on_connection=True)
+        data_package_query = filter_by_groups(
+            db.session.query(DataPackage).filter_by(install_on_connection=True),
+            DataPackage,
+            profile_user,
+        )
         plugins_query = db.session.query(Packages).filter_by(install_on_connection=True)
 
         if syncSecago > 0:

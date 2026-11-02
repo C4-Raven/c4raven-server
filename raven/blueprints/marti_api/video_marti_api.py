@@ -18,6 +18,7 @@ from werkzeug.datastructures import ImmutableMultiDict
 from raven import __version__ as version
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, logger
+from raven.group_isolation import assign_uploader_groups, can_see, filter_by_groups
 from raven.forms.MediaMTXPathConfig import MediaMTXPathConfig
 from raven.functions import iso8601_string_from_datetime
 from raven.models.EUD import EUD
@@ -35,6 +36,17 @@ def mediamtx_path_from_alias(alias):
     names; anything else (e.g. the spaces in "Front Gate Cam") becomes '_'.
     """
     return re.sub(r"[^A-Za-z0-9_\-.~/]", "_", (alias or "").lstrip("/"))
+
+
+def cert_user() -> User | None:
+    """The user named by the Marti client cert's CN, or None (no/invalid cert, unknown CN)."""
+    try:
+        cert = verify_client_cert()
+        if not cert:
+            return None
+        return app.security.datastore.find_user(username=cert.get_subject().commonName)
+    except BaseException:
+        return None
 
 
 @video_marti_api.route("/Marti/vcm", methods=["GET", "POST"])
@@ -84,6 +96,7 @@ def video():
 
             v = VideoStream()
             apply_fields(v)
+            assign_uploader_groups(v, cert_user())
             path_config = MediaMTXPathConfig(None).serialize()
             path_config["sourceOnDemand"] = False
             v.mediamtx_settings = json.dumps(path_config)
@@ -99,6 +112,9 @@ def video():
                     v = db.session.execute(
                         db.select(VideoStream).filter_by(path=path)
                     ).scalar_one()
+                    # Another group's feed on the same path: not this client's to change
+                    if not can_see(v, cert_user()):
+                        return "", 403
                     apply_fields(v)
                     v.xml = sanitized_feed_xml()
 
@@ -110,7 +126,9 @@ def video():
     elif request.method == "GET":
         try:
             with app.app_context():
-                videos = db.session.execute(db.select(VideoStream)).scalars()
+                videos = db.session.execute(
+                    filter_by_groups(db.select(VideoStream), VideoStream, cert_user())
+                ).scalars()
                 videoconnections = Element("videoConnections")
 
                 for video in videos:
@@ -170,7 +188,9 @@ def get_videos():
             ),
             401,
         )
-    videos = db.session.execute(db.select(VideoStream)).scalars()
+    videos = db.session.execute(
+        filter_by_groups(db.select(VideoStream), VideoStream, user)
+    ).scalars()
 
     video_connections = {"videoConnections": []}
     for video in videos:
@@ -236,6 +256,9 @@ def add_video():
                 )
 
             if video_stream:
+                # Someone else's feed this user can't see: leave it alone
+                if not can_see(video_stream, user):
+                    continue
                 if alias:
                     video_stream.alias = alias
                 db.session.commit()
@@ -265,6 +288,7 @@ def add_video():
             video_stream.rtsp_reliable = 1
             video_stream.network_timeout = 10000
             video_stream.generate_xml(urlparse(request.url_root).hostname)
+            assign_uploader_groups(video_stream, user)
             db.session.add(video_stream)
             db.session.commit()
 
@@ -317,6 +341,8 @@ def get_video(uid):
             401,
         )
     user = user[0]
+    if not can_see(video, user):
+        return jsonify({"success": False, "error": gettext("Video not found")}), 404
     return video.to_marti_json(user), 200
 
 
@@ -330,6 +356,8 @@ def delete_video(uid):
     # and then indexed it, so a real uid raised TypeError (500) and an unknown
     # uid never reached the 404 branch.
     video_stream = db.session.execute(db.select(VideoStream).filter_by(uid=uid)).scalars().first()
+    if video_stream and not can_see(video_stream, cert_user()):
+        video_stream = None
     if not video_stream:
         return (
             jsonify(

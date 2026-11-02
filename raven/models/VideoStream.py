@@ -10,6 +10,7 @@ from sqlalchemy import TEXT, Boolean, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from raven.extensions import db
+from raven.models.VideoStreamGroup import VideoStreamGroup  # noqa: F401 (secondary table)
 
 
 @dataclass
@@ -43,6 +44,8 @@ class VideoStream(db.Model):
     cot = relationship("CoT", back_populates="video")
     user = relationship("User", back_populates="video_streams")
     recordings = relationship("VideoRecording", back_populates="video_stream")
+    # Groups that may see this stream; none = everyone (see raven/group_isolation.py)
+    groups = relationship("Group", secondary="video_streams_groups")
 
     def serialize(self):
         return {
@@ -61,6 +64,10 @@ class VideoStream(db.Model):
             "username": self.username,
             "ready": self.ready,
         }
+
+    @property
+    def group_names(self) -> list[str]:
+        return sorted(group.name for group in self.groups)
 
     @property
     def browser_path(self):
@@ -109,6 +116,7 @@ class VideoStream(db.Model):
                 ),
                 "hls_link": "{}://{}:{}/hls/{}/".format(protocol, hostname, port, self.browser_path),
                 "thumbnail": f"{protocol}://{hostname}:{port}/api/videos/thumbnail?path={self.path}",
+                "groups": self.group_names,
             }
 
     def to_marti_json(self, user):

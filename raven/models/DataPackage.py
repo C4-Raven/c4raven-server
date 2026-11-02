@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from raven.extensions import db
 from raven.functions import iso8601_string_from_datetime
+from raven.models.DataPackageGroup import DataPackageGroup  # noqa: F401 (secondary table)
 
 
 @dataclass
@@ -42,6 +43,8 @@ class DataPackage(db.Model):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    # Groups that may see this package; none = everyone (see raven/group_isolation.py)
+    groups = relationship("Group", secondary="data_packages_groups")
 
     @property
     def is_private(self) -> bool:
@@ -67,6 +70,10 @@ class DataPackage(db.Model):
             "private": self.is_private,
         }
 
+    @property
+    def group_names(self) -> list[str]:
+        return sorted(group.name for group in self.groups)
+
     def to_json(self, include_eud=True):
         return {
             "filename": self.filename,
@@ -83,4 +90,5 @@ class DataPackage(db.Model):
             "install_on_enrollment": self.install_on_enrollment,
             "install_on_connection": self.install_on_connection,
             "private": self.is_private,
+            "groups": self.group_names,
         }

@@ -25,6 +25,7 @@ from werkzeug.datastructures import ImmutableMultiDict
 
 from raven.extensions import db, ldap_manager, logger
 from raven.forms.MediaMTXPathConfig import MediaMTXPathConfig
+from raven.group_isolation import assign_uploader_groups, can_see
 from raven.models.VideoRecording import VideoRecording
 from raven.models.VideoStream import VideoStream
 
@@ -394,6 +395,13 @@ def add_update_stream():
             video.rtsp_reliable = 1
             video.network_timeout = 10000
             video.generate_xml(urlparse(request.url_root).hostname)
+            assign_uploader_groups(video, current_user)
+        elif video and not can_see(video, current_user):
+            # Another group's stream: as far as this user is concerned it doesn't exist
+            return (
+                jsonify({"success": False, "error": gettext("Path %(path)s not found", path=path)}),
+                400,
+            )
         elif not video and request.path.endswith("update"):
             return (
                 jsonify({"success": False, "error": gettext("Path %(path)s not found", path=path)}),
@@ -510,7 +518,7 @@ def delete_stream():
             return jsonify({"success": False, "error": gettext("Please specify a path name")}), 400
 
         video = db.session.query(VideoStream).filter(VideoStream.path == path).first()
-        if not video:
+        if not video or not can_see(video, current_user):
             return (
                 jsonify({"success": False, "error": gettext("Path %(path)s not found", path=path)}),
                 400,
@@ -642,6 +650,7 @@ def external_auth():
             v.path = bleach.clean(request.json.get("path"))
             v.alias = v.path.split("/")[-1]
             v.username = bleach.clean(request.json.get("user"))
+            assign_uploader_groups(v, app.security.datastore.find_user(username=v.username))
             path_config = MediaMTXPathConfig(None).serialize()
             path_config["sourceOnDemand"] = False
             v.mediamtx_settings = json.dumps(path_config)

@@ -19,6 +19,7 @@ from raven.blueprints.marti_api.data_package_marti_api import (
 from raven.audit import record_audit_event
 from raven.blueprints.raven_api.api import paginate, search
 from raven.extensions import db, logger
+from raven.group_isolation import AUDIT_CATEGORY, resolve_group_names
 from raven.forms.data_package_form import DataPackageUpdateForm
 from raven.models.Certificate import Certificate
 from raven.models.DataPackage import DataPackage
@@ -190,15 +191,11 @@ def data_package_download():
         )
 
     if not can_access_data_package(data_package[0], current_user):
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": gettext("This data package is private to its sender and recipients"),
-                }
-            ),
-            403,
-        )
+        if data_package[0].is_private:
+            error = gettext("This data package is private to its sender and recipients")
+        else:
+            error = gettext("This data package is limited to groups you aren't in")
+        return jsonify({"success": False, "error": error}), 403
 
     download_name = data_package[0].filename
     name, extension = os.path.splitext(download_name)
@@ -223,3 +220,65 @@ def data_package_download():
 @auth_required()
 def upload_data_package():
     return data_package_share()
+
+
+@data_package_api.route("/api/data_packages/groups", methods=["PATCH"])
+@auth_required()
+def edit_data_package_groups():
+    """Sets which groups may see a data package. An empty list makes it visible to everyone.
+
+    :json: hash, groups (list of group names)
+    """
+    if not current_user.has_role("administrator"):
+        return jsonify({"success": False, "error": gettext("Administrator role required")}), 403
+
+    body = request.get_json(silent=True) or {}
+    file_hash = body.get("hash")
+    names = body.get("groups")
+    if not file_hash or not isinstance(names, list):
+        return (
+            jsonify({"success": False, "error": gettext("Please provide a hash and a list of groups")}),
+            400,
+        )
+
+    data_package = db.session.execute(
+        db.session.query(DataPackage).filter_by(hash=file_hash)
+    ).scalar_one_or_none()
+    if not data_package:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Data package with hash '%(hash)s' not found", hash=file_hash),
+                }
+            ),
+            404,
+        )
+
+    groups, missing = resolve_group_names(names)
+    if missing:
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": gettext("Group not found: %(group_name)s", group_name=", ".join(missing)),
+                }
+            ),
+            404,
+        )
+
+    before = data_package.group_names
+    data_package.groups = groups
+    db.session.commit()
+    after = data_package.group_names
+
+    if before != after:
+        record_audit_event(
+            AUDIT_CATEGORY,
+            "data_package_groups_changed",
+            actor=current_user.username,
+            details=f"Data package: {data_package.filename} ({data_package.hash}) · "
+            f"Groups: {', '.join(before) or 'everyone'} -> {', '.join(after) or 'everyone'}",
+        )
+
+    return jsonify({"success": True, "groups": after})

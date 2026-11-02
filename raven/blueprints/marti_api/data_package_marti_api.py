@@ -22,6 +22,7 @@ from werkzeug.utils import secure_filename
 from raven.audit import record_audit_event
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, logger
+from raven.group_isolation import assign_uploader_groups, group_visibility_clause, is_admin
 from raven.functions import format_bytes, iso8601_string_from_datetime
 from raven.models.DataPackage import DataPackage
 from raven.models.DataPackageRecipient import DataPackageRecipient
@@ -87,15 +88,19 @@ def save_data_package_to_db(
             # FK to euds.uid: an unknown uid would fail the insert outright
             creator_uid = None
         data_package.creator_uid = creator_uid
-        data_package.submission_user = current_user.id if current_user.is_authenticated else None
         data_package.submission_time = datetime.now(timezone.utc)
         data_package.mime_type = mimetype
         data_package.size = file_size
 
-        if username:
-            user = app.security.datastore.find_user(username=username)
-            if user:
-                data_package.submission_user = user.id
+        # The uploader: an explicit username, else the web session, else the Marti client
+        # cert (ATAK uploads carry no session), else the owner of the uploading EUD
+        uploader = app.security.datastore.find_user(username=username) if username else None
+        uploader = uploader or data_package_caller()
+        if uploader is None and creator_uid:
+            eud = db.session.execute(db.select(EUD).filter_by(uid=creator_uid)).scalar()
+            uploader = eud.user if eud else None
+        data_package.submission_user = uploader.id if uploader else None
+        assign_uploader_groups(data_package, uploader)
 
         db.session.add(data_package)
         db.session.commit()
@@ -207,13 +212,21 @@ def data_package_caller() -> User | None:
 
 
 def visible_data_packages(query, user, admin_sees_all: bool = False):
-    """Restrict a DataPackage query/select to what `user` may see: public packages, plus
-    private ones they sent or were sent (TAK Server semantics for tool=private)."""
-    if admin_sees_all and user is not None and user.has_role("administrator"):
+    """Restrict a DataPackage query/select to what `user` may see (TAK Server semantics):
+    public packages that share a group with them (or have no groups, see
+    raven/group_isolation.py), plus packages they sent and private ones they were sent.
+
+    admin_sees_all: administrators get every package, private ones included (the web UI's
+    listing). Otherwise they still see every public package regardless of group, but private
+    packages only if they sent or received them."""
+    if admin_sees_all and is_admin(user):
         return query
 
     is_public = or_(DataPackage.tool.is_(None), func.lower(DataPackage.tool) != "private")
-    if user is None:
+    group_clause = group_visibility_clause(DataPackage, user)
+    if group_clause is not None:
+        is_public = is_public & group_clause
+    if user is None or getattr(user, "id", None) is None:
         return query.filter(is_public)
 
     # Sender may be identified by web user or by the uploading EUD; recipients are
@@ -238,10 +251,9 @@ def visible_data_packages(query, user, admin_sees_all: bool = False):
 
 
 def can_access_data_package(dp: DataPackage, user) -> bool:
-    """Whether `user` may download `dp`. Deliberately no admin bypass: admins can see private
-    packages listed but the contents stay between sender and recipients."""
-    if not dp.is_private:
-        return True
+    """Whether `user` may download `dp`. Deliberately no admin bypass for private packages:
+    admins can see them listed but the contents stay between sender and recipients. Public
+    packages are limited by group (admins see all)."""
     return (
         visible_data_packages(db.session.query(DataPackage).filter_by(hash=dp.hash), user).first()
         is not None
@@ -299,7 +311,7 @@ def data_package_metadata(file_hash):
             data_package = db.session.execute(
                 db.select(DataPackage).filter_by(hash=file_hash)
             ).first()
-            if data_package:
+            if data_package and can_access_data_package(data_package[0], data_package_caller()):
                 data_package = data_package[0]
                 # ATAK sends "private" for user-to-user transfers, "public" otherwise
                 tool = bleach.clean(request.data.decode("utf-8")).strip()
@@ -380,7 +392,7 @@ def get_data_package():
                     "hash": dp.hash,
                     "size": dp.size,
                     "tool": dp.tool or "public",
-                    "groups": [],
+                    "groups": dp.group_names,
                     "expiration": expiration,
                     "latitude": 0,
                     "longitude": 0,
@@ -488,8 +500,7 @@ def data_package_query():
         data_package = db.session.execute(
             db.select(DataPackage).filter_by(hash=request.args.get("hash"))
         ).scalar_one()
-        if data_package:
-
+        if data_package and can_access_data_package(data_package, data_package_caller()):
             url = urlparse(request.url_root)
             return (
                 "https://{}:{}/Marti/api/sync/metadata/{}/tool".format(
