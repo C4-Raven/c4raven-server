@@ -88,6 +88,14 @@ def downgrade():
         "DELETE FROM mission_changes WHERE change_type IN "
         "('ADD_MISSION_LAYER', 'UPDATE_MISSION_LAYER', 'REMOVE_MISSION_LAYER')"
     )
+    # So are the external data and feed changes: without their snapshot columns older code would
+    # list them as empty content changes. A JSON column set to None holds JSON null, not SQL NULL.
+    text_type = "CHAR" if op.get_bind().dialect.name == "mysql" else "TEXT"
+    snapshot_set = " OR ".join(
+        f"({column} IS NOT NULL AND CAST({column} AS {text_type}) <> 'null')"
+        for column in ("external_data", "mission_feed", "mission_layer")
+    )
+    op.execute(f"DELETE FROM mission_changes WHERE {snapshot_set}")
     with op.batch_alter_table("mission_changes", schema=None) as batch_op:
         batch_op.drop_column("mission_layer")
         batch_op.drop_column("mission_feed")

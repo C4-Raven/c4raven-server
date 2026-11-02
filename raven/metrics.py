@@ -141,16 +141,30 @@ class SharedCounters:
         self.values = context.RawArray(ctypes.c_uint64, len(self.series))
         self.lock = context.Lock()
 
+    # A child SIGKILLed while holding the lock leaves it held for good. Waits are bounded so
+    # that can never hang message handling: inc() drops the count, snapshot() reads unlocked.
+    INC_LOCK_TIMEOUT = 0.05
+    SNAPSHOT_LOCK_TIMEOUT = 1.0
+
     def inc(self, name: str, labels: str = "", amount: int = 1):
         i = self.index.get((name, labels))
         if i is None or amount <= 0:
             return
-        with self.lock:
+        if not self.lock.acquire(timeout=self.INC_LOCK_TIMEOUT):
+            return
+        try:
             self.values[i] += amount
+        finally:
+            self.lock.release()
 
     def snapshot(self) -> list:
-        with self.lock:
+        if not self.lock.acquire(timeout=self.SNAPSHOT_LOCK_TIMEOUT):
+            # Aligned 64 bit slots: an unlocked read can't tear, it can only miss an in-flight +1
             return list(self.values)
+        try:
+            return list(self.values)
+        finally:
+            self.lock.release()
 
 
 # This process's counters, see install()

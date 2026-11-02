@@ -139,7 +139,7 @@ def mission_detail():
             "subscribers": [role.to_json() for role in mission.roles],
             "contents": [content.to_json()["data"] for content in mission.contents],
             "items": items,
-            "layers": layer_tree(mission),
+            "layers": layer_tree(mission, web=True),
             "external_data": [item.to_json() for item in mission.external_data_items],
             "feeds": [feed.to_json() for feed in mission.feed_items],
             "changes": [change.to_json() for change in changes],

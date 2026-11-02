@@ -395,11 +395,83 @@ def test_samples_and_summary(app):
     assert data["totals"]["cot_received"] == 10
     assert data["received_by_category"] == {"chat": 4, "position": 6}
     assert data["connections"] == {"ssl": 2}
-    assert data["queue_depth"] == 7
     assert [p["received"] for p in data["history"]][:2] == [60.0, 0.0]
     assert [p["sent"] for p in data["history"]][:2] == [30.0, 120.0]
     # The counters were reset below the older samples' totals: that minute counts as 0
     assert data["history"][-1]["sent"] == 0.0
     assert data["rate"]["received_per_minute"] == data["history"][-1]["received"]
+    # A non-administrator gets the traffic numbers only
+    assert data["queue_depth"] is None
+    assert data["database_size"] is None
+    assert data["video_streams_active"] is None
+    assert data["sources"] == []
+
+    admin = app.test_client()
+    _login_session(app, admin, "admin")
+    data = admin.get("/api/metrics/summary?minutes=30").json
+    assert data["totals"]["cot_received"] == 10
+    assert data["queue_depth"] == 7
     assert data["sources"][0]["source"] == "eud_handler_ssl"
     assert data["sources"][0]["stale"] is False
+
+
+# --- robustness ---
+
+
+def test_inc_and_snapshot_dont_hang_on_a_lock_left_held(monkeypatch):
+    """A child SIGKILLed while holding the shared lock leaves it held for good."""
+    counters = metrics.SharedCounters(metrics.EUD_HANDLER_SERIES)
+    counters.inc("raven_bytes_sent_total", "", 5)
+    pid = os.fork()
+    if pid == 0:
+        counters.lock.acquire()
+        os.kill(os.getpid(), 9)
+    os.waitpid(pid, 0)
+
+    monkeypatch.setattr(metrics.SharedCounters, "SNAPSHOT_LOCK_TIMEOUT", 0.05)
+    started = time.monotonic()
+    counters.inc("raven_bytes_sent_total", "", 7)  # dropped, not blocked
+    values = dict(zip(counters.series, counters.snapshot()))
+    assert time.monotonic() - started < 2
+    assert values[("raven_bytes_sent_total", "")] == 5
+
+
+def test_bad_token_audit_memory_is_bounded(app, monkeypatch):
+    monkeypatch.setattr(metrics_api, "BAD_TOKEN_AUDIT_MAX_IPS", 3)
+    with app.test_request_context("/api/metrics"):
+        for i in range(10):
+            monkeypatch.setattr(metrics_api, "client_ip", lambda i=i: f"10.0.0.{i}")
+            metrics_api._audit_bad_token()
+    assert len(metrics_api._bad_token_audited) <= 3
+    assert "10.0.0.9" in metrics_api._bad_token_audited
+
+
+def test_udp_datagrams_are_not_counted_as_connections(monkeypatch):
+    from raven.eud_handler.EudHandler import EudHandler
+
+    counted = []
+    monkeypatch.setattr(metrics, "inc", lambda name, *a, **k: counted.append(name))
+
+    class Stop(Exception):
+        pass
+
+    def stop(*args, **kwargs):
+        raise Stop()
+
+    handler = EudHandler.__new__(EudHandler)
+    handler.logger = None
+    # UDP: (datagram, socket). Stop right after the counting, before any real setup work
+    handler.request = (b"<event/>", object())
+    monkeypatch.setattr(EudHandler, "create_app", stop)
+    with pytest.raises((Stop, AttributeError)):
+        handler.setup()
+    assert "raven_eud_connections_accepted_total" not in counted
+
+    class FakeSocket:
+        def setsockopt(self, *args):
+            raise Stop()
+
+    handler.request = FakeSocket()
+    with pytest.raises(Stop):
+        handler.setup()
+    assert "raven_eud_connections_accepted_total" in counted

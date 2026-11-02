@@ -916,3 +916,96 @@ def test_tool_profile_endpoint(admin, app, monkeypatch):
     with app.app_context():
         details = [e.details for e in db.session.query(AuditEvent).filter_by(action="profile_created")]
     assert any("tool Mission" in d for d in details)
+
+
+# --- review fixes ---
+
+
+def _team_package(app, filename="team-only.zip", file_hash="teamhash"):
+    from raven.models.DataPackage import DataPackage
+
+    with app.app_context():
+        dp = DataPackage()
+        dp.filename = filename
+        dp.hash = file_hash
+        dp.submission_time = datetime.datetime(2026, 1, 1)
+        dp.mime_type = "application/zip"
+        dp.size = 3
+        dp.install_on_connection = True
+        dp.groups = [db.session.query(Group).filter_by(name="team").one()]
+        db.session.add(dp)
+        db.session.commit()
+    with open(os.path.join(app.config["UPLOAD_FOLDER"], f"{file_hash}.zip"), "wb") as f:
+        f.write(b"zip")
+    return f"5c2bfcae3d98c9f4d262172df99ebac5/{filename}"
+
+
+def test_unauthenticated_connection_profile_gets_no_group_packages(app, monkeypatch):
+    """With RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH off the claimed clientUid's account is only
+    used for settings: group-restricted data packages are filtered as for anyone."""
+    entry = _team_package(app)
+    url = "/Marti/api/device/profile/connection?clientUid=ANDROID-alice&syncSecago=-1"
+    client = app.test_client()
+
+    monkeypatch.setattr(marti, "verify_client_cert", lambda: _FakeCert("alice"))
+    names, _, _, _ = zip_manifest(client.get(url))
+    assert entry in names
+
+    monkeypatch.setattr(marti, "verify_client_cert", lambda: False)
+    app.config["RAVEN_CONNECTION_PROFILE_REQUIRE_AUTH"] = False
+    names, entries, _, _ = zip_manifest(client.get(url))
+    assert entry not in names and entry not in entries
+
+
+def test_profile_zip_is_spooled_not_held_in_memory(app, monkeypatch):
+    import tempfile
+
+    monkeypatch.setattr(marti, "ZIP_SPOOL_BYTES", 1024)
+    monkeypatch.setattr(marti, "verify_client_cert", lambda: _FakeCert("alice"))
+    built = []
+    real = marti._zip_spool
+
+    def spool():
+        built.append(real())
+        return built[-1]
+
+    monkeypatch.setattr(marti, "_zip_spool", spool)
+    response = app.test_client().get("/Marti/api/device/profile/connection?syncSecago=-1")
+    zip_manifest(response)
+    assert isinstance(built[0], tempfile.SpooledTemporaryFile)
+    response.close()
+    assert built[0].closed
+
+
+def test_merged_profile_files_are_capped_per_response(admin, app, monkeypatch):
+    first = create(admin, name="First")
+    second = create(admin, name="Second")
+    assert upload(admin, first["id"], [("a.bin", b"x" * 600)]).status_code == 200
+    assert upload(admin, second["id"], [("b.bin", b"y" * 600)]).status_code == 200
+    # Each profile is within the limit on its own; together they're over it
+    monkeypatch.setattr(
+        marti,
+        "file_limits",
+        lambda: {"max_file_bytes": 1000, "max_total_bytes": 1000, "max_files": 50},
+    )
+    monkeypatch.setattr(marti, "verify_client_cert", lambda: _FakeCert("alice"))
+    names, entries, _, _ = zip_manifest(
+        app.test_client().get("/Marti/api/device/profile/connection?syncSecago=-1")
+    )
+    assert ("a.bin" in names) != ("b.bin" in names)
+    assert ("a.bin" in entries) != ("b.bin" in entries)
+
+
+def test_same_path_twice_in_one_upload_reports_only_the_kept_file(admin, app):
+    profile = create(admin, name="Dupes")
+    r = upload(admin, profile["id"], [("x.pref", b"first"), ("x.pref", b"second")])
+    assert r.status_code == 200, r.json
+    assert [f["zip_path"] for f in r.json["files"]] == ["x.pref"]
+    assert r.json["files"][0]["id"] is not None
+    assert len(r.json["profile"]["files"]) == 1
+    fid = r.json["files"][0]["id"]
+    assert admin.get(f"/api/device-profiles/{profile['id']}/files/{fid}").data == b"second"
+    # Only the kept file is left on disk
+    with app.app_context():
+        folder = device_profiles.files_folder()
+    assert len(os.listdir(folder)) == 1

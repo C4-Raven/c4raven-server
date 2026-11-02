@@ -33,6 +33,7 @@ import raven.models  # noqa: E402
 for _module in pkgutil.iter_modules(raven.models.__path__):
     importlib.import_module(f"raven.models.{_module.name}")
 
+from raven.blueprints.raven_api import message_search_api  # noqa: E402
 from raven.blueprints.raven_api.message_search_api import (  # noqa: E402
     message_search_api_blueprint,
 )
@@ -53,6 +54,14 @@ T0 = datetime.datetime(2026, 10, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
 def _t(minutes):
     return T0 + datetime.timedelta(minutes=minutes)
+
+
+@pytest.fixture(autouse=True)
+def _wide_default_window(request, monkeypatch):
+    """The seed data is at a fixed date (T0), older than the 24 hour default search window, so
+    the filter tests search everything unless they're about the default window itself."""
+    if "real_default_window" not in request.keywords:
+        monkeypatch.setattr(message_search_api, "DEFAULT_WINDOW", datetime.timedelta(days=36500))
 
 
 @pytest.fixture
@@ -500,3 +509,50 @@ def test_search_is_not_audited(app, client):
     _search(app, client)
     with app.app_context():
         assert db.session.query(AuditEvent).count() == 0
+
+
+# --- default window, paging and count caps ---
+
+
+@pytest.mark.real_default_window
+def test_no_dates_searches_last_24_hours(app, client):
+    with app.app_context():
+        _cot("recent-1", "alice-eud", "a-f-G-U-C", 0, 10.0, 20.0)
+        recent = db.session.query(CoT).filter_by(uid="recent-1").one()
+        recent.timestamp = datetime.datetime.now(datetime.timezone.utc).replace(
+            tzinfo=None
+        ) - datetime.timedelta(hours=1)
+        db.session.commit()
+    body = _search(app, client)
+    assert _uids(body) == ["recent-1"]
+    assert body["default_start"]
+    # An explicit range still reaches the old seed data, and isn't flagged as the default
+    body = _search(app, client, start="2026-01-01T00:00:00Z")
+    assert body["total"] == 12
+    assert body["default_start"] is None
+
+
+@pytest.mark.real_default_window
+def test_export_uses_same_default_window(app, client):
+    _login(app, client, "admin")
+    response = client.get("/api/message_search/export?format=csv")
+    assert response.status_code == 200
+    rows = list(csv.reader(io.StringIO(response.get_data(as_text=True))))
+    assert rows[1:] == []
+
+
+def test_paging_and_count_are_capped(app, client, monkeypatch):
+    monkeypatch.setattr(message_search_api, "MAX_RESULT_WINDOW", 4)
+    body = _search(app, client, per_page=2)
+    assert body["total"] == 4
+    assert body["total_capped"] is True
+    assert body["total_pages"] == 2
+    # A page past the window is clamped to the last one inside it
+    body = _search(app, client, per_page=2, page=50)
+    assert body["current_page"] == 2
+    assert len(body["results"]) == 2
+
+    monkeypatch.setattr(message_search_api, "MAX_RESULT_WINDOW", 10000)
+    body = _search(app, client, per_page=2)
+    assert body["total"] == 11
+    assert body["total_capped"] is False

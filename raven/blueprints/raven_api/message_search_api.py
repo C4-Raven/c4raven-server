@@ -2,12 +2,16 @@
 Message search: query stored CoT by time, area, type, callsign/uid and chat/remarks text, and
 export the same query as CSV or KML (like TAK Server's CoT query/export).
 
-GET /api/message_search?<filters>&page=1&per_page=50        -> JSON page of results
+GET /api/message_search?<filters>&page=1&per_page=50        -> JSON page of results. Paging
+                                                               stops at MAX_RESULT_WINDOW rows
+                                                               and the total is counted up to
+                                                               it ("total_capped" past that).
 GET /api/message_search/export?<filters>&format=csv|kml     -> streamed file (audited)
 GET /api/message_search/<cot_id>                            -> one message with its raw XML
 
 Filters (all optional):
-  start, end            ISO 8601 date/times on the CoT's time attribute (no offset = UTC)
+  start, end            ISO 8601 date/times on the CoT's time attribute (no offset = UTC).
+                        With neither, the last DEFAULT_WINDOW (24 hours) is searched.
   min_lat, min_lon,     bounding box; min_lon > max_lon crosses the antimeridian
   max_lat, max_lon
   lat, lon, radius      center + radius in meters (equirectangular approximation, up to
@@ -61,6 +65,11 @@ METERS_PER_DEGREE = 111320.0
 # ATAK's "unknown" value for hae/ce/le
 UNKNOWN_VALUE = 9999999.0
 EXPORT_BATCH = 1000
+# Searched when neither start nor end is given, so an empty search doesn't scan every CoT ever
+DEFAULT_WINDOW = datetime.timedelta(hours=24)
+# Paging only goes this deep (page * per_page) and the total is only counted this far: deep
+# OFFSETs and exact counts over a large cots table are what make a search slow
+MAX_RESULT_WINDOW = 10000
 
 CSV_COLUMNS = (
     "timestamp",
@@ -153,6 +162,9 @@ def parse_filters():
 
     if filters["start"] and filters["end"] and filters["start"] > filters["end"]:
         raise ValueError(gettext("start must be before end"))
+    if not filters["start"] and not filters["end"]:
+        filters["start"] = datetime.datetime.now(datetime.timezone.utc) - DEFAULT_WINDOW
+        filters["default_window"] = True
 
     bbox = [filters[k] for k in ("min_lat", "min_lon", "max_lat", "max_lon")]
     if any(v is not None for v in bbox) and not all(v is not None for v in bbox):
@@ -190,7 +202,7 @@ def describe_filters(filters):
     """A short text form of the filters for the audit trail."""
     parts = []
     for key, value in filters.items():
-        if value is None:
+        if value is None or key == "default_window":
             continue
         if isinstance(value, datetime.datetime):
             value = value.isoformat()
@@ -451,11 +463,16 @@ def search_messages():
     except ValueError as e:
         return _bad_request(e)
 
-    page = _int_arg("page", 1, 1, 1000000)
     per_page = _int_arg("per_page", DEFAULT_PER_PAGE, 1, MAX_PER_PAGE)
+    page = _int_arg("page", 1, 1, max(1, MAX_RESULT_WINDOW // per_page))
 
     query = build_query(filters, current_user)
-    total = db.session.execute(select(func.count()).select_from(query.subquery())).scalar()
+    # Counted no further than one past the window, so a huge match costs no more than that
+    counted = db.session.execute(
+        select(func.count()).select_from(query.limit(MAX_RESULT_WINDOW + 1).subquery())
+    ).scalar()
+    total_capped = counted > MAX_RESULT_WINDOW
+    total = min(counted, MAX_RESULT_WINDOW)
     rows = db.session.execute(_ordered(query).limit(per_page).offset((page - 1) * per_page)).all()
 
     return jsonify(
@@ -463,10 +480,14 @@ def search_messages():
             "success": True,
             "results": [row_to_json(row) for row in rows],
             "total": total,
+            "total_capped": total_capped,
+            "max_results": MAX_RESULT_WINDOW,
             "current_page": page,
             "per_page": per_page,
             "total_pages": max(1, math.ceil(total / per_page)),
             "export_max_rows": export_max_rows(),
+            # Set when no start/end was given and only the last 24 hours were searched
+            "default_start": _iso(filters["start"]) if filters.get("default_window") else None,
         }
     )
 

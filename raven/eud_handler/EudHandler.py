@@ -241,7 +241,9 @@ class EudHandler(socketserver.BaseRequestHandler):
 
     def setup(self):
         self.socket: socket = self.request
-        metrics.inc("raven_eud_connections_accepted_total")
+        # A UDP server hands every datagram to a new handler as (data, socket): not a connection
+        if not isinstance(self.request, tuple):
+            metrics.inc("raven_eud_connections_accepted_total")
 
         # Without this, a peer that vanishes without a clean FIN/RST (wifi
         # drop, app killed, phone put to sleep) leaves recv() in handle()
