@@ -99,7 +99,7 @@ def drop_removed_jobs_from_config(app):
 # Jobs added to DefaultConfig.JOBS after release. config.yml snapshots JOBS on first run, so
 # an existing install's config would never pick them up; add_new_jobs_to_config() appends
 # them. As with every config job, one already in the persistent job store is left as is.
-ADDED_SCHEDULER_JOB_IDS = ("expire_group_memberships",)
+ADDED_SCHEDULER_JOB_IDS = ("expire_group_memberships", "apply_data_retention")
 
 
 def add_new_jobs_to_config(app):

@@ -18,6 +18,7 @@ from raven.blueprints.raven_api.mission_api import data_sync_api
 from raven.blueprints.raven_api.onboard_api import onboard_api_blueprint
 from raven.blueprints.raven_api.package_api import packages_blueprint
 from raven.blueprints.raven_api.plugin_api import plugin_blueprint
+from raven.blueprints.raven_api.retention_api import retention_api_blueprint
 from raven.blueprints.raven_api.scheduler_api import scheduler_api_blueprint
 from raven.blueprints.raven_api.security_audit_api import security_audit_api_blueprint
 from raven.blueprints.raven_api.supporting_document_api import supporting_document_api
@@ -55,3 +56,4 @@ raven_api.register_blueprint(onboard_api_blueprint)
 raven_api.register_blueprint(ldap_blueprint)
 raven_api.register_blueprint(tak_gov_link_blueprint)
 raven_api.register_blueprint(language_api)
+raven_api.register_blueprint(retention_api_blueprint)

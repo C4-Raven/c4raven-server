@@ -432,7 +432,11 @@ def test_new_job_added_to_old_config_snapshot():
     cfg.config["JOBS"] = [{"id": "purge_data", "func": "x:y", "trigger": "interval", "minutes": 1}]
     add_new_jobs_to_config(cfg)
     add_new_jobs_to_config(cfg)
-    assert [j["id"] for j in cfg.config["JOBS"]] == ["purge_data", "expire_group_memberships"]
+    assert [j["id"] for j in cfg.config["JOBS"]] == [
+        "purge_data",
+        "expire_group_memberships",
+        "apply_data_retention",
+    ]
 
 
 # --- lock ---

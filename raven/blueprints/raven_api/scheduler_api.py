@@ -30,8 +30,9 @@ JOB_DESCRIPTIONS = {
         "groups are kept."
     ),
     "delete_old_data": (
-        "Deletes data older than the configured retention period (the RAVEN_DELETE_OLD_DATA_* "
-        "settings). Old markers, alerts and range & bearing lines are also removed from "
+        "Legacy, superseded by the per-type settings on the Data Retention tab (Apply data "
+        "retention). Deletes data older than the configured retention period (the "
+        "RAVEN_DELETE_OLD_DATA_* settings). Old markers, alerts and range & bearing lines are also removed from "
         "connected devices' maps; old chat messages, mission changes, EUD records, points and "
         "CoT history are deleted from the database."
     ),
@@ -45,6 +46,13 @@ JOB_DESCRIPTIONS = {
         "Groups page, or a group's default membership duration). Affected devices are "
         "unsubscribed from the group straight away and each removal is recorded in the "
         "Security Audit log."
+    ),
+    "apply_data_retention": (
+        "Deletes data older than the retention set for each type on the Data Retention tab "
+        "(CoT history, chats, alerts, markers, data packages and video files, statistics, "
+        "audit events, old log files...), in small batches. Also drops chat messages held for "
+        "offline devices once they are older than the offline chat retention (48 hours by "
+        "default). Types set to keep forever are left alone."
     ),
     "get_airplanes_live_data": (
         "Legacy placeholder that does nothing. It only exists so old saved job entries still load."

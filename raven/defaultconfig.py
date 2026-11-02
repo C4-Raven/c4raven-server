@@ -366,4 +366,11 @@ class DefaultConfig:
             "seconds": 0,
             "minutes": 1,
         },
+        {
+            "id": "apply_data_retention",
+            "func": "raven.blueprints.scheduled_jobs:apply_data_retention",
+            "trigger": "interval",
+            "seconds": 0,
+            "minutes": 10,
+        },
     ]
