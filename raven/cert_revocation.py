@@ -250,6 +250,24 @@ def ensure_crl(ca_folder, password, logger=None) -> bool:
     return True
 
 
+def report_crl_failure(app, message, logger=None):
+    """A CRL that can't be regenerated will expire and then lock every device out, so a failure
+    is logged as an error and recorded as a "crl_refresh_failed" security audit event (shown on
+    the Security Audit page) rather than only going to the log. Never raises."""
+    if logger:
+        logger.error(message)
+    try:
+        from raven.audit import record_audit_event
+
+        with app.app_context():
+            record_audit_event(
+                "security", "crl_refresh_failed", success=False, actor="system", details=message
+            )
+    except BaseException as e:
+        if logger:
+            logger.error(f"Failed to record the CRL failure in the audit log: {e}")
+
+
 def revoke(ca_folder, password, entries):
     """Mark certificates revoked in crl_index.txt and regenerate ca.crl.
 
@@ -323,16 +341,25 @@ def forwarded_cert_serial(header_value) -> str | None:
 def kick_revoked_sessions(app, serials, logger=None):
     """Ask the SSL streaming port to drop any live connection using one of these serials.
 
-    The streaming handlers are separate processes; each one binds its eud_control queue to
-    "cert.<serial>" (see EudHandler), so this reaches exactly the connection(s) on that cert.
-    Best effort: a connection that is missed is still cut off at its next handshake by the CRL.
-    Returns True if the messages were published."""
+    The streaming handlers are separate processes; each one binds a private eud_control queue to
+    "cert.<serial>" as soon as both its RabbitMQ channel and its client cert are known (see
+    EudHandler.bind_cert_control_queue), so this reaches exactly the connection(s) on that cert.
+    The messages are published mandatory with publisher confirms, so an unroutable one (no live
+    connection on that cert) is reported back instead of silently dropped. A connection that is
+    missed anyway is still cut off at its next handshake by the CRL.
+
+    :returns: dict with ``sent`` (False if the broker couldn't be reached, nothing was kicked)
+        and ``connected`` (the serials a live streaming connection was listening on, i.e. the
+        sessions that were told to disconnect)
+    """
     serials = [s for s in (normalize_serial(s) for s in serials) if s]
     if not serials:
-        return True
+        return {"sent": True, "connected": []}
     import pika
+    from pika.exceptions import UnroutableError
 
     connection = None
+    connected = []
     try:
         connection = pika.BlockingConnection(
             pika.ConnectionParameters(
@@ -344,21 +371,28 @@ def kick_revoked_sessions(app, serials, logger=None):
             )
         )
         channel = connection.channel()
+        channel.confirm_delivery()
         # Args must match raven.app / EudHandler exactly or the broker closes the channel (406)
         channel.exchange_declare("eud_control", durable=True, exchange_type="direct")
         for serial in serials:
-            channel.basic_publish(
-                exchange="eud_control",
-                routing_key=CERT_ROUTING_PREFIX + serial,
-                body=json.dumps({"action": "revoke", "serial": serial}),
-                properties=pika.BasicProperties(expiration="60000"),
-            )
+            try:
+                channel.basic_publish(
+                    exchange="eud_control",
+                    routing_key=CERT_ROUTING_PREFIX + serial,
+                    body=json.dumps({"action": "revoke", "serial": serial}),
+                    properties=pika.BasicProperties(expiration="60000"),
+                    mandatory=True,
+                )
+                connected.append(serial)
+            except UnroutableError:
+                # No streaming connection is using this cert right now
+                pass
         channel.close()
-        return True
+        return {"sent": True, "connected": connected}
     except BaseException as e:
         if logger:
             logger.error("Failed to disconnect sessions for revoked cert(s) {}: {}".format(serials, e))
-        return False
+        return {"sent": False, "connected": connected}
     finally:
         if connection is not None and connection.is_open:
             connection.close()

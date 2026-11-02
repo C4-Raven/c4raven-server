@@ -25,6 +25,13 @@ class CertificateAuthority:
         self.logger = logger
         self.app = app
 
+    def _openssl_env(self):
+        """The environment for the openssl commands below. The CA password goes in as
+        RAVEN_CA_PASS (``-passin/-passout env:RAVEN_CA_PASS``) rather than ``pass:`` on the
+        command line, where any local user could read it in ps / /proc/<pid>/cmdline and it
+        ended up in the debug log with the command."""
+        return dict(os.environ, RAVEN_CA_PASS=str(self.app.config.get("RAVEN_CA_PASSWORD") or ""))
+
     def create_ca(self):
         if not self.check_if_ca_exists():
             self.logger.info("Creating CA...")
@@ -38,18 +45,17 @@ class CertificateAuthority:
                 self.app.config.get("RAVEN_CA_NAME")
             )
 
-            command = "openssl req -new -sha256 -x509 -days {} -extensions v3_ca -keyout {} -out {} -passout pass:{} -config {} -subj {}".format(
+            command = "openssl req -new -sha256 -x509 -days {} -extensions v3_ca -keyout {} -out {} -passout env:RAVEN_CA_PASS -config {} -subj {}".format(
                 self.app.config.get("RAVEN_CA_EXPIRATION_TIME"),
                 os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca-do-not-share.key"),
                 os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca.pem"),
-                self.app.config.get("RAVEN_CA_PASSWORD"),
                 os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca_config.cfg"),
                 subject,
             )
 
             self.logger.debug(command)
 
-            exit_code = subprocess.call(command, shell=True)
+            exit_code = subprocess.call(command, shell=True, env=self._openssl_env())
 
             if exit_code:
                 raise Exception("Failed to create ca.pem. Exit code {}".format(exit_code))
@@ -62,7 +68,7 @@ class CertificateAuthority:
 
             self.logger.debug(command)
 
-            exit_code = subprocess.call(command, shell=True)
+            exit_code = subprocess.call(command, shell=True, env=self._openssl_env())
 
             if exit_code:
                 raise Exception("Failed to add trust to CA. Exit code {}".format(exit_code))
@@ -70,23 +76,21 @@ class CertificateAuthority:
             use_legacy = not subprocess.call("openssl list -providers", shell=True)
 
             if use_legacy:
-                command = "openssl pkcs12 -legacy -export -in {} -out {} -passout pass:{} -nokeys -caname {}".format(
+                command = "openssl pkcs12 -legacy -export -in {} -out {} -passout env:RAVEN_CA_PASS -nokeys -caname {}".format(
                     os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca-trusted.pem"),
                     os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "truststore-root.p12"),
-                    self.app.config.get("RAVEN_CA_PASSWORD"),
                     self.app.config.get("RAVEN_CA_NAME"),
                 )
             else:
-                command = "openssl pkcs12 -export -in {} -out {} -passout pass:{} -nokeys -caname {}".format(
+                command = "openssl pkcs12 -export -in {} -out {} -passout env:RAVEN_CA_PASS -nokeys -caname {}".format(
                     os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca-trusted.pem"),
                     os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "truststore-root.p12"),
-                    self.app.config.get("RAVEN_CA_PASSWORD"),
                     self.app.config.get("RAVEN_CA_NAME"),
                 )
 
             self.logger.debug(command)
 
-            exit_code = subprocess.call(command, shell=True)
+            exit_code = subprocess.call(command, shell=True, env=self._openssl_env())
 
             if exit_code:
                 raise Exception("Failed to export truststore. Exit code {}".format(exit_code))
@@ -96,18 +100,17 @@ class CertificateAuthority:
             f.write("unique_subject = no")
             f.close()
 
-            command = "cd {} && openssl ca -config {} -gencrl -keyfile {} -passin pass:{} -cert {} -out {}".format(
+            command = "cd {} && openssl ca -config {} -gencrl -keyfile {} -passin env:RAVEN_CA_PASS -cert {} -out {}".format(
                 self.app.config.get("RAVEN_CA_FOLDER"),
                 os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca_config.cfg"),
                 os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca-do-not-share.key"),
-                self.app.config.get("RAVEN_CA_PASSWORD"),
                 os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca.pem"),
                 os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca.crl"),
             )
 
             self.logger.debug(command)
 
-            exit_code = subprocess.call(command, shell=True)
+            exit_code = subprocess.call(command, shell=True, env=self._openssl_env())
 
             if exit_code:
                 raise Exception("Failed to create crl. Exit code {}".format(exit_code))
@@ -135,11 +138,10 @@ class CertificateAuthority:
 
         subject = self.app.config.get("RAVEN_CA_SUBJECT") + "/CN={}".format(common_name)
 
-        command = "openssl req -new -newkey rsa:2048 -sha256 -keyout {} -passout pass:{} -out {} -subj {} -config {}".format(
+        command = "openssl req -new -newkey rsa:2048 -sha256 -keyout {} -passout env:RAVEN_CA_PASS -out {} -subj {} -config {}".format(
             os.path.join(
                 self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".key"
             ),
-            self.app.config.get("RAVEN_CA_PASSWORD"),
             os.path.join(
                 self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".csr"
             ),
@@ -149,7 +151,7 @@ class CertificateAuthority:
 
         self.logger.debug(command)
 
-        exit_code = subprocess.call(command, shell=True)
+        exit_code = subprocess.call(command, shell=True, env=self._openssl_env())
         if exit_code:
             raise Exception("Failed to create csr. Exit code {}".format(exit_code))
 
@@ -167,7 +169,7 @@ class CertificateAuthority:
         use_legacy = not subprocess.call("openssl list -providers", shell=True)
 
         if use_legacy:
-            command = "openssl pkcs12 -legacy -export -in {}.pem -inkey {}.key -out {}.p12 -name {} -CAfile {} -passin pass:{} -passout pass:{}".format(
+            command = "openssl pkcs12 -legacy -export -in {}.pem -inkey {}.key -out {}.p12 -name {} -CAfile {} -passin env:RAVEN_CA_PASS -passout env:RAVEN_CA_PASS".format(
                 os.path.join(
                     self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name
                 ),
@@ -179,11 +181,9 @@ class CertificateAuthority:
                 ),
                 common_name,
                 os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca.pem"),
-                self.app.config.get("RAVEN_CA_PASSWORD"),
-                self.app.config.get("RAVEN_CA_PASSWORD"),
             )
         else:
-            command = "openssl pkcs12 -export -in {}.pem -inkey {}.key -out {}.p12 -name {} -CAfile {} -passin pass:{} -passout pass:{}".format(
+            command = "openssl pkcs12 -export -in {}.pem -inkey {}.key -out {}.p12 -name {} -CAfile {} -passin env:RAVEN_CA_PASS -passout env:RAVEN_CA_PASS".format(
                 os.path.join(
                     self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name
                 ),
@@ -195,13 +195,11 @@ class CertificateAuthority:
                 ),
                 common_name,
                 os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca.pem"),
-                self.app.config.get("RAVEN_CA_PASSWORD"),
-                self.app.config.get("RAVEN_CA_PASSWORD"),
             )
 
         self.logger.debug(command)
 
-        exit_code = subprocess.call(command, shell=True)
+        exit_code = subprocess.call(command, shell=True, env=self._openssl_env())
         if exit_code:
             raise Exception("Failed to export p12 key. Exit code {}".format(exit_code))
 
@@ -212,11 +210,10 @@ class CertificateAuthority:
             0o620,
         )
 
-        command = "openssl rsa -in {} -passin pass:{} -out {}".format(
+        command = "openssl rsa -in {} -passin env:RAVEN_CA_PASS -out {}".format(
             os.path.join(
                 self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".key"
             ),
-            os.path.join(self.app.config.get("RAVEN_CA_PASSWORD")),
             os.path.join(
                 self.app.config.get("RAVEN_CA_FOLDER"),
                 "certs",
@@ -227,7 +224,7 @@ class CertificateAuthority:
 
         self.logger.debug(command)
 
-        exit_code = subprocess.call(command, shell=True)
+        exit_code = subprocess.call(command, shell=True, env=self._openssl_env())
         if exit_code:
             raise Exception("Failed to remove server key password. Exit code {}".format(exit_code))
 
@@ -246,7 +243,7 @@ class CertificateAuthority:
 
             self.logger.debug(command)
 
-            exit_code = subprocess.call(command, shell=True)
+            exit_code = subprocess.call(command, shell=True, env=self._openssl_env())
             if exit_code:
                 raise Exception(
                     "Failed to generate server's public key. Exit code {}".format(exit_code)
@@ -343,7 +340,7 @@ class CertificateAuthority:
             config_file = os.path.join(self.app.config.get("RAVEN_CA_FOLDER"), "ca_config.cfg")
             extensions = "client"
 
-        command = "openssl x509 -sha256 -req -days {} -in {} -CA {} -CAkey {} -out {} -set_serial {} -passin pass:{} -extensions {} -extfile {}{}".format(
+        command = "openssl x509 -sha256 -req -days {} -in {} -CA {} -CAkey {} -out {} -set_serial {} -passin env:RAVEN_CA_PASS -extensions {} -extfile {}{}".format(
             days,
             os.path.join(
                 self.app.config.get("RAVEN_CA_FOLDER"), "certs", common_name, common_name + ".csr"
@@ -358,7 +355,6 @@ class CertificateAuthority:
             # clash likely within a few hundred certs; 63 random bits (positive, as RFC 5280
             # wants) makes it negligible.
             secrets.randbits(63) or 1,
-            self.app.config.get("RAVEN_CA_PASSWORD"),
             extensions,
             config_file,
             " -subj {}".format(shlex.quote(subject)) if subject else "",
@@ -366,7 +362,7 @@ class CertificateAuthority:
 
         self.logger.debug(command)
 
-        exit_code = subprocess.call(command, shell=True)
+        exit_code = subprocess.call(command, shell=True, env=self._openssl_env())
         if exit_code:
             raise Exception("Failed to sign csr. Exit code {}".format(exit_code))
 

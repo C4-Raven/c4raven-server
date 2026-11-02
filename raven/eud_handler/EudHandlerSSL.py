@@ -33,6 +33,9 @@ class EudHandlerSSL(EudHandler):
                 )
                 self.close_connection()
                 return
+            # Make this connection reachable by its cert serial (revocation kick) now that
+            # it's known; the RabbitMQ channel may or may not be open yet
+            self.request_cert_control_queue()
             for c in peer_cert.get("subject", ()):
                 if c[0][0] == "commonName":
                     self.common_name = c[0][1]
