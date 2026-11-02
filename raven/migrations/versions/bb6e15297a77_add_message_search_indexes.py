@@ -4,7 +4,7 @@ Plain (non-concurrent) indexes: on a server with a large cot table the upgrade c
 and blocks CoT inserts while each index builds.
 
 Revision ID: bb6e15297a77
-Revises: d3f1a7c95b20
+Revises: aea6c6b91b37
 Create Date: 2026-11-02 12:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "bb6e15297a77"
-down_revision = "d3f1a7c95b20"
+down_revision = "aea6c6b91b37"
 branch_labels = None
 depends_on = None
 

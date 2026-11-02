@@ -5,7 +5,7 @@ and device_profile_files (files shipped in a profile's data package; the bytes l
 RAVEN_DATA_FOLDER/device_profile_files). The downgrade drops both; stored files are left on disk.
 
 Revision ID: 80f6d534906c
-Revises: d3f1a7c95b20
+Revises: 30dad796cc32
 Create Date: 2026-11-02 12:00:00.000000
 
 """
@@ -15,7 +15,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "80f6d534906c"
-down_revision = "d3f1a7c95b20"
+down_revision = "30dad796cc32"
 branch_labels = None
 depends_on = None
 

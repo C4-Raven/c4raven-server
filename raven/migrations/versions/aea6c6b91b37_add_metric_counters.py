@@ -5,7 +5,7 @@ metric_counters holds the message counters every eud_handler / cot_parser servic
 message rate chart.
 
 Revision ID: aea6c6b91b37
-Revises: d3f1a7c95b20
+Revises: 0dcd4440aa0b
 Create Date: 2026-11-02 12:00:00.000000
 
 """
@@ -15,7 +15,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "aea6c6b91b37"
-down_revision = "d3f1a7c95b20"
+down_revision = "0dcd4440aa0b"
 branch_labels = None
 depends_on = None
 

@@ -6,7 +6,7 @@ removed after the row itself is gone. The old missions.external_data / missions.
 are left alone (the mission JSON falls back to them when a mission has no rows in the new tables).
 
 Revision ID: 30dad796cc32
-Revises: d3f1a7c95b20
+Revises: b0afa9a75b5e
 Create Date: 2026-11-02 12:00:00.000000
 
 """
@@ -16,7 +16,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "30dad796cc32"
-down_revision = "d3f1a7c95b20"
+down_revision = "b0afa9a75b5e"
 branch_labels = None
 depends_on = None
 

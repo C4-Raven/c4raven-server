@@ -4,7 +4,7 @@ Adds retention_settings (raven/retention.py; no rows are seeded, a type without 
 default) and offline_chat_messages (raven/offline_chat.py).
 
 Revision ID: b0afa9a75b5e
-Revises: d3f1a7c95b20
+Revises: bb6e15297a77
 Create Date: 2026-11-02 12:00:00.000000
 
 """
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "b0afa9a75b5e"
-down_revision = "d3f1a7c95b20"
+down_revision = "bb6e15297a77"
 branch_labels = None
 depends_on = None
 
