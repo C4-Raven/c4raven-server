@@ -25,6 +25,7 @@ from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, logger
 from raven.group_isolation import assign_uploader_groups, group_visibility_clause, is_admin
 from raven.functions import format_bytes, iso8601_string_from_datetime
+from raven.mission_export import content_file_path
 from raven.models.DataPackage import DataPackage
 from raven.models.DataPackageRecipient import DataPackageRecipient
 from raven.models.EUD import EUD
@@ -34,32 +35,80 @@ from raven.models.user import User
 data_package_marti_api = Blueprint("data_package_marti_api", __name__)
 
 
-def save_data_package_file(file, filename: str = None, username: str = None, eud_uid: str = None):
-    file_hash = request.args.get("hash")
-    if not file_hash:
-        sha256 = hashlib.sha256()
-        if type(file) == bytes:
-            sha256.update(file)
-            file_hash = sha256.hexdigest()
-            filename, extension = os.path.splitext(secure_filename(filename))
-            with open(os.path.join(app.config.get("UPLOAD_FOLDER"), f"{file_hash}.zip"), "wb") as f:
-                f.write(file)
-        else:
-            sha256.update(file.stream.read())
-            file.stream.seek(0)
-            file_hash = sha256.hexdigest()
-            file.save(os.path.join(app.config.get("UPLOAD_FOLDER"), f"{file_hash}.zip"))
-            filename, extension = os.path.splitext(secure_filename(file.filename))
-            logger.debug("Got file: {} - {}".format(file.filename, file_hash))
-    else:
-        file.save(os.path.join(app.config.get("UPLOAD_FOLDER"), f"{file_hash}.zip"))
-        filename, extension = os.path.splitext(secure_filename(file.filename))
-        logger.debug("Got file: {} - {}".format(file.filename, file_hash))
+class DataPackageUploadError(Exception):
+    """An upload that can't be stored: a ?hash= that doesn't match the bytes, or a package
+    that already exists and isn't the caller's to see. Carries the HTTP status to answer."""
 
-    file_size = os.path.getsize(os.path.join(app.config.get("UPLOAD_FOLDER"), f"{file_hash}.zip"))
-    save_data_package_to_db(
-        f"{filename}.zip", file_hash, "application/x-zip-compressed", file_size, username, eud_uid
-    )
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+    def response(self):
+        return jsonify({"success": False, "error": self.message}), self.status
+
+
+def _uploader(username: str = None) -> User | None:
+    user = app.security.datastore.find_user(username=username) if username else None
+    return user or data_package_caller()
+
+
+def _store_package_bytes(
+    data: bytes, username: str = None, check_client_hash: bool = True
+) -> tuple[str, bool]:
+    """Writes a package zip to UPLOAD_FOLDER/<sha256>.zip. The name on disk is always the sha256
+    of the bytes, computed here: a client-supplied ?hash= is only checked against it, never used
+    as a file name, and an existing package's file is never overwritten.
+
+    Returns (hash, already_exists). Uploading bytes that are already a package is idempotent for
+    a caller who may see that package (ATAK resends packages); for anyone else it's a 409, so the
+    existing package's groups/recipients are never touched by someone outside them."""
+    file_hash = hashlib.sha256(data).hexdigest()
+    client_hash = request.args.get("hash") if check_client_hash else None
+    if client_hash and client_hash.strip().lower() != file_hash:
+        raise DataPackageUploadError(
+            gettext("The hash parameter does not match the uploaded file"), 400
+        )
+
+    existing = db.session.execute(
+        db.select(DataPackage).filter_by(hash=file_hash)
+    ).scalar_one_or_none()
+    if existing is not None and not can_access_data_package(existing, _uploader(username)):
+        raise DataPackageUploadError(
+            gettext("This data package has already been uploaded"), 409
+        )
+
+    upload_folder = app.config.get("UPLOAD_FOLDER")
+    destination = os.path.join(upload_folder, f"{file_hash}.zip")
+    if not os.path.exists(destination):
+        # The bytes match the name, so if a concurrent upload of the same package wins the
+        # race the file is the same either way
+        temp_path = os.path.join(upload_folder, f".upload-{uuid.uuid4().hex}.tmp")
+        with open(temp_path, "wb") as f:
+            f.write(data)
+        os.replace(temp_path, destination)
+    return file_hash, existing is not None
+
+
+def save_data_package_file(file, filename: str = None, username: str = None, eud_uid: str = None):
+    """Stores an uploaded package zip (bytes or a FileStorage) and its data_packages row. Returns
+    its sha256. Raises DataPackageUploadError (see _store_package_bytes)."""
+    if type(file) == bytes:
+        data = file
+        filename, extension = os.path.splitext(secure_filename(filename or ""))
+    else:
+        data = file.stream.read()
+        file.stream.seek(0)
+        filename, extension = os.path.splitext(secure_filename(file.filename or ""))
+    if not filename:
+        filename = uuid.uuid4().hex
+
+    file_hash, exists = _store_package_bytes(data, username)
+    logger.debug("Got file: {} - {}".format(filename, file_hash))
+    if not exists:
+        save_data_package_to_db(
+            f"{filename}.zip", file_hash, "application/x-zip-compressed", len(data), username, eud_uid
+        )
 
     return file_hash
 
@@ -95,8 +144,7 @@ def save_data_package_to_db(
 
         # The uploader: an explicit username, else the web session, else the Marti client
         # cert (ATAK uploads carry no session), else the owner of the uploading EUD
-        uploader = app.security.datastore.find_user(username=username) if username else None
-        uploader = uploader or data_package_caller()
+        uploader = _uploader(username)
         if uploader is None and creator_uid:
             eud = db.session.execute(db.select(EUD).filter_by(uid=creator_uid)).scalar()
             uploader = eud.user if eud else None
@@ -106,62 +154,44 @@ def save_data_package_to_db(
         db.session.add(data_package)
         db.session.commit()
     except sqlalchemy.exc.IntegrityError as e:
+        # Lost a race with a concurrent upload of the same bytes
         db.session.rollback()
         logger.error("Failed to save data package: {}".format(e))
         logger.debug(traceback.format_exc())
-        return (
-            jsonify(
-                {"success": False, "error": gettext("This data package has already been uploaded")}
-            ),
-            400,
+        raise DataPackageUploadError(
+            gettext("This data package has already been uploaded"), 409
         )
 
 
 def create_data_package_zip(file: FileStorage | str) -> str:
+    """Wraps a single non-zip file (a KML, an image...) in a data package zip and stores it.
+    Returns the package's sha256. Raises DataPackageUploadError (see _store_package_bytes)."""
     if isinstance(file, str):
-        logger.info(secure_filename(os.path.basename(file)))
         filename, extension = os.path.splitext(secure_filename(os.path.basename(file)))
-        logger.info(f"Got filename {filename}")
+        with open(file, "rb") as f:
+            file_bytes = f.read()
     else:
-        filename, extension = os.path.splitext(secure_filename(file.filename))
-
-    zipf = zipfile.ZipFile(
-        os.path.join(app.config.get("UPLOAD_FOLDER"), f"{filename}.zip"),
-        "a",
-        zipfile.ZIP_DEFLATED,
-        False,
-    )
+        filename, extension = os.path.splitext(secure_filename(file.filename or ""))
+        file_bytes = file.stream.read()
+        file.stream.seek(0)
+    if not filename:
+        filename = uuid.uuid4().hex
+    entry_name = secure_filename(filename + extension)
 
     # Use the md5 of the uploaded file as its folder name in the data package zip
-    md5 = hashlib.md5()
-    try:
-        md5.update(file.stream.read())
-        file.stream.seek(0)
-    except AttributeError:
-        with open(file, "r") as f:
-            md5.update(f.read().encode())
-
-    md5_hash = md5.hexdigest()
-
-    if isinstance(file, str):
-        with open(file, "r") as f:
-            zipf.writestr(f"{md5_hash}/{secure_filename(filename + extension)}", f.read())
-    else:
-        zipf.writestr(f"{md5_hash}/{secure_filename(filename + extension)}", file.stream.read())
+    md5_hash = hashlib.md5(file_bytes).hexdigest()
 
     # MANIFEST file
     manifest = Element("MissionPackageManifest", {"version": "2"})
     config = SubElement(manifest, "Configuration")
     SubElement(config, "Parameter", {"name": "uid", "value": str(uuid.uuid4())})
-    SubElement(
-        config, "Parameter", {"name": "name", "value": secure_filename(filename + extension)}
-    )
+    SubElement(config, "Parameter", {"name": "name", "value": entry_name})
 
     contents = SubElement(manifest, "Contents")
     content = SubElement(
         contents,
         "Content",
-        {"ignore": "false", "zipEntry": f"{md5_hash}/{secure_filename(filename + extension)}"},
+        {"ignore": "false", "zipEntry": f"{md5_hash}/{entry_name}"},
     )
 
     extension = extension.lower().replace(".", "")
@@ -174,25 +204,21 @@ def create_data_package_zip(file: FileStorage | str) -> str:
         SubElement(content, "Parameter", {"name": "contentType", "value": "KML"})
         SubElement(content, "Parameter", {"name": "visible", "value": "true"})
 
-    zipf.writestr("MANIFEST/manifest.xml", tostring(manifest))
-    zipf.close()
+    # Built in memory from scratch: the zip used to be opened in append mode at a path derived
+    # from the client's file name, so uploading "<someone else's hash>.kml" appended to (and then
+    # renamed away) that package.
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, False) as zipf:
+        zipf.writestr(f"{md5_hash}/{entry_name}", file_bytes)
+        zipf.writestr("MANIFEST/manifest.xml", tostring(manifest))
+    zip_file_bytes = buffer.getvalue()
 
-    # Get the sha256 hash of the data package zip for its file name on disk and for the data_packages table
-    zip_file = open(os.path.join(app.config.get("UPLOAD_FOLDER"), f"{filename}.zip"), "rb")
-    zip_file_bytes = zip_file.read()
-    zip_file.close()
-
-    sha256 = hashlib.sha256()
-    sha256.update(zip_file_bytes)
-    data_package_hash = sha256.hexdigest()
-
-    os.rename(
-        os.path.join(app.config.get("UPLOAD_FOLDER"), f"{filename}.zip"),
-        os.path.join(app.config.get("UPLOAD_FOLDER"), f"{data_package_hash}.zip"),
-    )
-    save_data_package_to_db(
-        f"{filename}.zip", data_package_hash, "application/zip", len(zip_file_bytes)
-    )
+    # A ?hash= would be of the uploaded file, not of the zip built around it
+    data_package_hash, exists = _store_package_bytes(zip_file_bytes, check_client_hash=False)
+    if not exists:
+        save_data_package_to_db(
+            f"{filename}.zip", data_package_hash, "application/zip", len(zip_file_bytes)
+        )
 
     return data_package_hash
 
@@ -291,10 +317,13 @@ def data_package_share():
                 400,
             )
 
-        if extension != "zip":
-            file_hash = create_data_package_zip(file)
-        else:
-            file_hash = save_data_package_file(file)
+        try:
+            if extension != "zip":
+                file_hash = create_data_package_zip(file)
+            else:
+                file_hash = save_data_package_file(file)
+        except DataPackageUploadError as e:
+            return e.response()
 
         metrics.record("raven_data_package_uploads_total")
         url = urlparse(request.url_root)
@@ -463,6 +492,26 @@ def download_data_package():
         )
     elif file and request.method == "HEAD":
         return "", 200
+
+    if isinstance(file[0], MissionContent):
+        # Mission content: only a file whose bytes match the content's hash, see
+        # mission_export.content_file_path. Files in UPLOAD_FOLDER named after a hash used to be
+        # writable by anyone (?hash= on missionupload) and missions/ is keyed by file name.
+        path = content_file_path(file[0])
+        if not path:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": gettext("File not found: %(filename)s}", filename=file[0].filename),
+                    }
+                ),
+                404,
+            )
+        metrics.record("raven_data_package_downloads_total")
+        return send_from_directory(
+            os.path.dirname(path), os.path.basename(path), download_name=file[0].filename
+        )
 
     filename, extension = os.path.splitext(secure_filename(file[0].filename))
     if getattr(file[0], "certificate", None):

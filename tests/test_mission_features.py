@@ -7,7 +7,10 @@ Mission tokens are signed with a throwaway RSA key written where verify_token() 
 """
 
 import datetime
+import hashlib
+import importlib
 import io
+import os
 import time
 import zipfile
 from xml.etree.ElementTree import fromstring
@@ -49,6 +52,9 @@ KML = "{http://www.opengis.net/kml/2.2}"
 MISSION = "op alpha"
 GUID = "5b8f0d3e-0000-4000-8000-000000000001"
 OWNER, SUBSCRIBER, READER = "ANDROID-owner", "ANDROID-sub", "ANDROID-ro"
+PHOTO = b"\xff\xd8photo"
+# Mission content files are only served if their bytes match the content's hash
+PHOTO_HASH = hashlib.sha256(PHOTO).hexdigest()
 
 POINT_COT = (
     '<event version="2.0" uid="marker-1" type="a-u-G" how="h-g-i-g-o" time="2026-11-01T10:00:00Z" '
@@ -195,11 +201,11 @@ def app(tmp_path, monkeypatch):
             )
         )
 
-        (uploads / "abc123.jpg").write_bytes(b"\xff\xd8photo")
+        (uploads / f"{PHOTO_HASH}.jpg").write_bytes(PHOTO)
         content = MissionContent(
             uid="content-1",
             filename="photo.jpg",
-            hash="abc123",
+            hash=PHOTO_HASH,
             mime_type="image/jpeg",
             size=7,
             submission_time=now,
@@ -424,12 +430,12 @@ def test_layers_crud_and_order(app, owner):
     # Items must belong to the mission, and only fit the right layer type
     r = owner.put(base(f"/layers/{markers['uid']}/items"), json={"uids": ["not-in-mission"]})
     assert r.status_code == 404
-    r = owner.put(base(f"/layers/{markers['uid']}/items"), json={"hashes": ["abc123"]})
+    r = owner.put(base(f"/layers/{markers['uid']}/items"), json={"hashes": [PHOTO_HASH]})
     assert r.status_code == 400
     files = create_layer(owner, "Files", "CONTENTS")
-    r = owner.put(base(f"/layers/{files['uid']}/items"), json={"hashes": ["abc123"]})
+    r = owner.put(base(f"/layers/{files['uid']}/items"), json={"hashes": [PHOTO_HASH]})
     assert r.status_code == 200
-    assert r.json["data"]["contents"][0]["data"]["hash"] == "abc123"
+    assert r.json["data"]["contents"][0]["data"]["hash"] == PHOTO_HASH
 
     alpha_node = next(layer for layer in tree(owner) if layer["uid"] == alpha["uid"])
     assert [child["name"] for child in alpha_node["children"]] == ["Markers"]
@@ -641,7 +647,7 @@ def test_web_detail(app, owner):
     assert data["mission"]["name"] == MISSION
     assert "password" not in data["mission"]
     assert {s["clientUid"] for s in data["subscribers"]} == {OWNER, SUBSCRIBER, READER}
-    assert {c["hash"] for c in data["contents"]} == {"abc123", "def456"}
+    assert {c["hash"] for c in data["contents"]} == {PHOTO_HASH, "def456"}
     items = {i["uid"]: i for i in data["items"]}
     assert set(items) == {"marker-1", "shape-1", "bare-1"}
     assert items["marker-1"]["callsign"] == "Rally & Point"
@@ -685,9 +691,10 @@ def test_web_group_visibility(app):
     alice = web_client(app, "alice")
     for path in ("/api/missions/detail", "/api/missions/archive", "/api/missions/kml"):
         assert alice.get(path, query_string={"name": MISSION}).status_code == 404
-    # bob is in no group and sees every mission, as on the mission list
+    # bob is in no group: only missions without groups, not red's
     bob = web_client(app, "bob")
-    assert bob.get("/api/missions/detail", query_string={"name": MISSION}).status_code == 200
+    assert bob.get("/api/missions/detail", query_string={"name": MISSION}).status_code == 404
+    assert bob.get("/api/missions/detail", query_string={"name": "other"}).status_code == 200
 
 
 def test_web_delete_mission_removes_new_rows(app, owner):
@@ -729,3 +736,155 @@ def test_web_delete_mission_removes_new_rows(app, owner):
         assert db.session.query(MissionLayer).count() == 0
         assert db.session.query(MissionExternalData).count() == 0
         assert db.session.query(MissionFeed).count() == 0
+
+
+# --- Authz regressions ---------------------------------------------------------------------------
+
+
+def _add_eud(app, username, uid):
+    from raven.models.EUD import EUD
+
+    with app.app_context():
+        eud = EUD()
+        eud.uid = uid
+        eud.callsign = uid
+        eud.user_id = app.security.datastore.find_user(username=username).id
+        db.session.add(eud)
+        db.session.commit()
+
+
+def _web_status(app, username, name=MISSION):
+    client = web_client(app, username)
+    return {
+        path: client.get(path, query_string={"name": name}).status_code
+        for path in ("/api/missions/detail", "/api/missions/archive", "/api/missions/kml")
+    }
+
+
+@pytest.mark.parametrize("flag", ["password_protected", "invite_only"])
+def test_web_protected_mission_needs_a_subscription(app, flag):
+    with app.app_context():
+        mission = db.session.query(Mission).filter_by(name=MISSION).one()
+        setattr(mission, flag, True)
+        mission.password = "secret"
+        db.session.commit()
+
+    # bob is in no group and not subscribed: used to get every file in the archive
+    assert set(_web_status(app, "bob").values()) == {404}
+    # alice owns the subscribed ANDROID-sub device
+    _add_eud(app, "alice", SUBSCRIBER)
+    assert set(_web_status(app, "alice").values()) == {200}
+    # The creator, without a role row
+    _add_eud(app, "bob", "ANDROID-bob")
+    with app.app_context():
+        db.session.query(Mission).filter_by(name=MISSION).one().creator_uid = "ANDROID-bob"
+        db.session.commit()
+    assert set(_web_status(app, "bob").values()) == {200}
+    assert set(_web_status(app, "admin").values()) == {200}
+
+    # The list still shows it, without its contents, items or change log
+    r = web_client(app, "alice").get("/api/missions", query_string={"per_page": 50})
+    row = next(m for m in r.json["results"] if m["name"] == MISSION)
+    assert row["contents"]
+    with app.app_context():
+        db.session.query(Mission).filter_by(name=MISSION).one().creator_uid = None
+        db.session.commit()
+    r = web_client(app, "bob").get("/api/missions", query_string={"per_page": 50})
+    row = next(m for m in r.json["results"] if m["name"] == MISSION)
+    assert row["passwordProtected"] or row["inviteOnly"]
+    assert row["contents"] == [] and row["uids"] == [] and row["missionChanges"] == []
+    r = web_client(app, "admin").get("/api/missions", query_string={"per_page": 50})
+    assert next(m for m in r.json["results"] if m["name"] == MISSION)["contents"]
+
+
+def test_web_mission_visibility_uses_active_out_memberships(app):
+    with app.app_context():
+        red = Group()
+        red.name, red.type = "red", Group.SYSTEM
+        db.session.add(red)
+        db.session.flush()
+        db.session.add(GroupMission(group_id=red.id, mission_name=MISSION))
+        alice = app.security.datastore.find_user(username="alice")
+        # alice only writes to red
+        db.session.add(GroupUser(user_id=alice.id, group_id=red.id, direction=Group.IN))
+        db.session.commit()
+        red_id, alice_id = red.id, alice.id
+    assert set(_web_status(app, "alice").values()) == {404}
+
+    with app.app_context():
+        out = GroupUser(user_id=alice_id, group_id=red_id, direction=Group.OUT, enabled=False)
+        db.session.add(out)
+        db.session.commit()
+    assert set(_web_status(app, "alice").values()) == {404}  # disabled
+
+    with app.app_context():
+        out = db.session.query(GroupUser).filter_by(direction=Group.OUT).one()
+        out.enabled = True
+        out.expires_at = datetime.datetime(2000, 1, 1)
+        db.session.commit()
+    assert set(_web_status(app, "alice").values()) == {404}  # expired
+
+    with app.app_context():
+        db.session.query(GroupUser).filter_by(direction=Group.OUT).one().expires_at = None
+        db.session.commit()
+    assert set(_web_status(app, "alice").values()) == {200}
+
+
+def test_mission_write_needs_a_role_row(app, owner):
+    # A valid token for a device with no role on the mission (e.g. unsubscribed) used to fall back
+    # to the mission's default role (subscriber, which may add layers)
+    stranger = Marti(app, "ANDROID-stranger")
+    r = stranger.put(base("/layers"), query_string={"name": "x", "type": "GROUP"})
+    assert r.status_code == 403
+    r = stranger.post(base("/externaldata"), json=EXTERNAL)
+    assert r.status_code == 403
+    create_layer(owner, "Allowed")
+
+
+def test_archive_keeps_items_whose_names_sanitise_alike(app, owner):
+    with app.app_context():
+        now = datetime.datetime(2026, 11, 1, 9, 0)
+        for uid in ("a b", "a_b"):
+            db.session.add(
+                CoT(uid=uid, type="a-u-G", how="h-e", timestamp=now, start=now, stale=now,
+                    xml=POINT_COT.replace('uid="marker-1"', f'uid="{uid}"'), mission_name=MISSION)
+            )
+        db.session.commit()
+    archive = zipfile.ZipFile(io.BytesIO(owner.get(base("/archive")).data))
+    names = archive.namelist()
+    assert "a_b/a_b.cot" in names
+    other = hashlib.sha1(b"a_b").hexdigest()
+    assert f"{other}/{other}.cot" in names
+    entries = {
+        content.get("zipEntry")
+        for content in fromstring(archive.read("MANIFEST/manifest.xml")).iter("Content")
+    }
+    assert {"a_b/a_b.cot", f"{other}/{other}.cot"} <= entries
+
+
+def test_archive_and_content_download_only_serve_bytes_matching_the_hash(app, owner, monkeypatch):
+    data_package_marti_api = importlib.import_module(
+        "raven.blueprints.marti_api.data_package_marti_api"
+    )
+    app.register_blueprint(data_package_marti_api.data_package_marti_api)
+    monkeypatch.setattr(data_package_marti_api, "verify_client_cert", lambda: False)
+    uploads = app.config["UPLOAD_FOLDER"]
+    client = app.test_client()
+    r = client.get("/Marti/sync/content", query_string={"hash": PHOTO_HASH})
+    assert r.status_code == 200 and r.data == PHOTO
+
+    # Something else written under the content's hash name (older versions let any upload pick
+    # its file name with ?hash=)
+    with open(os.path.join(uploads, f"{PHOTO_HASH}.jpg"), "wb") as f:
+        f.write(b"tampered")
+    assert client.get("/Marti/sync/content", query_string={"hash": PHOTO_HASH}).status_code == 404
+    names = zipfile.ZipFile(io.BytesIO(owner.get(base("/archive")).data)).namelist()
+    assert "content-1/photo.jpg" not in names
+
+    # The missions/ copy is used when it matches
+    with open(os.path.join(app.config["RAVEN_DATA_FOLDER"], "missions", "photo.jpg"), "wb") as f:
+        f.write(PHOTO)
+    r = client.get("/Marti/sync/content", query_string={"hash": PHOTO_HASH})
+    assert r.status_code == 200 and r.data == PHOTO
+    archive = zipfile.ZipFile(io.BytesIO(owner.get(base("/archive")).data))
+    assert archive.read("content-1/photo.jpg") == PHOTO

@@ -77,43 +77,8 @@ from raven import offline_chat
 from raven.models.OfflineChatMessage import OfflineChatMessage  # noqa: F401
 from raven.models.RetentionSetting import RetentionSetting  # noqa: F401
 from raven.proto import atak_pb2
-
-
-def parse_fileshare(event, sender_uid: str | None):
-    """Pure XML extraction for a b-f-t-r (fileshare) CoT.
-
-    Returns (sha256, fileshare_sender_uid, callsigns, uids) or None when the
-    event is not a fileshare with a hash. Mission dests are ignored and the
-    sender's own uid is dropped so it never gets recorded as a recipient.
-    """
-    if event.attrs.get("type") != "b-f-t-r":
-        return None
-
-    fileshare = event.find("fileshare")
-    if not fileshare:
-        return None
-
-    sha256 = fileshare.attrs.get("sha256")
-    if not sha256:
-        return None
-
-    fileshare_sender_uid = fileshare.attrs.get("senderUid") or None
-
-    callsigns: list[str] = []
-    uids: list[str] = []
-    for dest in event.find_all("dest"):
-        if "mission" in dest.attrs:
-            continue
-        callsign = dest.attrs.get("callsign")
-        dest_uid = dest.attrs.get("uid")
-        if callsign:
-            if callsign not in callsigns:
-                callsigns.append(callsign)
-        elif dest_uid and dest_uid != sender_uid:
-            if dest_uid not in uids:
-                uids.append(dest_uid)
-
-    return sha256, fileshare_sender_uid, callsigns, uids
+from raven import cot_sharing
+from raven.cot_sharing import parse_fileshare  # noqa: F401 (re-exported)
 
 
 class CoTController:
@@ -617,59 +582,18 @@ class CoTController:
         with self.context:
             offline_chat.queue_offline_chat(self.db.session, event, uid, user_id)
 
-    def parse_video(self, event, cot_pk):
-        video = event.find("__video")
-        if video:
-            self.logger.debug("Got video stream")
-            connection_entry = video.find("ConnectionEntry")
-            if not connection_entry:
-                return
-
-            path = connection_entry.attrs["path"]
-            if path.startswith("/"):
-                path = path[1:]
-
-            v = VideoStream()
-            v.network_timeout = connection_entry.attrs["networkTimeout"]
-            v.uid = connection_entry.attrs["uid"]
-            v.path = path
-            v.protocol = connection_entry.attrs["protocol"]
-            v.buffer_time = connection_entry.attrs["bufferTime"]
-            v.port = connection_entry.attrs["port"]
-            v.rover_port = connection_entry.attrs["roverPort"]
-            v.rtsp_reliable = connection_entry.attrs["rtspReliable"]
-            v.ignore_embedded_klv = connection_entry.attrs["ignoreEmbeddedKLV"].lower() == "true"
-            v.alias = connection_entry.attrs["alias"]
-            v.cot_id = cot_pk
-            v.generate_xml(connection_entry.attrs["address"])
-
-            with self.context:
-                try:
-                    self.db.session.add(v)
-                    self.db.session.commit()
-                    self.logger.debug("Added video")
-                except exc.IntegrityError as e:
-                    self.db.session.rollback()
-                    self.db.session.execute(
-                        update(VideoStream)
-                        .where(VideoStream.uid == connection_entry.attrs["uid"])
-                        .values(
-                            network_timeout=connection_entry.attrs["networkTimeout"],
-                            protocol=connection_entry.attrs["protocol"],
-                            buffer_time=connection_entry.attrs["bufferTime"],
-                            # address=connection_entry.attrs['address'],
-                            port=connection_entry.attrs["port"],
-                            rover_port=connection_entry.attrs["roverPort"],
-                            rtsp_reliable=connection_entry.attrs["rtspReliable"],
-                            ignore_embedded_klv=(
-                                connection_entry.attrs["ignoreEmbeddedKLV"].lower() == "true"
-                            ),
-                            alias=connection_entry.attrs["alias"],
-                            xml=v.xml,
-                        )
-                    )
-
-                    self.db.session.commit()
+    def parse_video(self, event, cot_pk, user_id=None):
+        # user_id is the sending connection's user: new feeds get their groups and existing
+        # ones are only changed by someone who can see them (raven/cot_sharing.py)
+        if not event.find("__video"):
+            return
+        with self.context:
+            try:
+                cot_sharing.upsert_cot_video(self.db.session, event, cot_pk, user_id, self.logger)
+            except exc.IntegrityError as e:
+                # A concurrent insert of the same feed
+                self.db.session.rollback()
+                self.logger.warning(f"Failed to save video stream: {e}")
 
     def parse_alert(self, event, uid, point_pk, cot_pk):
         emergency = event.find("emergency")
@@ -1192,68 +1116,17 @@ class CoTController:
                     properties=ttl,
                 )
 
-    def record_fileshare_recipients(self, event, uid: str | None):
+    def record_fileshare_recipients(self, event, uid: str | None, user_id=None):
         """Remember who a private data package was sent to, so downloads of it
-        can be limited to the sender and the addressed recipients."""
-        parsed = parse_fileshare(event, uid)
-        if not parsed:
+        can be limited to the sender and the addressed recipients. Only recorded when the
+        sending connection's user may share the package (raven/cot_sharing.py)."""
+        if not parse_fileshare(event, uid):
             return
-
-        sha256, fileshare_sender_uid, callsigns, uids = parsed
-        if not callsigns and not uids:
-            return
-
         with self.context:
             try:
-                data_package = self.db.session.execute(
-                    self.db.session.query(DataPackage).filter_by(hash=sha256)
-                ).scalar()
-                if not data_package:
-                    # ATAK uploads before sending the CoT, so this should be rare
-                    self.logger.debug(f"No data package with hash {sha256} for fileshare CoT")
-                    return
-
-                # The download authorization relies on creator_uid to identify the sender
-                if not data_package.creator_uid and fileshare_sender_uid:
-                    sender = self.db.session.execute(
-                        self.db.session.query(EUD).filter_by(uid=fileshare_sender_uid)
-                    ).scalar()
-                    if sender:
-                        data_package.creator_uid = fileshare_sender_uid
-
-                recipients: list[tuple[str | None, str | None]] = []
-                for callsign in callsigns:
-                    eud = self.db.session.execute(
-                        self.db.session.query(EUD).filter_by(callsign=callsign)
-                    ).scalar()
-                    recipients.append((eud.uid if eud else None, callsign))
-                for dest_uid in uids:
-                    eud = self.db.session.execute(
-                        self.db.session.query(EUD).filter_by(uid=dest_uid)
-                    ).scalar()
-                    recipients.append((dest_uid, eud.callsign if eud else None))
-
-                now = datetime.now(timezone.utc)
-                for eud_uid, callsign in recipients:
-                    # Query first rather than relying on IntegrityError so one duplicate
-                    # doesn't roll back the other rows in this session
-                    existing = self.db.session.execute(
-                        self.db.session.query(DataPackageRecipient).filter_by(
-                            data_package_hash=sha256, eud_uid=eud_uid, callsign=callsign
-                        )
-                    ).scalar()
-                    if existing:
-                        continue
-                    self.db.session.add(
-                        DataPackageRecipient(
-                            data_package_hash=sha256,
-                            eud_uid=eud_uid,
-                            callsign=callsign,
-                            created_at=now,
-                        )
-                    )
-
-                self.db.session.commit()
+                cot_sharing.record_fileshare_recipients(
+                    self.db.session, event, uid, user_id, self.logger
+                )
             except BaseException as e:
                 self.logger.error(f"Failed to record fileshare recipients: {e}")
                 self.logger.debug(traceback.format_exc())
@@ -1385,14 +1258,14 @@ class CoTController:
                 point_pk = self.parse_point(event, uid, cot_pk)
                 self.parse_geochat(event, cot_pk, point_pk)
                 self.queue_offline_chat(event, uid, body.get("user_id"))
-                self.parse_video(event, cot_pk)
+                self.parse_video(event, cot_pk, body.get("user_id"))
                 self.parse_alert(event, uid, point_pk, cot_pk)
                 self.parse_casevac(event, uid, point_pk, cot_pk)
                 self.parse_marker(event, uid, point_pk, cot_pk)
                 self.parse_rbline(event, uid, point_pk, cot_pk)
                 self.parse_stats(event, uid)
                 self.generate_mission_change(uid, event)
-                self.record_fileshare_recipients(event, uid)
+                self.record_fileshare_recipients(event, uid, body.get("user_id"))
                 self.route_cot(event, uid, body.get("user_id"), body.get("target_groups"))
                 self.rabbit_channel.basic_ack(delivery_tag=basic_deliver.delivery_tag)
                 metrics.inc(

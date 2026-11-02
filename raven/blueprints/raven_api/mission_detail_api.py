@@ -7,6 +7,7 @@ import bleach
 from flask import jsonify, request
 from flask_babel import gettext
 from flask_security import auth_required, current_user
+from sqlalchemy import select
 
 from raven.audit import record_audit_event
 from raven.blueprints.marti_api.mission_data_marti_api import (
@@ -18,27 +19,47 @@ from raven.blueprints.raven_api.mission_api import data_sync_api
 from raven.extensions import db, logger
 from raven.functions import iso8601_string_from_datetime
 from raven.mission_export import latest_mission_cots
-from raven.models.Group import Group
-from raven.models.GroupUser import GroupUser
+from raven.group_isolation import can_see, is_admin
+from raven.models.EUD import EUD
 from raven.models.Mission import Mission
 from raven.models.MissionChange import MissionChange
 from raven.models.MissionLogEntry import MissionLogEntry
+from raven.models.MissionRole import MissionRole
 
 
-def _can_view(mission: Mission) -> bool:
-    """Same rule as the mission list (GET /api/missions): administrators see every mission, other
-    users the missions of the groups they're in, or every mission if they're in none"""
-    if current_user.has_role("administrator"):
+def _can_view(mission: Mission, user=None) -> bool:
+    """Whether `user` (default: the web session's) may open a mission's detail page, archive or
+    KML. Administrators may see every mission. Anyone else needs to:
+
+    * see it by group: an active OUT (read) membership of one of its groups, or the mission has
+      no groups (raven/group_isolation.can_see, the rule data packages and videos follow), and
+    * for a password-protected or invite-only mission, be subscribed (a mission role for one of
+      their devices) or have created it.
+
+    This used to follow the mission list's looser rule (IN memberships, disabled or expired ones
+    included, and a user in no group saw everything), which let anyone without a group download
+    every password-protected mission's files."""
+    user = user if user is not None else current_user
+    if is_admin(user):
         return True
-    group_ids = {
-        row.group_id
-        for row in db.session.execute(
-            db.session.query(GroupUser).filter_by(user_id=current_user.id, direction=Group.IN)
-        ).scalars()
-    }
-    if not group_ids:
+    if not can_see(mission, user):
+        return False
+    if not (mission.password_protected or mission.invite_only):
         return True
-    return any(group.id in group_ids for group in mission.groups)
+
+    eud_uids = select(EUD.uid).where(EUD.user_id == user.id)
+    if mission.creator_uid and db.session.execute(
+        select(EUD.id).where(EUD.user_id == user.id, EUD.uid == mission.creator_uid)
+    ).first():
+        return True
+    return (
+        db.session.execute(
+            select(MissionRole.id).where(
+                MissionRole.mission_name == mission.name, MissionRole.clientUid.in_(eud_uids)
+            )
+        ).first()
+        is not None
+    )
 
 
 def _get_mission():

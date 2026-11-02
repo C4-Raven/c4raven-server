@@ -27,27 +27,29 @@ def thumbnail():
     if not path:
         return jsonify({"success": False, "error": "Please specify a path"}), 400
 
-    video_stream = db.session.query(VideoStream).filter(VideoStream.path == path).first()
-    if video_stream and not can_see(video_stream, current_user):
+    # Normalise before the lookup: "redcam/" or "x/../redcam" used to miss the stream row (so
+    # skip the group check) and still name the same folder on disk
+    path = os.path.normpath(path.strip("/"))
+    if path in ("", ".") or path == ".." or path.startswith("../") or os.path.isabs(path):
+        return jsonify({"success": False, "error": gettext("Please specify a valid path")}), 400
+    if recording is not None and (
+        not recording or recording != os.path.basename(recording) or recording in (".", "..")
+    ):
         return jsonify({"success": False, "error": gettext("Please specify a valid path")}), 400
 
-    if recording and os.path.exists(
-        os.path.join(
-            app.config.get("RAVEN_DATA_FOLDER"), "mediamtx", "recordings", path, recording + ".png"
-        )
-    ):
-        return send_from_directory(
-            os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "mediamtx", "recordings", path),
-            recording + ".png",
-        )
+    # The stream itself and any stream whose recordings folder this is inside of
+    parts = path.split("/")
+    prefixes = ["/".join(parts[: i + 1]) for i in range(len(parts))]
+    for video_stream in db.session.query(VideoStream).filter(VideoStream.path.in_(prefixes)):
+        if not can_see(video_stream, current_user):
+            return jsonify({"success": False, "error": gettext("Please specify a valid path")}), 400
 
-    elif os.path.exists(
-        os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "mediamtx", "recordings", path)
-    ):
-        return send_from_directory(
-            os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "mediamtx", "recordings", path),
-            "thumbnail.png",
-        )
+    folder = os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "mediamtx", "recordings", path)
+    if recording and os.path.exists(os.path.join(folder, recording + ".png")):
+        return send_from_directory(folder, recording + ".png")
+
+    elif os.path.exists(folder):
+        return send_from_directory(folder, "thumbnail.png")
 
     return jsonify({"success": False, "error": gettext("Please specify a valid path")}), 400
 

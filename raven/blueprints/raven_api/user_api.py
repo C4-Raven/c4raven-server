@@ -29,6 +29,7 @@ from raven.audit import record_audit_event
 from raven.group_policy import apply_auto_join
 from raven.models.PendingClearCommand import PendingClearCommand
 from raven.blueprints.marti_api.data_package_marti_api import (
+    DataPackageUploadError,
     create_data_package_zip,
     save_data_package_file,
 )
@@ -900,10 +901,13 @@ def send_file_to_user():
     if data_package:
         data_package = data_package[0]
     else:
-        if extension.lower() != "zip":
-            file_hash = create_data_package_zip(file)
-        else:
-            file_hash = save_data_package_file(file, username=current_user.username)
+        try:
+            if extension.lower() != "zip":
+                file_hash = create_data_package_zip(file)
+            else:
+                file_hash = save_data_package_file(file, username=current_user.username)
+        except DataPackageUploadError as e:
+            return e.response()
 
         data_package = db.session.execute(
             db.session.query(DataPackage).filter_by(hash=file_hash)
