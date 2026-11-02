@@ -345,8 +345,8 @@ def test_data_package_and_video_files_deleted(app, tmp_path):
         db.session.add(DataPackage(filename="new.zip", hash="newhash", submission_time=ago(HOUR), mime_type="application/zip", size=3))
         db.session.add(DataPackage(filename="enroll.zip", hash="enrollhash", submission_time=ago(10 * DAY), mime_type="application/zip", size=3, install_on_enrollment=True))
 
-        rec_dir = tmp_path / "recordings"
-        rec_dir.mkdir()
+        rec_dir = tmp_path / "mediamtx" / "recordings" / "cam"
+        rec_dir.mkdir(parents=True)
         old_seg, new_seg, live_seg = rec_dir / "old.mp4", rec_dir / "new.mp4", rec_dir / "live.mp4"
         for f in (old_seg, new_seg, live_seg):
             f.write_bytes(b"video")
@@ -482,15 +482,19 @@ def test_dm_by_uid_dest_itak(app):
         assert queued()[0].recipient_uid == "IOS-b"
 
 
-def test_no_queue_for_online_recipient(app):
+def test_online_recipient_not_resent_what_it_got_live(app):
+    """A copy is queued for a Connected recipient too (its row can lag a dead connection), but
+    once the device has been heard from well after the message, it isn't resent."""
     with app.app_context():
         add_eud("ANDROID-a", "Alpha", status="Connected")
         add_eud("ANDROID-b", "Bravo", status="Connected")
-        assert offline_chat.queue_offline_chat(db.session, event_of(geochat_xml()), "ANDROID-a") == 0
-        assert queued() == []
+        sent_at = naive(ago(120))
+        assert offline_chat.queue_offline_chat(db.session, event_of(geochat_xml()), "ANDROID-a", now=sent_at) == 1
+        offline_chat.record_rx(db.session, "ANDROID-b", at=naive(ago(60)))
         sent = []
         assert offline_chat.deliver_pending(db.session, "ANDROID-b", sent.append) == 0
         assert sent == []
+        assert all(r.delivered_at is not None for r in queued("ANDROID-b"))
 
 
 def test_not_queued_for_sender_unknown_or_non_tak_devices(app):
@@ -513,8 +517,9 @@ def test_group_chat_queues_each_offline_member(app):
         add_eud("ANDROID-c", "Charlie", status="Connected")
         add_eud("ANDROID-d", "Delta", status="Disconnected")
         xml = geochat_xml(chatroom="Patrol", chat_id="group-uuid", dests=("Bravo", "Charlie", "Delta"), parent="UserGroups")
-        assert offline_chat.queue_offline_chat(db.session, event_of(xml), "ANDROID-a") == 2
-        assert sorted(r.recipient_uid for r in queued()) == ["ANDROID-b", "ANDROID-d"]
+        # Connected members get a copy too, in case their connection is already dead
+        assert offline_chat.queue_offline_chat(db.session, event_of(xml), "ANDROID-a") == 3
+        assert sorted(r.recipient_uid for r in queued()) == ["ANDROID-b", "ANDROID-c", "ANDROID-d"]
 
 
 def test_all_chat_rooms_not_queued(app):
@@ -599,3 +604,370 @@ def test_failed_write_keeps_the_rest_queued(app):
         assert [r.delivered_at is not None for r in queued("ANDROID-b")] == [True, False, False]
         rest = []
         assert offline_chat.deliver_pending(db.session, "ANDROID-b", rest.append) == 2
+
+
+# --- review fixes ---
+
+
+def test_segment_path_outside_recordings_is_never_deleted(app, tmp_path):
+    """segment_path comes from the MediaMTX webhook; the token has leaked before. A forged
+    path (outside the folder, a ../ escape, or a symlink inside pointing out) must not get a
+    file deleted. The row itself still goes."""
+    with app.app_context():
+        secret = tmp_path / "ca" / "ca-do-not-delete.pem"
+        secret.parent.mkdir()
+        secret.write_bytes(b"KEY")
+        rec_dir = tmp_path / "mediamtx" / "recordings" / "cam"
+        rec_dir.mkdir(parents=True)
+        link = rec_dir / "link.mp4"
+        link.symlink_to(secret)
+        for path in (str(secret), str(rec_dir / ".." / ".." / ".." / "ca" / "ca-do-not-delete.pem"), str(link)):
+            db.session.add(VideoRecording(path="cam", segment_path=path, in_progress=False, stop_time=ago(10 * DAY)))
+        db.session.commit()
+        set_keep("video_recordings", DAY)
+        assert retention.apply_retention(only=["video_recordings"])["video_recordings"] == 3
+        assert secret.read_bytes() == b"KEY"
+        assert db.session.query(VideoRecording).count() == 0
+
+
+def test_mediamtx_webhook_refuses_segment_path_outside_recordings(app, tmp_path):
+    from raven.blueprints.raven_api.mediamtx_api import mediamtx_api_blueprint
+
+    app.config["RAVEN_MEDIAMTX_TOKEN"] = "tok"
+    app.register_blueprint(mediamtx_api_blueprint)
+    client = app.test_client()
+    inside = str(tmp_path / "mediamtx" / "recordings" / "cam" / "2026-11-03_10-00-00-000000.mp4")
+    for event in ("segment_record", "segment_record_complete"):
+        for bad in (str(tmp_path / "ca" / "ca.pem"), inside.replace("/cam/", "/../../../ca/"), "relative.mp4", ""):
+            r = client.get("/api/mediamtx/webhook", query_string={"token": "tok", "event": event, "segment_path": bad, "path": "cam"})
+            assert r.status_code == 400, (event, bad)
+    r = client.get("/api/mediamtx/webhook", query_string={"token": "tok", "event": "segment_record", "segment_path": inside, "path": "cam"})
+    assert r.status_code == 200
+    with app.app_context():
+        assert [v.segment_path for v in db.session.query(VideoRecording)] == [inside]
+
+
+def test_recording_delete_endpoint_stays_in_recordings_folder(app, tmp_path):
+    from raven.blueprints.raven_api.video_api import video_api_blueprint
+
+    app.register_blueprint(video_api_blueprint)
+    secret = tmp_path / "secret.pem"
+    secret.write_bytes(b"KEY")
+    rec_dir = tmp_path / "mediamtx" / "recordings" / "cam"
+    rec_dir.mkdir(parents=True)
+    good = rec_dir / "good.mp4"
+    good.write_bytes(b"video")
+    with app.app_context():
+        bad_row = VideoRecording(path="cam", segment_path=str(secret), in_progress=False)
+        good_row = VideoRecording(path="cam", segment_path=str(good), in_progress=False)
+        db.session.add_all([bad_row, good_row])
+        db.session.commit()
+        bad_id, good_id = bad_row.id, good_row.id
+    admin = login(app, "admin")
+    # Not served either
+    assert admin.get("/api/videos/recording", query_string={"id": bad_id}).status_code == 404
+    assert admin.delete("/api/videos/recording", query_string={"id": bad_id}).status_code == 200
+    assert secret.read_bytes() == b"KEY"
+    assert admin.delete("/api/videos/recording", query_string={"id": good_id}).status_code == 200
+    assert not good.exists()
+
+
+def test_uid_takeover_does_not_get_backlog(app):
+    with app.app_context():
+        add_eud("ANDROID-a", "Alpha", status="Connected", username="alice")
+        add_eud("ANDROID-b", "Bravo", status="Disconnected", username="bob")
+        offline_chat.queue_offline_chat(db.session, event_of(geochat_xml(message_id="secret")), "ANDROID-a")
+        assert queued("ANDROID-b")[0].recipient_user_id == user_id("bob")
+        sent = []
+        # Unauthenticated connection claiming the uid, or another user's
+        assert offline_chat.deliver_pending(db.session, "ANDROID-b", sent.append) == 0
+        assert offline_chat.deliver_pending(db.session, "ANDROID-b", sent.append, user_id=user_id("alice")) == 0
+        assert sent == [] and queued("ANDROID-b")[0].delivered_at is None
+        # The device's own user gets it
+        assert offline_chat.deliver_pending(db.session, "ANDROID-b", sent.append, user_id=user_id("bob")) == 1
+
+
+def _ops_groups():
+    cyan = Team(name="Cyan")
+    db.session.add(cyan)
+    ops = Group()
+    ops.name, ops.type, ops.bitpos = "ops", "SYSTEM", 2
+    db.session.add(ops)
+    db.session.commit()
+    return cyan, ops
+
+
+def test_team_chat_readership_rechecked_at_delivery(app):
+    with app.app_context():
+        cyan, ops = _ops_groups()
+        alice, bob = user_id("alice"), user_id("bob")
+        db.session.add_all([
+            GroupUser(user_id=alice, group_id=ops.id, direction=Group.IN, enabled=True),
+            GroupUser(user_id=bob, group_id=ops.id, direction=Group.OUT, enabled=True),
+        ])
+        db.session.commit()
+        add_eud("ANDROID-a", "Alpha", status="Connected", username="alice", team=cyan)
+        add_eud("ANDROID-b", "Bravo", status="Disconnected", username="bob", team=cyan)
+        xml = geochat_xml(chatroom="Cyan", chat_id="Cyan", dests=(), parent="TeamGroups")
+        assert offline_chat.queue_offline_chat(db.session, event_of(xml), "ANDROID-a", alice) == 1
+
+        # Bob lost read access to ops while offline
+        db.session.query(GroupUser).filter_by(user_id=bob).update({"enabled": False})
+        db.session.commit()
+        sent = []
+        assert offline_chat.deliver_pending(db.session, "ANDROID-b", sent.append, user_id=bob) == 0
+        db.session.query(GroupUser).filter_by(user_id=bob).update({"enabled": True})
+        db.session.commit()
+        assert offline_chat.deliver_pending(db.session, "ANDROID-b", sent.append, user_id=bob) == 1
+
+
+def test_federated_team_chat_uses_target_groups(app):
+    with app.app_context():
+        cyan, ops = _ops_groups()
+        bob, carol = user_id("bob"), user_id("carol")
+        db.session.add(GroupUser(user_id=bob, group_id=ops.id, direction=Group.OUT, enabled=True))
+        db.session.commit()
+        add_eud("FED-x", "Xray", status="Connected", team=cyan)
+        add_eud("ANDROID-b", "Bravo", status="Disconnected", username="bob", team=cyan)
+        add_eud("ANDROID-c", "Charlie", status="Disconnected", username="carol", team=cyan)
+        xml = geochat_xml(sender_uid="FED-x", chatroom="Cyan", chat_id="Cyan", dests=(), parent="TeamGroups")
+        # Unknown group: the live routing reaches nobody, so nothing is queued
+        assert offline_chat.queue_offline_chat(db.session, event_of(xml), "FED-x", None, target_groups=["nope"]) == 0
+        # Without target_groups the (group-less) sender would have been __ANON__ -> carol
+        assert offline_chat.queue_offline_chat(db.session, event_of(xml), "FED-x", None, target_groups=["ops"]) == 1
+        assert [r.recipient_uid for r in queued()] == ["ANDROID-b"]
+
+
+def test_cot_parser_passes_target_groups():
+    import inspect
+
+    from raven.cot_parser import cot_parser
+
+    source = inspect.getsource(cot_parser)
+    assert 'self.queue_offline_chat(\n                    event, uid, body.get("user_id"), body.get("target_groups")' in source
+
+
+def test_revoking_a_cert_drops_the_devices_queue(app, monkeypatch):
+    from raven import cert_revocation
+    from raven.blueprints.raven_api import certificate_api
+    from raven.models.Certificate import Certificate
+
+    monkeypatch.setattr(cert_revocation, "revoke", lambda *a, **k: [])
+    monkeypatch.setattr(cert_revocation, "kick_revoked_sessions", lambda *a, **k: True)
+    with app.app_context():
+        add_eud("ANDROID-a", "Alpha", status="Connected")
+        add_eud("ANDROID-b", "Bravo", status="Disconnected", username="bob")
+        add_eud("ANDROID-c", "Charlie", status="Disconnected")
+        xml = geochat_xml(dests=("Bravo", "Charlie"), chatroom="Patrol", chat_id="g", parent="UserGroups")
+        assert offline_chat.queue_offline_chat(db.session, event_of(xml), "ANDROID-a") == 2
+        cert = Certificate(
+            common_name="bob", eud_uid="ANDROID-b", username="bob", serial_number="0A",
+            expiration_date=naive(now_utc()), server_address="x", server_port=8089,
+            truststore_filename="t", user_cert_filename="u", cert_password="p",
+        )
+        db.session.add(cert)
+        db.session.commit()
+        cert_id = cert.id
+    with app.test_request_context():
+        certificate_api.revoke_certificates([db.session.get(Certificate, cert_id)], "keyCompromise", "admin")
+        assert [r.recipient_uid for r in queued()] == ["ANDROID-c"]
+
+
+def test_message_in_the_still_connected_window_is_delivered(app):
+    """The recipient's row says Connected but its connection already died (last heard from
+    before the message was sent): the message is queued anyway and delivered on reconnect."""
+    with app.app_context():
+        add_eud("ANDROID-a", "Alpha", status="Connected")
+        add_eud("ANDROID-b", "Bravo", status="Connected")
+        offline_chat.record_rx(db.session, "ANDROID-b", at=naive(ago(20)))
+        assert offline_chat.queue_offline_chat(db.session, event_of(geochat_xml(message_id="lost")), "ANDROID-a") == 1
+        # ...and so is one sent just before the last receive (in flight), within the grace
+        offline_chat.queue_offline_chat(db.session, event_of(geochat_xml(message_id="edge")), "ANDROID-a", now=naive(ago(22)))
+        # One well before was delivered live
+        offline_chat.queue_offline_chat(db.session, event_of(geochat_xml(message_id="live")), "ANDROID-a", now=naive(ago(60)))
+        sent = []
+        assert offline_chat.deliver_pending(db.session, "ANDROID-b", sent.append) == 2
+        assert [event_of(s.decode()).attrs["uid"].rsplit(".", 1)[1] for s in sent] == ["edge", "lost"]
+        assert all(r.delivered_at is not None for r in queued("ANDROID-b"))
+
+
+def test_retention_job_settles_what_connected_devices_got_live(app):
+    with app.app_context():
+        add_eud("ANDROID-a", "Alpha", status="Connected")
+        add_eud("ANDROID-b", "Bravo", status="Connected")
+        add_eud("ANDROID-c", "Charlie", status="Disconnected")
+        add_eud("ANDROID-d", "Delta", status="Connected")
+        xml = geochat_xml(dests=("Bravo", "Charlie", "Delta"), chatroom="Patrol", chat_id="g", parent="UserGroups")
+        offline_chat.queue_offline_chat(db.session, event_of(xml), "ANDROID-a", now=naive(ago(300)))
+        offline_chat.record_rx(db.session, "ANDROID-b", at=naive(ago(10)))  # heard from long after
+        offline_chat.record_rx(db.session, "ANDROID-c", at=naive(ago(10)))  # but disconnected now
+        offline_chat.record_rx(db.session, "ANDROID-d", at=naive(ago(290)))  # only 10 s after
+        retention.apply_retention(only=["offline_chat"])
+        state = {r.recipient_uid: r.delivered_at is not None for r in queued()}
+        assert state == {"ANDROID-b": True, "ANDROID-c": False, "ANDROID-d": False}
+
+
+def _bare_handler(app, uid=None):
+    from raven.eud_handler.EudHandler import EudHandler
+
+    handler = object.__new__(EudHandler)
+    handler.app = app
+    handler.uid = uid
+    handler.user = None
+    handler.is_ssl = False
+    handler.callsign = None
+    handler.phone_number = None
+    handler.bound_queues = []
+    handler.group_memberships = []
+    handler.consumer_tags = []
+    handler.conn_token = "tok"
+    return handler
+
+
+def test_eud_handler_records_last_rx_throttled(app):
+    with app.app_context():
+        add_eud("ANDROID-b", "Bravo", status="Connected")
+    handler = _bare_handler(app, "ANDROID-b")
+    handler.note_rx()
+    with app.app_context():
+        first = db.session.query(EUD).filter_by(uid="ANDROID-b").one().last_rx_at
+        assert first is not None
+        db.session.query(EUD).filter_by(uid="ANDROID-b").update({"last_rx_at": None})
+        db.session.commit()
+    handler.note_rx()  # within LAST_RX_WRITE_INTERVAL: no write
+    with app.app_context():
+        assert db.session.query(EUD).filter_by(uid="ANDROID-b").one().last_rx_at is None
+    handler.last_rx_write -= offline_chat.LAST_RX_WRITE_INTERVAL + 1
+    handler.note_rx()
+    with app.app_context():
+        assert db.session.query(EUD).filter_by(uid="ANDROID-b").one().last_rx_at is not None
+
+    # A broken database never breaks the receive path
+    broken = _bare_handler(app, "ANDROID-b")
+    broken.app = None
+    broken.note_rx()
+
+
+def test_backlog_delivered_before_live_queues_are_consumed(app):
+    class FakeChannel:
+        is_open = True
+
+        def __init__(self, log):
+            self.log = log
+
+        def basic_consume(self, queue, **kwargs):
+            self.log.append(("consume", queue))
+            return queue
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    with app.app_context():
+        add_eud("ANDROID-a", "Alpha", status="Connected")
+        add_eud("ANDROID-b", "Bravo", status="Disconnected")
+        offline_chat.queue_offline_chat(db.session, event_of(geochat_xml(message_id="m")), "ANDROID-a")
+    log = []
+    handler = _bare_handler(app)
+    handler.rabbit_channel = FakeChannel(log)
+    handler._send = lambda data: log.append(("send", event_of(data.decode()).attrs["uid"]))
+    sa = event_of(
+        '<event version="2.0" uid="ANDROID-b" type="a-f-G-U-C" how="m-g" time="2026-11-03T10:00:00Z" '
+        'start="2026-11-03T10:00:00Z" stale="2026-11-03T10:05:00Z"><point lat="0" lon="0" hae="0" ce="1" le="1"/>'
+        '<detail><contact callsign="Bravo"/><takv platform="ATAK-CIV" version="5.6" device="x" os="34"/></detail></event>'
+    )
+    handler.parse_device_info(sa)
+    sends = [i for i, entry in enumerate(log) if entry[0] == "send"]
+    consumes = [i for i, entry in enumerate(log) if entry == ("consume", "Bravo")]
+    assert len(sends) == 1 and consumes and sends[0] < consumes[0]
+
+
+def test_device_clock_rows_are_neither_kept_forever_nor_purged_fresh(app):
+    with app.app_context():
+        add_eud("ANDROID-a", "Alpha")
+        future = datetime.datetime(2099, 1, 1, tzinfo=UTC)
+        epoch = datetime.datetime(1970, 1, 1, tzinfo=UTC)
+        # Received first, dated 2099; then a normal old row; then a fresh 1970 row
+        rows = [EUDStats(eud_uid="ANDROID-a", timestamp=t) for t in (future, ago(10 * DAY), epoch)]
+        db.session.add_all(rows)
+        db.session.commit()
+        ids = [r.id for r in rows]
+        set_keep("eud_stats", DAY)
+        retention.apply_retention(only=["eud_stats"])
+        # The 2099 row was received before a row that is now past the cutoff, so it goes; the
+        # 1970 row was received after it and is kept for now
+        assert [r.id for r in db.session.query(EUDStats)] == [ids[2]]
+        # Next run: nothing plausible aged out after it, so it is still kept
+        retention.apply_retention(only=["eud_stats"])
+        assert db.session.query(EUDStats).count() == 1
+        # A later row aging out takes it along
+        db.session.add(EUDStats(eud_uid="ANDROID-a", timestamp=ago(10 * DAY)))
+        db.session.commit()
+        retention.apply_retention(only=["eud_stats"])
+        assert db.session.query(EUDStats).count() == 0
+
+        # Chat has a string primary key; it is aged by its CoT id
+        db.session.add(GeoChat(uid="future", chatroom_id="r", sender_uid="ANDROID-a", remarks="x", timestamp=future, point_id=0, cot_id=1))
+        db.session.add(GeoChat(uid="old", chatroom_id="r", sender_uid="ANDROID-a", remarks="x", timestamp=ago(10 * DAY), point_id=0, cot_id=2))
+        db.session.add(GeoChat(uid="fresh-1970", chatroom_id="r", sender_uid="ANDROID-a", remarks="x", timestamp=epoch, point_id=0, cot_id=3))
+        db.session.commit()
+        set_keep("geochat", DAY)
+        retention.apply_retention(only=["geochat"])
+        assert [g.uid for g in db.session.query(GeoChat)] == ["fresh-1970"]
+
+
+def test_retention_indexes_exist(app):
+    import importlib.util
+
+    from sqlalchemy import inspect as sa_inspect
+
+    path = os.path.join(
+        os.path.dirname(retention.__file__), "migrations", "versions",
+        "5c2e8a91d4b7_offline_chat_entitlement_and_retention_indexes.py",
+    )
+    spec = importlib.util.spec_from_file_location("retention_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    assert migration.down_revision == "06e1c612e122"
+    with app.app_context():
+        inspector = sa_inspect(db.engine)
+        for table, name, columns in migration.INDEXES:
+            indexes = {i["name"]: i["column_names"] for i in inspector.get_indexes(table)}
+            assert indexes.get(name) == columns, (table, name)
+        assert "last_rx_at" in {c["name"] for c in inspector.get_columns("euds")}
+        cols = {c["name"] for c in inspector.get_columns("offline_chat_messages")}
+        assert {"recipient_user_id", "read_groups"} <= cols
+
+
+def test_mission_data_survives_retention(app):
+    from raven.models.Mission import Mission
+    from raven.models.MissionChange import MissionChange
+    from raven.models.MissionUID import MissionUID
+
+    with app.app_context():
+        add_eud("ANDROID-a", "Alpha")
+        old = ago(10 * DAY)
+        db.session.add(Mission(name="ops"))
+        db.session.add(MissionUID(uid="in-mission", mission_name="ops"))
+        db.session.add(MissionUID(uid="was-in-mission", mission_name=None))
+        for uid in ("in-mission", "was-in-mission", "plain"):
+            db.session.add(CoT(uid=uid, type="a-f-G", sender_uid="ANDROID-a", timestamp=old, start=old, stale=old, xml="<event/>"))
+
+        def change(change_type, mission_uid):
+            c = MissionChange(change_type=change_type, mission_name="ops", mission_uid=mission_uid, isFederatedChange=False,
+                              timestamp=old, server_time=old, creator_uid="ANDROID-a")
+            db.session.add(c)
+            db.session.flush()
+            return c.id
+
+        first_add = change(MissionChange.ADD_CONTENT, "in-mission")
+        latest_add = change(MissionChange.ADD_CONTENT, "in-mission")
+        edit = change(MissionChange.CHANGE, "in-mission")
+        gone_add = change(MissionChange.ADD_CONTENT, "was-in-mission")
+        db.session.commit()
+
+        set_keep("cot", DAY)
+        set_keep("mission_changes", DAY)
+        retention.apply_retention(only=["cot", "mission_changes"])
+        assert sorted(c.uid for c in db.session.query(CoT)) == ["in-mission"]
+        assert [c.id for c in db.session.query(MissionChange)] == [latest_add]
+        assert not {first_add, edit, gone_add} & {c.id for c in db.session.query(MissionChange)}

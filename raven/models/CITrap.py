@@ -21,7 +21,9 @@ class CITrap(db.Model):
     user_description: Mapped[str] = mapped_column(String(255), nullable=True)
     date_time: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     date_time_description: Mapped[str] = mapped_column(String(255), nullable=True)
-    point_id: Mapped[int] = mapped_column(Integer, ForeignKey("points.id", ondelete="CASCADE"))
+    point_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("points.id", ondelete="CASCADE"), index=True
+    )
     location_description: Mapped[str] = mapped_column(String(255), nullable=True)
     event_scale: Mapped[str] = mapped_column(String(255), nullable=True)
     importance: Mapped[str] = mapped_column(String(255), nullable=True)

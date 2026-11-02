@@ -609,13 +609,16 @@ class CoTController:
                         except exc.IntegrityError:
                             self.db.session.rollback()
 
-    def queue_offline_chat(self, event, uid, user_id):
-        # Keep a copy of chat messages for addressed devices that are offline right now, to be
-        # delivered when they reconnect (raven/offline_chat.py)
+    def queue_offline_chat(self, event, uid, user_id, target_groups=None):
+        # Keep a copy of chat messages for the addressed devices, to be delivered if they
+        # missed the live copy (raven/offline_chat.py). Federated-in team chat is addressed
+        # by target_groups, as in route_cot.
         if not uid or not event.find("__chat"):
             return
         with self.context:
-            offline_chat.queue_offline_chat(self.db.session, event, uid, user_id)
+            offline_chat.queue_offline_chat(
+                self.db.session, event, uid, user_id, target_groups=target_groups
+            )
 
     def parse_video(self, event, cot_pk):
         video = event.find("__video")
@@ -1384,7 +1387,9 @@ class CoTController:
                 cot_pk = self.insert_cot(soup, event, uid)
                 point_pk = self.parse_point(event, uid, cot_pk)
                 self.parse_geochat(event, cot_pk, point_pk)
-                self.queue_offline_chat(event, uid, body.get("user_id"))
+                self.queue_offline_chat(
+                    event, uid, body.get("user_id"), body.get("target_groups")
+                )
                 self.parse_video(event, cot_pk)
                 self.parse_alert(event, uid, point_pk, cot_pk)
                 self.parse_casevac(event, uid, point_pk, cot_pk)

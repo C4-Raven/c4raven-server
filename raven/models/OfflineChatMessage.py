@@ -32,5 +32,11 @@ class OfflineChatMessage(db.Model):
     # The GeoChat event uid, so the same message is only queued once per device
     message_uid: Mapped[str] = mapped_column(String(255), nullable=False)
     xml: Mapped[str] = mapped_column(Text, nullable=False)
+    # The user the recipient device belonged to when the message was queued. When set, only a
+    # connection authenticated as this user gets the message.
+    recipient_user_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    # Team chat only: JSON list of the group ids that may read it ([] for __ANON__), re-checked
+    # against the connecting user at delivery. NULL for messages addressed with <dest>.
+    read_groups: Mapped[str] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     delivered_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)

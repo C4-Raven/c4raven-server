@@ -15,6 +15,7 @@ from raven.extensions import db, logger
 from raven.group_isolation import AUDIT_CATEGORY, can_see, filter_by_groups, resolve_group_names
 from raven.models.VideoRecording import VideoRecording
 from raven.models.VideoStream import VideoStream
+from raven.recordings import contained_recording_path
 
 video_api_blueprint = Blueprint("video_api_blueprint", __name__)
 
@@ -96,10 +97,19 @@ def download_recording():
             return jsonify({"success": False, "error": gettext("Recording not found")}), 404
 
         if request.method == "GET":
-            filename = pathlib.Path(recording.segment_path)
+            segment_path = contained_recording_path(recording.segment_path)
+            if not segment_path:
+                return jsonify({"success": False, "error": gettext("Recording not found")}), 404
+            filename = pathlib.Path(segment_path)
             return send_from_directory(filename.parent, filename.name)
         elif request.method == "DELETE":
-            os.remove(recording.segment_path)
+            # segment_path came from the MediaMTX webhook: never delete outside the
+            # recordings folder
+            segment_path = contained_recording_path(recording.segment_path)
+            if segment_path and os.path.isfile(segment_path):
+                os.remove(segment_path)
+            elif recording.segment_path:
+                logger.warning(f"Not deleting recording file {recording.segment_path!r}")
             db.session.delete(recording)
             db.session.commit()
             return jsonify({"success": True})

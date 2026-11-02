@@ -22,7 +22,7 @@ from flask import jsonify, request
 from flask_babel import gettext
 from flask_security import current_user, roles_accepted
 
-from raven import cert_revocation
+from raven import cert_revocation, offline_chat
 from raven.audit import record_audit_event
 from raven.blueprints.raven_api.user_api import _protected_user_response
 from raven.certificate_authority import CertificateAuthority
@@ -174,6 +174,7 @@ def revoke_certificates(certs, reason, actor, note=None):
 
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     serials = {c.serial_number for c in revocable}
+    revoked_euds = {c.eud_uid for c in revocable}
     # Any other (legacy, colliding) row with the same serial is revoked by the same CRL entry
     for cert in (
         db.session.query(Certificate)
@@ -182,7 +183,10 @@ def revoke_certificates(certs, reason, actor, note=None):
     ):
         cert.revoked_at = now
         cert.revocation_reason = reason
+        revoked_euds.add(cert.eud_uid)
     db.session.commit()
+    # Chat queued for the device must not go to whoever connects with its uid next
+    offline_chat.drop_queue(db.session, revoked_euds)
 
     disconnected = cert_revocation.kick_revoked_sessions(app, serials, logger)
 

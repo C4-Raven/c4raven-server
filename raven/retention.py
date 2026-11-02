@@ -18,6 +18,18 @@ Cutoffs: almost every timestamp column is written from timezone-aware UTC dateti
 (datetime_from_iso8601_string, datetime.now(timezone.utc)), so those are compared with an aware
 UTC cutoff, which Postgres converts the same way it converted the writes. Columns written as
 naive UTC (audit_events, offline_chat_messages) get a naive UTC cutoff.
+
+Device clocks: CoT, position, chat, alert, CasEvac, R&B line and device statistics times are the
+device's own CoT times, and there is no server receive time to use instead. A device with a
+broken clock must neither keep its rows forever (dated 2099) nor lose fresh rows on the next run
+(dated 1970). So a row whose time is implausible -- before 2000, more than a day in the future,
+or missing -- is aged by receive order instead (see _aged): it goes once a row with a plausible
+time that was received after it (a higher id) is itself past the cutoff. Mission change logs
+are aged by their server_time where they have one.
+
+Mission data: CoTs that are Data Sync mission content (cot.mission_name, or a uid in
+mission_uids that belongs to a mission) are never purged, and the latest ADD_CONTENT change of
+every item still in a mission is kept so the mission's change log still says how it got there.
 """
 
 import os
@@ -33,6 +45,9 @@ from sqlalchemy import and_, delete, func, or_, select, text, union
 from raven.extensions import db, logger
 
 OFFLINE_CHAT = "offline_chat"
+# Device times before this, or more than FUTURE_SLACK ahead of now, are not believed
+EARLIEST_PLAUSIBLE = datetime(2000, 1, 1, tzinfo=timezone.utc)
+FUTURE_SLACK = timedelta(days=1)
 BATCH_SIZE = 1000
 MAX_SECONDS_PER_TYPE = 120
 MIN_KEEP_SECONDS = 3600
@@ -139,6 +154,27 @@ def _not_null_ids(column):
     return select(column).where(column.is_not(None))
 
 
+def _aged(column, order, cutoff, now):
+    """Where clause for rows past the cutoff by a device-supplied time column. Rows with an
+    implausible or missing time are aged by receive order (order: an increasing id) instead:
+    they go once a row with a plausible time and a higher id is past the cutoff. The boundary
+    is worked out once, before anything is deleted, since deleting changes it."""
+    plausible_old = and_(column >= EARLIEST_PLAUSIBLE, column < cutoff)
+    boundary = db.session.execute(select(func.max(order)).where(plausible_old)).scalar()
+    if boundary is None:
+        return plausible_old
+    implausible = or_(
+        column.is_(None), column < EARLIEST_PLAUSIBLE, column > now + FUTURE_SLACK
+    )
+    return or_(plausible_old, and_(implausible, order < boundary))
+
+
+def _mission_cot_uids():
+    from raven.models.MissionUID import MissionUID
+
+    return select(MissionUID.uid).where(MissionUID.mission_name.is_not(None))
+
+
 # --- CoT and positions ---
 
 
@@ -160,11 +196,11 @@ def _referenced_point_ids():
     )
 
 
-def _purge_cot(cutoff, cutoff_naive, deadline):
+def _purge_cot(cutoff, cutoff_naive, deadline, now):
     """Old CoT history and positions. Rows that something kept is still built on are left
     alone: the current CoT/point of a marker, alert, CasEvac, chat message, R&B line or video
     stream (deleting those CoTs would cascade into them), and CoTs that are Data Sync mission
-    content."""
+    content (by mission_name, or by a uid that is in a mission)."""
     from raven.models.Alert import Alert
     from raven.models.CasEvac import CasEvac
     from raven.models.CoT import CoT
@@ -178,7 +214,9 @@ def _purge_cot(cutoff, cutoff_naive, deadline):
     deleted = _delete_in_batches(
         Point,
         Point.id,
-        and_(Point.timestamp < cutoff, Point.id.not_in(referenced_points)),
+        and_(
+            _aged(Point.timestamp, Point.id, cutoff, now), Point.id.not_in(referenced_points)
+        ),
         deadline,
     )
 
@@ -197,8 +235,9 @@ def _purge_cot(cutoff, cutoff_naive, deadline):
         CoT,
         CoT.id,
         and_(
-            CoT.timestamp < cutoff,
+            _aged(CoT.timestamp, CoT.id, cutoff, now),
             CoT.mission_name.is_(None),
+            or_(CoT.uid.is_(None), CoT.uid.not_in(_mission_cot_uids())),
             CoT.id.not_in(referenced_cots),
         ),
         deadline,
@@ -215,14 +254,21 @@ def _count_cot():
 # --- simple tables ---
 
 
-def _simple(model_path, column_name, naive=False):
-    def purge(cutoff, cutoff_naive, deadline):
+def _simple(model_path, column_name, naive=False, device_time=False, order_name=None):
+    """Purge by one time column. naive: written as naive UTC by the server. device_time: the
+    device's own time, aged with _aged (order_name: the increasing column to age implausible
+    times by, the primary key by default)."""
+
+    def purge(cutoff, cutoff_naive, deadline, now):
         model = _model(model_path)
         column = getattr(model, column_name)
         pk = model.__mapper__.primary_key[0]
-        return _delete_in_batches(
-            model, pk, column < (cutoff_naive if naive else cutoff), deadline
-        )
+        if device_time:
+            order = getattr(model, order_name) if order_name else pk
+            where = _aged(column, order, cutoff, now)
+        else:
+            where = column < (cutoff_naive if naive else cutoff)
+        return _delete_in_batches(model, pk, where, deadline)
 
     return purge
 
@@ -245,7 +291,7 @@ def _model(path):
 # --- markers and R&B lines ---
 
 
-def _purge_markers(cutoff, cutoff_naive, deadline):
+def _purge_markers(cutoff, cutoff_naive, deadline, now):
     """Markers whose latest CoT is older than the cutoff (Marker.production_time is a string,
     so the CoT's timestamp is used instead), and old range & bearing lines."""
     from raven.models.CoT import CoT
@@ -255,10 +301,12 @@ def _purge_markers(cutoff, cutoff_naive, deadline):
     deleted = _delete_in_batches(
         Marker,
         Marker.id,
-        Marker.cot_id.in_(select(CoT.id).where(CoT.timestamp < cutoff)),
+        Marker.cot_id.in_(select(CoT.id).where(_aged(CoT.timestamp, CoT.id, cutoff, now))),
         deadline,
     )
-    deleted += _delete_in_batches(RBLine, RBLine.id, RBLine.timestamp < cutoff, deadline)
+    deleted += _delete_in_batches(
+        RBLine, RBLine.id, _aged(RBLine.timestamp, RBLine.id, cutoff, now), deadline
+    )
     return deleted
 
 
@@ -279,7 +327,7 @@ def _data_package_path(file_hash):
     return os.path.join(app.config.get("UPLOAD_FOLDER"), f"{file_hash}.zip")
 
 
-def _purge_data_packages(cutoff, cutoff_naive, deadline):
+def _purge_data_packages(cutoff, cutoff_naive, deadline, now):
     """Old uploaded data packages and their .zip files. Packages an admin set to install on
     enrollment or connection, and enrollment packages tied to a certificate, are kept."""
     from raven.models.Certificate import Certificate
@@ -325,17 +373,29 @@ def _data_package_bytes():
 # --- video recordings ---
 
 
-def _purge_video_recordings(cutoff, cutoff_naive, deadline):
-    """Finished recordings older than the cutoff, with their segment file and thumbnail."""
+def _purge_video_recordings(cutoff, cutoff_naive, deadline, now):
+    """Finished recordings older than the cutoff, with their segment file and thumbnail.
+    segment_path comes from the MediaMTX webhook, so a file is only removed if it resolves to
+    somewhere inside the recordings folder; the row of one that doesn't is still deleted."""
     from raven.models.VideoRecording import VideoRecording
+    from raven.recordings import contained_recording_path
 
     def files(ids):
         paths = []
         for segment in db.session.execute(
             select(VideoRecording.segment_path).where(VideoRecording.id.in_(ids))
         ).scalars():
-            if segment:
-                paths += [segment, segment + ".png"]
+            if not segment:
+                continue
+            for candidate in (segment, segment + ".png"):
+                resolved = contained_recording_path(candidate)
+                if resolved:
+                    paths.append(resolved)
+                elif candidate == segment:
+                    logger.warning(
+                        f"Data retention: not deleting {segment!r}, it is outside the "
+                        "recordings folder"
+                    )
         return paths
 
     return _delete_in_batches(
@@ -356,6 +416,53 @@ def _video_bytes():
     return (
         db.session.execute(select(func.coalesce(func.sum(VideoRecording.file_size), 0))).scalar()
         or 0
+    )
+
+
+# --- mission change logs ---
+
+
+def _purge_mission_changes(cutoff, cutoff_naive, deadline, now):
+    """Old mission change log entries, aged by server_time (timestamp for rows without one).
+    The latest ADD_CONTENT change of each item still in a mission is kept."""
+    from raven.models.MissionChange import MissionChange
+    from raven.models.MissionContent import MissionContent
+    from raven.models.MissionContentMission import MissionContentMission
+    from raven.models.MissionUID import MissionUID
+
+    added = MissionChange.change_type == MissionChange.ADD_CONTENT
+    still_in_mission_content = (
+        select(func.max(MissionChange.id))
+        .join(MissionContent, MissionContent.uid == MissionChange.content_uid)
+        .join(
+            MissionContentMission,
+            and_(
+                MissionContentMission.mission_content_id == MissionContent.id,
+                MissionContentMission.mission_name == MissionChange.mission_name,
+            ),
+        )
+        .where(added)
+        .group_by(MissionChange.mission_name, MissionChange.content_uid)
+    )
+    still_in_mission_uids = (
+        select(func.max(MissionChange.id))
+        .join(
+            MissionUID,
+            and_(
+                MissionUID.uid == MissionChange.mission_uid,
+                MissionUID.mission_name == MissionChange.mission_name,
+            ),
+        )
+        .where(added)
+        .group_by(MissionChange.mission_name, MissionChange.mission_uid)
+    )
+    keep = union(still_in_mission_content, still_in_mission_uids)
+    when = func.coalesce(MissionChange.server_time, MissionChange.timestamp)
+    return _delete_in_batches(
+        MissionChange,
+        MissionChange.id,
+        and_(_aged(when, MissionChange.id, cutoff, now), MissionChange.id.not_in(keep)),
+        deadline,
     )
 
 
@@ -402,7 +509,7 @@ def _log_files():
     return count, total
 
 
-def _purge_error_logs(cutoff, cutoff_naive, deadline):
+def _purge_error_logs(cutoff, cutoff_naive, deadline, now):
     deleted = 0
     for path, mtime, _ in _rotated_log_files():
         if mtime < cutoff.timestamp():
@@ -432,7 +539,7 @@ DATA_TYPES = [
         "GeoChat messages and direct messages stored on the server.",
         None,
         _simple_count("raven.models.GeoChat:GeoChat"),
-        _simple("raven.models.GeoChat:GeoChat", "timestamp"),
+        _simple("raven.models.GeoChat:GeoChat", "timestamp", device_time=True, order_name="cot_id"),
         tables=("geochat",),
     ),
     DataType(
@@ -441,7 +548,7 @@ DATA_TYPES = [
         "Emergency alerts (911, ring the bell, in contact...).",
         None,
         _simple_count("raven.models.Alert:Alert"),
-        _simple("raven.models.Alert:Alert", "start_time"),
+        _simple("raven.models.Alert:Alert", "start_time", device_time=True),
         tables=("alerts",),
     ),
     DataType(
@@ -450,7 +557,7 @@ DATA_TYPES = [
         "9-line MEDEVAC requests.",
         None,
         _simple_count("raven.models.CasEvac:CasEvac"),
-        _simple("raven.models.CasEvac:CasEvac", "timestamp"),
+        _simple("raven.models.CasEvac:CasEvac", "timestamp", device_time=True),
         tables=("casevac",),
     ),
     DataType(
@@ -490,7 +597,7 @@ DATA_TYPES = [
         "Battery, memory and network statistics reported by devices.",
         None,
         _simple_count("raven.models.EUDStats:EUDStats", "eud_stats"),
-        _simple("raven.models.EUDStats:EUDStats", "timestamp"),
+        _simple("raven.models.EUDStats:EUDStats", "timestamp", device_time=True),
         tables=("eud_stats",),
     ),
     DataType(
@@ -516,10 +623,11 @@ DATA_TYPES = [
     DataType(
         "mission_changes",
         "Mission change logs",
-        "The change history of Data Sync missions.",
+        "The change history of Data Sync missions. The change that added each item still in a "
+        "mission is kept.",
         None,
         _simple_count("raven.models.MissionChange:MissionChange"),
-        _simple("raven.models.MissionChange:MissionChange", "timestamp"),
+        _purge_mission_changes,
         tables=("mission_changes",),
     ),
     DataType(
@@ -667,6 +775,16 @@ def apply_retention(now: datetime | None = None, only: list[str] | None = None):
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     results = {}
+    if not only or OFFLINE_CHAT in only:
+        # Whatever the offline chat retention, stop holding messages connected devices
+        # demonstrably got live (raven/offline_chat.py)
+        try:
+            from raven import offline_chat
+
+            offline_chat.settle_live_deliveries(db.session, now)
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Data retention: could not settle offline chat deliveries: {e}")
     for data_type in DATA_TYPES:
         if only and data_type.key not in only:
             continue
@@ -679,7 +797,7 @@ def apply_retention(now: datetime | None = None, only: list[str] | None = None):
         error = None
         deleted = 0
         try:
-            deleted = data_type.purge(cutoff, cutoff_naive, deadline)
+            deleted = data_type.purge(cutoff, cutoff_naive, deadline, now)
         except Exception as e:
             db.session.rollback()
             error = str(e)[:2000]

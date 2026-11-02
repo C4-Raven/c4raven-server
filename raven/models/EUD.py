@@ -35,6 +35,10 @@ class EUD(db.Model):
     # Federation Hub provenance id of the peer server this device was
     # federated in from, or NULL for a device enrolled on this server.
     federated_from: Mapped[str] = mapped_column(String(255), nullable=True)
+    # When the server last received data from the device (naive UTC). Written by EudHandler at
+    # most every 30 seconds per connection; raven/offline_chat.py uses it to tell which queued
+    # chat a device got live.
+    last_rx_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     points = relationship("Point", cascade="all, delete-orphan", back_populates="eud")
     cots = relationship("CoT", cascade="all, delete-orphan", back_populates="eud")
     casevacs = relationship("CasEvac", cascade="all, delete-orphan", back_populates="eud")

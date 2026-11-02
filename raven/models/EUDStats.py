@@ -16,7 +16,7 @@ class EUDStats(db.Model):
     __tablename__ = "eud_stats"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    timestamp: Mapped[DateTime] = mapped_column(DateTime, nullable=True)
+    timestamp: Mapped[DateTime] = mapped_column(DateTime, nullable=True, index=True)
     eud_uid: Mapped[str] = mapped_column(
         String(255), ForeignKey("euds.uid", ondelete="CASCADE"), nullable=False
     )

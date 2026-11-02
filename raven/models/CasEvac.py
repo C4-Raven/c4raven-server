@@ -61,7 +61,7 @@ class CasEvac(db.Model):
     zone_prot_selection: Mapped[int] = mapped_column(Integer, nullable=True)
     urgent_surgical: Mapped[str] = mapped_column(String(255), nullable=True)
     point_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("points.id", ondelete="CASCADE"), nullable=True
+        Integer, ForeignKey("points.id", ondelete="CASCADE"), nullable=True, index=True
     )
     cot_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("cot.id", ondelete="CASCADE"), nullable=True
