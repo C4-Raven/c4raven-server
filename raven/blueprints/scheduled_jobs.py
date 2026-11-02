@@ -264,6 +264,19 @@ def expire_group_memberships():
             logger.error(f"Failed to expire group memberships: {e}")
 
 
+def record_metrics_sample():
+    # Snapshots the message counter totals once a minute for the Dashboard's rate chart
+    # (raven.metrics.take_sample), keeping the last 24 hours.
+    from raven.metrics import take_sample
+
+    with apscheduler.app.app_context():
+        try:
+            take_sample(db.session)
+        except BaseException as e:
+            db.session.rollback()
+            logger.error(f"Failed to record a metrics sample: {e}")
+
+
 # Kept so a stale job row/config entry that still references this old function name doesn't
 # fail to load. (The ADS-B and AIS feed jobs that replaced it have since been removed.)
 def get_airplanes_live_data():
