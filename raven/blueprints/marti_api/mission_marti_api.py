@@ -1990,7 +1990,8 @@ def mission_changes(mission_name: str = None, mission_guid: str = None):
         db.session.query(MissionChange).filter_by(mission_name=mission_name)
     ).all()
     for change in changes:
-        response["data"].append(change[0].to_json())
+        if not change[0].hidden_from_marti():
+            response["data"].append(change[0].to_json())
 
     return jsonify(response)
 
@@ -2860,7 +2861,9 @@ def add_content(mission_name):
         {
             "version": "3",
             "type": "MissionChange",
-            "data": [change[0].to_json() for change in all_changes],
+            "data": [
+                change[0].to_json() for change in all_changes if not change[0].hidden_from_marti()
+            ],
             "nodeId": app.config.get("RAVEN_NODE_ID"),
         }
     )
@@ -2902,16 +2905,6 @@ def get_mission_cots(mission_name: str = None, mission_guid: str = None):
     )
 
 
-@mission_marti_api.route("/Marti/api/missions/<mission_name>/layers")
-@mission_marti_api.route("/Marti/api/missions/guid/<mission_guid>/layers")
-def get_mission_layers(mission_name: str = None, mission_guid: str = None):
-    # Map layers aren't implemented; answer the way TAK Server does for a mission without any
-    # (an empty MissionLayer envelope) -- the empty body we used to return is a JSON parse error
-    return jsonify(
-        {
-            "version": "3",
-            "type": "MissionLayer",
-            "data": [],
-            "nodeId": app.config.get("RAVEN_NODE_ID"),
-        }
-    )
+# Archive/KML export, layers, external data and feeds live in their own module but register on this
+# blueprint; imported last because it uses the helpers above.
+from raven.blueprints.marti_api import mission_data_marti_api  # noqa: E402,F401
