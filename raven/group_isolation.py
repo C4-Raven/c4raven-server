@@ -99,6 +99,26 @@ def can_see(item, user) -> bool:
     return any(group.id in readable for group in item.groups)
 
 
+def can_publish(item, user) -> bool:
+    """Whether `user` may publish (replace the video of) the existing stream `item`.
+
+    Administrators and the stream's owner may. Otherwise it takes an IN (write) membership
+    of one of the stream's groups -- the direction the stream's data flows into the server
+    through -- and a stream with neither an owner nor groups is open to any user.
+    """
+    if item is None or user is None or getattr(user, "id", None) is None:
+        return False
+    if is_admin(user):
+        return True
+    owner = getattr(item, "username", None)
+    if owner and owner == user.username:
+        return True
+    if not item.groups:
+        return not owner
+    writable = set(db.session.execute(_membership_group_ids(user, Group.IN)).scalars())
+    return any(group.id in writable for group in item.groups)
+
+
 def resolve_group_names(names) -> tuple[list[Group], list[str]]:
     """Looks up groups by name. Returns (groups, names that don't exist)."""
     groups, missing = [], []

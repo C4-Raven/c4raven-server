@@ -1,4 +1,5 @@
 import datetime
+import hmac
 import json
 import os
 import shlex
@@ -7,7 +8,7 @@ import subprocess
 import sys
 import traceback
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import bleach
 import requests
@@ -23,9 +24,10 @@ from flask_security.utils import parse_auth_token
 from sqlalchemy import update
 from werkzeug.datastructures import ImmutableMultiDict
 
+from raven import stream_tokens
 from raven.extensions import db, ldap_manager, logger
 from raven.forms.MediaMTXPathConfig import MediaMTXPathConfig
-from raven.group_isolation import assign_uploader_groups, can_see
+from raven.group_isolation import assign_uploader_groups, can_publish, can_see, is_admin
 from raven.models.VideoRecording import VideoRecording
 from raven.models.VideoStream import VideoStream
 
@@ -66,9 +68,9 @@ def start_web_copy(path: str, rtsp_port) -> str | None:
     codec"), so the stream never plays in a browser.
 
     For such a stream, starts an ffmpeg process that copies the video (and audio, if any) out of
-    the wrapper, without re-encoding, to <path>_raven_web on the same server. Publishing from
-    127.0.0.1 is whitelisted in external_auth and RTSP reads are open, so it needs no
-    credentials. ffmpeg exits by itself when the source stops.
+    the wrapper, without re-encoding, to <path>_raven_web on the same server. ffmpeg reads and
+    publishes with RAVEN_MEDIAMTX_TOKEN, which external_auth accepts for any path (a grouped
+    stream isn't open to anonymous RTSP readers). ffmpeg exits by itself when the source stops.
 
     :return: The web copy's path, or None if the stream doesn't need one or ffmpeg didn't start
     """
@@ -87,11 +89,12 @@ def start_web_copy(path: str, rtsp_port) -> str | None:
 
     port = int(rtsp_port or 8554)
     web_path = path + WEB_COPY_SUFFIX
+    token = "?token={}".format(app.config.get("RAVEN_MEDIAMTX_TOKEN"))
     command = [
         "ffmpeg", "-nostdin", "-loglevel", "error",
-        "-rtsp_transport", "tcp", "-i", f"rtsp://127.0.0.1:{port}/{path}",
+        "-rtsp_transport", "tcp", "-i", f"rtsp://127.0.0.1:{port}/{path}{token}",
         "-map", "0:v", "-map", "0:a?", "-c", "copy",
-        "-f", "rtsp", "-rtsp_transport", "tcp", f"rtsp://127.0.0.1:{port}/{web_path}",
+        "-f", "rtsp", "-rtsp_transport", "tcp", f"rtsp://127.0.0.1:{port}/{web_path}{token}",
     ]
     try:
         subprocess.Popen(
@@ -255,7 +258,11 @@ def mediamtx_webhook():
             try:
                 (
                     FFmpeg()
-                    .input(video_stream.to_json()["rtsp_link"] + "?token={}".format(token))
+                    .input(
+                        "rtsp://127.0.0.1:{}/{}?token={}".format(
+                            video_stream.port or 8554, video_stream.path, token
+                        )
+                    )
                     .option("y")
                     .output(
                         os.path.join(
@@ -552,7 +559,162 @@ def delete_stream():
         return "", 200
 
 
-# This is mainly for mediamtx authentication
+# The rest of this file is MediaMTX authentication (its authHTTPAddress webhook).
+#
+# Every request MediaMTX makes here is judged against the stream at its path, by who's asking:
+#
+# * RAVEN_MEDIAMTX_TOKEN in the query (?token=) is Raven itself -- its thumbnail grabs and
+#   ffmpeg web copies -- and may do anything.
+# * A user is identified by a Flask-Security token in the query (?jwt=, the web UI and the
+#   Marti video list), a username/password (RTSP/RTMP credentials), or, for watching only, a
+#   signed per-path stream token (?st=, see raven/stream_tokens.py).
+# * Anyone else is anonymous.
+#
+# Watching (read/playback) a stream that belongs to groups needs a user who can see it by
+# group (raven/group_isolation.py). Other streams stay as they were: any user may watch them
+# and anonymous RTSP readers may too, since TAK clients send no credentials.
+#
+# Publishing needs a user. A new path is theirs (the stream is registered with their groups);
+# an existing stream needs its owner, an IN member of one of its groups or an administrator.
+
+
+def _stream_for_path(path: str) -> VideoStream | None:
+    """The VideoStream a MediaMTX path plays. A web copy (<path>_raven_web, see start_web_copy)
+    belongs to the stream it copies."""
+    if path.endswith(WEB_COPY_SUFFIX):
+        source = (
+            db.session.query(VideoStream)
+            .filter(VideoStream.path == path[: -len(WEB_COPY_SUFFIX)])
+            .first()
+        )
+        if source:
+            return source
+    return db.session.query(VideoStream).filter(VideoStream.path == path).first()
+
+
+def _runs_on_server(stream: VideoStream) -> bool:
+    """Whether MediaMTX itself starts this stream's publisher (e.g. the yt-dlp ffmpeg command
+    add_update_stream sets as runOnDemand), which publishes from 127.0.0.1 without credentials."""
+    try:
+        settings = json.loads(stream.mediamtx_settings or "{}")
+    except ValueError:
+        return False
+    return bool(settings.get("runOnDemand") or settings.get("runOnInit"))
+
+
+def _user_from_jwt(token: str):
+    """The active user a Flask-Security auth token belongs to, the same checks Flask-Security's
+    own token loader makes, or None."""
+    datastore = app.security.datastore
+    try:
+        tdata = parse_auth_token(token)
+        if hasattr(datastore.user_model, "fs_token_uniquifier"):
+            user = datastore.find_user(fs_token_uniquifier=tdata["uid"])
+        else:
+            user = datastore.find_user(fs_uniquifier=tdata["uid"])
+    except BaseException as e:
+        logger.error(f"Invalid token: {e}")
+        return None
+    if user and user.active and user.verify_auth_token(tdata):
+        return user
+    return None
+
+
+def _user_from_password(username: str, password: str):
+    """The active user these credentials log in, or None."""
+    if not username or not password:
+        return None
+
+    if app.config.get("RAVEN_ENABLE_LDAP"):
+        result = ldap_manager.authenticate(username, password)
+        if result.status != AuthenticationResponseStatus.success:
+            return None
+        # Keep this import here to avoid a circular import when Raven is started
+        from raven.blueprints.raven_api.ldap_api import save_user
+
+        user = save_user(result.user_dn, result.user_id, result.user_info, result.user_groups)
+    else:
+        user = app.security.datastore.find_user(username=username)
+        if not user or not user.password or not verify_password(password, user.password):
+            return None
+
+    return user if user and user.active else None
+
+
+def _user_from_stream_token(token: str, stream: VideoStream):
+    user_id = stream_tokens.verify_token(token, stream.path)
+    if user_id is None:
+        return None
+    user = app.security.datastore.find_user(id=user_id)
+    return user if user and user.active else None
+
+
+def _register_published_stream(user, path: str, body: dict):
+    """Adds the stream `user` is starting to publish on a new path to Raven and MediaMTX,
+    tagged with their groups."""
+    logger.debug("Publish {}".format(path))
+    v = VideoStream()
+    v.uid = bleach.clean(body.get("id")) if body.get("id") else None
+    v.rover_port = -1
+    v.ignore_embedded_klv = False
+    v.buffer_time = None
+    v.network_timeout = 10000
+    v.protocol = bleach.clean(str(body.get("protocol") or ""))
+    v.path = path
+    v.alias = v.path.split("/")[-1]
+    v.username = user.username
+    assign_uploader_groups(v, user)
+    path_config = MediaMTXPathConfig(None).serialize()
+    path_config["sourceOnDemand"] = False
+    v.mediamtx_settings = json.dumps(path_config)
+
+    # `port` is the port TAK clients use to *view* the stream over
+    # RTSP -- MediaMTX always re-serves every ingested stream over
+    # RTSP on its one fixed port (rtspAddress in mediamtx.yml, 8554
+    # by default) regardless of what protocol it was published with,
+    # same as the "init"/"ready" webhook handlers above already
+    # assume. An RTMP publish previously got 1935 (its own ingest
+    # port) here instead, which isn't an RTSP port at all -- WinTAK
+    # would fail with a fatal media error trying to open it.
+    if v.protocol == "rtsp":
+        v.port = 8554
+        v.rtsp_reliable = 1
+    elif v.protocol == "rtmp":
+        v.port = 8554
+        v.rtsp_reliable = 1
+    else:
+        v.rtsp_reliable = 0
+
+    v.generate_xml(body.get("ip"))
+
+    try:
+        db.session.add(v)
+        db.session.commit()
+        settings = path_config
+        logger.debug("Inserted video stream {}".format(v.uid))
+    except sqlalchemy.exc.IntegrityError:
+        # Registered meanwhile by a concurrent request: just make sure MediaMTX has it
+        db.session.rollback()
+        video = db.session.query(VideoStream).filter(VideoStream.path == path).first()
+        settings = json.loads(video.mediamtx_settings) if video else path_config
+
+    try:
+        r = requests.post(
+            "{}/v3/config/paths/add/{}".format(app.config.get("RAVEN_MEDIAMTX_API_ADDRESS"), path),
+            json=settings,
+        )
+        if r.status_code == 200:
+            logger.debug("Added path {} to mediamtx".format(path))
+        else:
+            logger.error(
+                "Failed to add path {} to mediamtx. Status code {} {}".format(
+                    path, r.status_code, r.text
+                )
+            )
+    except BaseException:
+        logger.error(traceback.format_exc())
+
+
 @mediamtx_api_blueprint.route("/api/external_auth", methods=["POST"])
 def external_auth():
     # This route is meant to be called only by MediaMTX itself (its
@@ -568,12 +730,29 @@ def external_auth():
     if request.headers.get("X-Forwarded-For"):
         return "", 401
 
-    username = bleach.clean(request.json.get("user"))
-    password = bleach.clean(request.json.get("password"))
-    action = bleach.clean(request.json.get("action"))
-    query = bleach.clean(request.json.get("query"))
-    ip = bleach.clean(request.json.get("ip"))
-    protocol = bleach.clean(request.json.get("protocol"))
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action") or "")
+    protocol = str(body.get("protocol") or "")
+    ip = str(body.get("ip") or "")
+    path = str(body.get("path") or "").strip("/")
+    # The query of the URL the client opened (rtsp://, the HLS/WebRTC page via nginx, ...)
+    query = dict(parse_qsl(str(body.get("query") or ""), keep_blank_values=True))
+
+    def allow():
+        return "", 200
+
+    def deny():
+        logger.debug(f"external_auth denied {action} {protocol} {path} from {ip}")
+        return "", 401
+
+    # Raven itself (thumbnails, web copies)
+    server_token = str(app.config.get("RAVEN_MEDIAMTX_TOKEN") or "")
+    if server_token and hmac.compare_digest(
+        query.get("token", "").encode(), server_token.encode()
+    ):
+        return allow()
+
+    stream = _stream_for_path(path)
 
     # Whitelist 127.0.0.1 to make things like YouTube video re-streaming work
     # (a local ffmpeg process publishing into MediaMTX on the server's own
@@ -582,148 +761,48 @@ def external_auth():
     # HLS/WebRTC *read* proxied through nginx (i.e. every real viewer) would
     # match this too and skip the jwt/token check entirely, making a video's
     # plain URL viewable by anyone who can reach the domain, logged in or
-    # not.
-    if action == "publish" and ip and ip in app.config.get("RAVEN_IP_WHITELIST"):
-        return "", 200
+    # not. nginx's RTSPS/RTMPS proxies arrive from 127.0.0.1 as well, so a
+    # grouped stream only takes an uncredentialed local publisher when
+    # MediaMTX runs that publisher itself.
+    if (
+        action == "publish"
+        and ip
+        and ip in app.config.get("RAVEN_IP_WHITELIST")
+        and (stream is None or not stream.groups or _runs_on_server(stream))
+    ):
+        return allow()
 
-    # ATAK/WinTAK video feeds are plain <feed> XML (see VideoStream.generate_xml)
-    # with no username/password fields at all, so a TAK client's RTSP DESCRIBE
-    # never carries credentials -- it would always hit the 401 fallback below.
-    # Publishing still goes through the same webhook with action=publish, so
-    # this only opens up *watching* an existing feed over RTSP, not creating
-    # one; HLS/WebRTC reads keep requiring the jwt/token query param below.
-    if action == "read" and protocol == "rtsp":
-        return "", 200
+    user = None
+    if query.get("jwt"):
+        user = _user_from_jwt(query["jwt"])
+    if user is None:
+        user = _user_from_password(str(body.get("user") or ""), str(body.get("password") or ""))
+    if user is None and action in ("read", "playback") and stream and query.get(
+        stream_tokens.PARAM
+    ):
+        user = _user_from_stream_token(query[stream_tokens.PARAM], stream)
 
-    # Token auth to prevent high CPU usage when reading HLS streams
-    if "jwt" in query or "token" in query:
-        query = query.split("&")
-        for q in query:
-            if "=" not in q:
-                continue
-            key, value = q.split("=")
-            if key == "jwt":
-                try:
-                    parse_auth_token(value)
-                    return "", 200
-                except BaseException as e:
-                    logger.error(f"Invalid token: {e}")
-                    return "", 401
-            elif key == "token":
-                if value == app.config.get("RAVEN_MEDIAMTX_TOKEN"):
-                    return "", 200
-                else:
-                    return "", 401
+    if action in ("read", "playback"):
+        if stream is not None and stream.groups:
+            return allow() if user is not None and can_see(stream, user) else deny()
+        if user is not None:
+            return allow()
+        # ATAK/WinTAK video feeds are plain <feed> XML (see VideoStream.generate_xml)
+        # with no username/password fields at all, so a TAK client's RTSP DESCRIBE
+        # never carries credentials. HLS/WebRTC reads keep requiring a jwt or token.
+        return allow() if action == "read" and protocol == "rtsp" else deny()
 
-    auth_success = False
+    if action == "publish":
+        if user is None:
+            return deny()
+        if stream is None:
+            # Web copy paths are Raven's own
+            if path.endswith(WEB_COPY_SUFFIX) and not is_admin(user):
+                return deny()
+            _register_published_stream(user, path, body)
+            logger.debug("external_auth returning 200")
+            return allow()
+        return allow() if can_publish(stream, user) else deny()
 
-    # LDAP Auth
-    if app.config.get("RAVEN_ENABLE_LDAP"):
-        result = ldap_manager.authenticate(username, password)
-        if result.status == AuthenticationResponseStatus.success:
-            # Keep this import here to avoid a circular import when Raven is started
-            from raven.blueprints.raven_api.ldap_api import save_user
-
-            save_user(result.user_dn, result.user_id, result.user_info, result.user_groups)
-            auth_success = True
-        else:
-            return "", 401
-    # Flask-Security auth
-    else:
-        user = app.security.datastore.find_user(username=username)
-        if not user:
-            return "", 401
-        if not verify_password(password, user.password):
-            return "", 401
-        auth_success = True
-
-    if auth_success:
-        if action == "publish":
-            logger.debug("Publish {}".format(request.json.get("path")))
-            v = VideoStream()
-            v.uid = bleach.clean(request.json.get("id")) if request.json.get("id") else None
-            v.rover_port = -1
-            v.ignore_embedded_klv = False
-            v.buffer_time = None
-            v.network_timeout = 10000
-            v.protocol = bleach.clean(request.json.get("protocol"))
-            v.path = bleach.clean(request.json.get("path"))
-            v.alias = v.path.split("/")[-1]
-            v.username = bleach.clean(request.json.get("user"))
-            assign_uploader_groups(v, app.security.datastore.find_user(username=v.username))
-            path_config = MediaMTXPathConfig(None).serialize()
-            path_config["sourceOnDemand"] = False
-            v.mediamtx_settings = json.dumps(path_config)
-
-            # `port` is the port TAK clients use to *view* the stream over
-            # RTSP -- MediaMTX always re-serves every ingested stream over
-            # RTSP on its one fixed port (rtspAddress in mediamtx.yml, 8554
-            # by default) regardless of what protocol it was published with,
-            # same as the "init"/"ready" webhook handlers above already
-            # assume. An RTMP publish previously got 1935 (its own ingest
-            # port) here instead, which isn't an RTSP port at all -- WinTAK
-            # would fail with a fatal media error trying to open it.
-            if v.protocol == "rtsp":
-                v.port = 8554
-                v.rtsp_reliable = 1
-            elif v.protocol == "rtmp":
-                v.port = 8554
-                v.rtsp_reliable = 1
-            else:
-                v.rtsp_reliable = 0
-
-            v.generate_xml(request.json.get("ip"))
-
-            with app.app_context():
-                try:
-
-                    db.session.add(v)
-                    db.session.commit()
-                    r = requests.post(
-                        "{}/v3/config/paths/add/{}".format(
-                            app.config.get("RAVEN_MEDIAMTX_API_ADDRESS"), v.path
-                        ),
-                        json=path_config,
-                    )
-                    if r.status_code == 200:
-                        logger.debug("Added path {} to mediamtx".format(v.path))
-                    else:
-                        logger.error(
-                            "Failed to add path {} to mediamtx. Status code {} {}".format(
-                                v.path, r.status_code, r.text
-                            )
-                        )
-                    logger.debug("Inserted video stream {}".format(v.uid))
-                except sqlalchemy.exc.IntegrityError as e:
-                    try:
-                        db.session.rollback()
-                        video = (
-                            db.session.query(VideoStream).filter(VideoStream.path == v.path).first()
-                        )
-                        r = requests.post(
-                            "{}/v3/config/paths/add/{}".format(
-                                app.config.get("RAVEN_MEDIAMTX_API_ADDRESS"), v.path
-                            ),
-                            json=json.loads(video.mediamtx_settings),
-                        )
-                        if r.status_code == 200:
-                            logger.debug("Added path {} to mediamtx".format(v.path))
-                        else:
-                            logger.error(
-                                "Failed to add path {} to mediamtx. Status code {} {}".format(
-                                    v.path, r.status_code, r.text
-                                )
-                            )
-                    except:
-                        logger.error(traceback.format_exc())
-
-        logger.debug("external_auth returning 200")
-        return "", 200
-    elif query:
-        for arg in query.split("&"):
-            key, value = arg.split("=")
-            if key == "token" and value == app.config.get("RAVEN_MEDIAMTX_TOKEN"):
-                return "", 200
-    else:
-        logger.debug("external_auth returning 401")
-        return "", 401
+    # api, metrics and pprof (mediamtx.yml leaves these out of HTTP auth anyway)
+    return allow() if user is not None and is_admin(user) else deny()

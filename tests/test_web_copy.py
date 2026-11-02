@@ -31,14 +31,16 @@ def _tracks(tracks):
 
 
 def test_mpegts_stream_gets_a_web_copy(app):
+    app.config["RAVEN_MEDIAMTX_TOKEN"] = "tok"
     with mock.patch.object(mediamtx_api.requests, "get", return_value=_tracks(["MPEG-TS"])), \
             mock.patch.object(mediamtx_api.subprocess, "Popen") as popen:
         assert start_web_copy("live/VIDEO_1", "8554") == "live/VIDEO_1" + WEB_COPY_SUFFIX
 
     command = popen.call_args.args[0]
     assert command[0] == "ffmpeg"
-    assert "rtsp://127.0.0.1:8554/live/VIDEO_1" in command
-    assert command[-1] == "rtsp://127.0.0.1:8554/live/VIDEO_1" + WEB_COPY_SUFFIX
+    # Reads and publishes as Raven itself: a grouped source isn't open to anonymous readers
+    assert "rtsp://127.0.0.1:8554/live/VIDEO_1?token=tok" in command
+    assert command[-1] == "rtsp://127.0.0.1:8554/live/VIDEO_1" + WEB_COPY_SUFFIX + "?token=tok"
     # Copies, never re-encodes, and drops the KLV data track
     assert command[command.index("-c") + 1] == "copy"
     assert "0:v" in command and "0:d" not in command

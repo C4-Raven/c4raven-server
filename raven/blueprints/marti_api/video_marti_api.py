@@ -126,8 +126,9 @@ def video():
     elif request.method == "GET":
         try:
             with app.app_context():
+                user = cert_user()
                 videos = db.session.execute(
-                    filter_by_groups(db.select(VideoStream), VideoStream, cert_user())
+                    filter_by_groups(db.select(VideoStream), VideoStream, user)
                 ).scalars()
                 videoconnections = Element("videoConnections")
 
@@ -140,6 +141,13 @@ def video():
                     path = feed.find("path").text
                     if not path.startswith("/"):
                         path = "/" + path
+
+                    # ATAK sends no credentials with an RTSP feed, so a stream that
+                    # belongs to groups is only playable with this user's signed token
+                    token_query = video.stream_token_query(user)
+                    if token_query:
+                        path += token_query
+                        feed.find("path").string = feed.find("path").text + token_query
 
                     if "iTAK" in request.user_agent.string:
                         url = (

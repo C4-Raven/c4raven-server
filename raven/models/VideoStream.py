@@ -5,10 +5,12 @@ from urllib.parse import urlparse
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from flask import current_app as app
-from flask import request
+from flask import has_request_context, request
+from flask_security import current_user
 from sqlalchemy import TEXT, Boolean, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from raven import stream_tokens
 from raven.extensions import db
 from raven.models.VideoStreamGroup import VideoStreamGroup  # noqa: F401 (secondary table)
 
@@ -74,6 +76,14 @@ class VideoStream(db.Model):
         """The path WebRTC and HLS viewers should play: the web copy if there is one."""
         return self.web_path or self.path
 
+    def stream_token_query(self, user) -> str:
+        """For a stream that belongs to groups, the "?st=..." query that lets `user` watch it
+        without credentials (see raven/stream_tokens.py); "" for any other stream, which
+        anyone may already watch over RTSP."""
+        if not self.groups or user is None or getattr(user, "id", None) is None:
+            return ""
+        return f"?{stream_tokens.PARAM}={stream_tokens.make_token(self.path, user)}"
+
     def to_json(self):
         try:
             mediamtx_settings = json.loads(self.mediamtx_settings)
@@ -82,6 +92,17 @@ class VideoStream(db.Model):
         except json.decoder.JSONDecodeError:
             source = None
             record = False
+
+        # The RTSP link is shown to the logged-in user to open in a player, so a grouped
+        # stream's link carries their signed token
+        viewer = None
+        if (
+            has_request_context()
+            and getattr(app, "login_manager", None)
+            and current_user
+            and current_user.is_authenticated
+        ):
+            viewer = current_user
 
         with app.app_context():
             url = urlparse(request.url_root)
@@ -110,7 +131,9 @@ class VideoStream(db.Model):
                 "ready": self.ready,
                 "source": source,
                 "record": record,
-                "rtsp_link": "rtsp://{}:{}/{}".format(hostname, self.port, self.path),
+                "rtsp_link": "rtsp://{}:{}/{}{}".format(
+                    hostname, self.port, self.path, self.stream_token_query(viewer)
+                ),
                 "webrtc_link": "{}://{}:{}/webrtc/{}/".format(
                     protocol, hostname, port, self.browser_path
                 ),
