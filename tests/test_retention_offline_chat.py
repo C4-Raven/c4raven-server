@@ -927,7 +927,7 @@ def test_retention_indexes_exist(app):
     spec = importlib.util.spec_from_file_location("retention_migration", path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
-    assert migration.down_revision == "06e1c612e122"
+    assert migration.down_revision == "b7e3c1d9a4f2"
     with app.app_context():
         inspector = sa_inspect(db.engine)
         for table, name, columns in migration.INDEXES:
