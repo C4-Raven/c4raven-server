@@ -340,6 +340,7 @@ def test_audit_json_shape(app):
         "user_agent",
         "success",
         "details",
+        "summary",
     }
     # newest first
     assert [e["id"] for e in events] == sorted((e["id"] for e in events), reverse=True)

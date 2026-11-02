@@ -3,10 +3,19 @@ Admin Security Audit: account posture, computed findings and the audit_events tr
 raven.audit.record_audit_event from the login, enrollment, certificate and user admin code paths).
 
 GET /api/security/audit?days=30&category=&search=&limit=1000  -> JSON report
-GET /api/security/audit/download?days=30                      -> the same report as a .txt file
+GET /api/security/audit/download?days=30&format=txt|csv       -> report .txt, or its events .csv
+GET /api/security/audit/events?category=admin&...             -> just the events (Admin actions)
+GET /api/security/audit/events/download?format=csv|txt&...    -> those events as a file
+
+Event filters, on all four: days (window, default 30) or start/end (ISO dates or datetimes; a
+bare end date includes that whole day), category (comma separated), actor, action (comma
+separated), success (true/false), search (free text). Without a category the security report
+leaves out the "admin" rows; those are the Admin actions view's.
 """
 
+import csv
 import datetime
+import io
 import traceback
 from collections import defaultdict
 
@@ -14,9 +23,14 @@ from flask import Blueprint, Response
 from flask import current_app as app
 from flask import jsonify, request
 from flask_security import roles_accepted, verify_password
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 
-from raven.audit import ENROLLMENT_METHODS, FAILED_LOGIN_ACTIONS, WEB_LOGIN_ACTIONS
+from raven.audit import (
+    ADMIN_CATEGORY,
+    ENROLLMENT_METHODS,
+    FAILED_LOGIN_ACTIONS,
+    WEB_LOGIN_ACTIONS,
+)
 from raven.extensions import db, logger
 from raven.functions import iso8601_string_from_datetime
 from raven.models.AuditEvent import AuditEvent
@@ -443,10 +457,91 @@ def _summary(users, cutoff, findings):
     }
 
 
-def _events(cutoff, category=None, search=None, limit=1000):
-    query = db.session.query(AuditEvent).filter(AuditEvent.timestamp >= cutoff)
+def _list_arg(name):
+    values = []
+    for raw in request.args.getlist(name):
+        values.extend(v.strip() for v in str(raw).split(",") if v.strip())
+    return values or None
+
+
+def _datetime_arg(name, end_of_day=False):
+    """An ISO date or datetime query arg as naive UTC, or None. A bare date with end_of_day is
+    the start of the next day, so end=2026-11-02 includes all of the 2nd."""
+    raw = (request.args.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    if end_of_day and len(raw) == 10:
+        value += datetime.timedelta(days=1)
+    return value
+
+
+def _bool_arg(name):
+    raw = (request.args.get(name) or "").strip().lower()
+    if raw in ("true", "1", "yes"):
+        return True
+    if raw in ("false", "0", "no"):
+        return False
+    return None
+
+
+def event_filters(default_category=None):
+    """The event filters from the query string, see the module docstring."""
+    category = _list_arg("category") or ([default_category] if default_category else None)
+    return {
+        "category": category,
+        "search": (request.args.get("search") or "").strip() or None,
+        "actor": (request.args.get("actor") or "").strip() or None,
+        "action": _list_arg("action"),
+        "success": _bool_arg("success"),
+        "start": _datetime_arg("start"),
+        "end": _datetime_arg("end", end_of_day=True),
+    }
+
+
+def _events_query(
+    cutoff,
+    category=None,
+    search=None,
+    actor=None,
+    action=None,
+    success=None,
+    start=None,
+    end=None,
+):
+    query = db.session.query(AuditEvent)
+    query = query.filter(AuditEvent.timestamp >= (start or cutoff))
+    if end:
+        query = query.filter(AuditEvent.timestamp < end)
     if category:
-        query = query.filter(AuditEvent.category == category)
+        if isinstance(category, str):
+            category = [category]
+        query = query.filter(AuditEvent.category.in_(list(category)))
+    else:
+        # The admin action rows have their own view; without them the security trail reads as
+        # it always has
+        query = query.filter(AuditEvent.category != ADMIN_CATEGORY)
+    if actor:
+        like = f"%{actor}%"
+        # record_audit_event drops actor when it's the account itself, so "actor" here is
+        # whoever did it: the actor, or the user when there's no separate actor
+        query = query.filter(
+            or_(
+                AuditEvent.actor.ilike(like),
+                and_(AuditEvent.actor.is_(None), AuditEvent.username.ilike(like)),
+            )
+        )
+    if action:
+        if isinstance(action, str):
+            action = [action]
+        query = query.filter(AuditEvent.action.in_(list(action)))
+    if success is not None:
+        query = query.filter(AuditEvent.success.is_(bool(success)))
     if search:
         like = f"%{search}%"
         query = query.filter(
@@ -457,13 +552,19 @@ def _events(cutoff, category=None, search=None, limit=1000):
                 AuditEvent.action.ilike(like),
                 AuditEvent.category.ilike(like),
                 AuditEvent.details.ilike(like),
+                AuditEvent.summary.ilike(like),
                 AuditEvent.user_agent.ilike(like),
             )
         )
+    return query
+
+
+def _events(cutoff, category=None, search=None, limit=1000, **filters):
+    query = _events_query(cutoff, category=category, search=search, **filters)
     return query.order_by(AuditEvent.timestamp.desc(), AuditEvent.id.desc()).limit(limit).all()
 
 
-def build_report(days, category=None, search=None, limit=1000):
+def build_report(days, category=None, search=None, limit=1000, **filters):
     now = _now()
     cutoff = now - datetime.timedelta(days=days)
     users = _users(now)
@@ -474,7 +575,7 @@ def build_report(days, category=None, search=None, limit=1000):
         "summary": _summary(users, cutoff, findings),
         "findings": findings,
         "users": [u["json"] for u in users],
-        "events": [e.to_json() for e in _events(cutoff, category, search, limit)],
+        "events": [e.to_json() for e in _events(cutoff, category, search, limit, **filters)],
     }
 
 
@@ -484,9 +585,8 @@ def security_audit():
     try:
         report = build_report(
             _int_arg("days", 30, 1, 3650),
-            category=(request.args.get("category") or "").strip() or None,
-            search=(request.args.get("search") or "").strip() or None,
             limit=_int_arg("limit", 1000, 1, 10000),
+            **event_filters(),
         )
         return jsonify(report)
     except BaseException as e:
@@ -591,23 +691,179 @@ def render_text_report(report):
     return "\n".join(out) + "\n"
 
 
+EVENT_CSV_COLUMNS = (
+    "timestamp",
+    "category",
+    "action",
+    "summary",
+    "success",
+    "username",
+    "actor",
+    "ip",
+    "user_agent",
+    "details",
+)
+
+
+def _csv_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value)
+    # Keep spreadsheets from evaluating a logged value as a formula
+    if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        text = "'" + text
+    return text
+
+
+def render_events_csv(events):
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(EVENT_CSV_COLUMNS)
+    for e in events:
+        writer.writerow([_csv_cell(e.get(c)) for c in EVENT_CSV_COLUMNS])
+    return out.getvalue()
+
+
+def render_events_text(events, title, generated_at, window):
+    out = [title, "=" * len(title), f"Generated: {generated_at}", f"Window:    {window}", ""]
+    out.append(f"{len(events)} events, newest first")
+    out.append("")
+    out += _table(
+        ["TIME (UTC)", "ACTION", "OK", "ACTOR", "USER", "IP", "SUMMARY", "DETAILS"],
+        [
+            [
+                e["timestamp"][:19].replace("T", " ") if e["timestamp"] else "-",
+                e["action"],
+                "yes" if e["success"] else "NO",
+                e["actor"] or (e["username"] if e["category"] == ADMIN_CATEGORY else None) or "-",
+                (e["username"] if e["actor"] else None) or "-",
+                e["ip"] or "-",
+                (e.get("summary") or "-").replace("\n", " "),
+                (e["details"] or "").replace("\n", " "),
+            ]
+            for e in events
+        ],
+    )
+    return "\n".join(out) + "\n"
+
+
+def _attachment(body, filename, mimetype):
+    return Response(
+        body,
+        mimetype=mimetype,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _window_text(days, filters):
+    if filters.get("start") or filters.get("end"):
+        start = _iso(filters.get("start")) or "-"
+        end = _iso(filters.get("end")) or "now"
+        return f"{start} to {end}"
+    return f"last {days} days"
+
+
 @security_audit_api_blueprint.route("/api/security/audit/download")
 @roles_accepted("administrator")
 def security_audit_download():
     try:
-        report = build_report(
-            _int_arg("days", 30, 1, 3650), limit=_int_arg("limit", 10000, 1, 100000)
-        )
-        filename = "security-audit-{}.txt".format(_now().strftime("%Y%m%d-%H%M"))
-        return Response(
-            render_text_report(report),
-            mimetype="text/plain",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Cache-Control": "no-store",
-            },
+        days = _int_arg("days", 30, 1, 3650)
+        limit = _int_arg("limit", 10000, 1, 100000)
+        filters = event_filters()
+        stamp = _now().strftime("%Y%m%d-%H%M")
+        if (request.args.get("format") or "txt").lower() == "csv":
+            cutoff = _now() - datetime.timedelta(days=days)
+            events = [e.to_json() for e in _events(cutoff, limit=limit, **filters)]
+            return _attachment(
+                render_events_csv(events), f"security-audit-{stamp}.csv", "text/csv"
+            )
+        report = build_report(days, limit=limit, **filters)
+        return _attachment(
+            render_text_report(report), f"security-audit-{stamp}.txt", "text/plain"
         )
     except BaseException as e:
         logger.error(f"Failed to build security audit download: {e}")
         logger.debug(traceback.format_exc())
         return jsonify({"success": False, "error": "Failed to build security audit"}), 500
+
+
+@security_audit_api_blueprint.route("/api/security/audit/events")
+@roles_accepted("administrator")
+def security_audit_events():
+    """Events only, without the posture report: the Admin actions view (category=admin by
+    default). Also returns the actors and actions seen in the window for its filter menus."""
+    try:
+        days = _int_arg("days", 30, 1, 3650)
+        limit = _int_arg("limit", 1000, 1, 10000)
+        filters = event_filters(default_category=ADMIN_CATEGORY)
+        now = _now()
+        cutoff = now - datetime.timedelta(days=days)
+
+        events = _events(cutoff, limit=limit, **filters)
+        total = _events_query(cutoff, **filters).order_by(None).count()
+
+        # Filter menus: everything in the window and category, ignoring the other filters
+        scope = _events_query(
+            cutoff, category=filters["category"], start=filters["start"], end=filters["end"]
+        )
+        actors = set()
+        pairs = scope.with_entities(AuditEvent.actor, AuditEvent.username).distinct()
+        for actor, username in pairs:
+            if actor or username:
+                actors.add(actor or username)
+        actions = {}
+        pairs = scope.with_entities(AuditEvent.action, AuditEvent.summary).distinct()
+        for action, summary in pairs:
+            # The summary minus its target ("Created group: Ops" -> "Created group")
+            if action not in actions or not actions[action]:
+                actions[action] = (summary or "").split(": ", 1)[0] or None
+
+        return jsonify(
+            {
+                "generated_at": _iso(now),
+                "days": days,
+                "total": total,
+                "events": [e.to_json() for e in events],
+                "actors": sorted(actors, key=str.lower),
+                "actions": [
+                    {"action": a, "label": label}
+                    for a, label in sorted(actions.items(), key=lambda x: (x[1] or x[0]).lower())
+                ],
+            }
+        )
+    except BaseException as e:
+        logger.error(f"Failed to list audit events: {e}")
+        logger.debug(traceback.format_exc())
+        return jsonify({"success": False, "error": "Failed to list audit events"}), 500
+
+
+@security_audit_api_blueprint.route("/api/security/audit/events/download")
+@roles_accepted("administrator")
+def security_audit_events_download():
+    try:
+        days = _int_arg("days", 30, 1, 3650)
+        filters = event_filters(default_category=ADMIN_CATEGORY)
+        now = _now()
+        cutoff = now - datetime.timedelta(days=days)
+        limit = _int_arg("limit", 10000, 1, 100000)
+        events = [e.to_json() for e in _events(cutoff, limit=limit, **filters)]
+        name = "admin-actions" if filters["category"] == [ADMIN_CATEGORY] else "audit-events"
+        stamp = now.strftime("%Y%m%d-%H%M")
+        if (request.args.get("format") or "csv").lower() == "txt":
+            title = (
+                "C4 Raven Admin Actions"
+                if filters["category"] == [ADMIN_CATEGORY]
+                else "C4 Raven Audit Events"
+            )
+            body = render_events_text(events, title, _iso(now), _window_text(days, filters))
+            return _attachment(body, f"{name}-{stamp}.txt", "text/plain")
+        return _attachment(render_events_csv(events), f"{name}-{stamp}.csv", "text/csv")
+    except BaseException as e:
+        logger.error(f"Failed to build audit events download: {e}")
+        logger.debug(traceback.format_exc())
+        return jsonify({"success": False, "error": "Failed to build audit events download"}), 500
