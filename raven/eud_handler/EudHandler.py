@@ -360,7 +360,9 @@ class EudHandler(socketserver.BaseRequestHandler):
             self.shutdown = True
             return
 
-        if self.rabbit_channel:
+        # A channel the broker already closed (or that is closing) raises on publish; the direct
+        # status update below covers that case
+        if self.rabbit_channel and self.rabbit_channel.is_open:
             self.rabbit_channel.basic_publish(
                 exchange="cot_parser",
                 body=json.dumps(
@@ -412,8 +414,14 @@ class EudHandler(socketserver.BaseRequestHandler):
         if not self.shutdown:
             self.shutdown = True
 
-            self.request.shutdown(SHUT_RDWR)
-            self.request.close()
+            try:
+                self.request.shutdown(SHUT_RDWR)
+            except OSError as e:
+                # The peer is already gone (ENOTCONN after a reset or a failed handshake): there
+                # is nothing left to shut down, just release the socket
+                self.logger.debug(f"socket shutdown for {self.client_address[0]}: {e}")
+            finally:
+                self.request.close()
 
     def create_app(self):
         app = Flask(__name__)
@@ -566,7 +574,15 @@ class EudHandler(socketserver.BaseRequestHandler):
             self.logger.error(traceback.format_exc())
 
     def on_channel_close(self, channel: Channel, error):
-        self.logger.error(f"RabbitMQ channel closed for {self.callsign}, shut it down")
+        who = self.callsign or self.uid or self.client_address[0]
+        if isinstance(
+            error, (pika.exceptions.ChannelClosedByClient, pika.exceptions.ConnectionClosedByClient)
+        ):
+            # close_connection() closed it: the normal end of every connection, including the
+            # ones that never identified themselves (scanners, failed TLS handshakes)
+            self.logger.debug(f"RabbitMQ channel closed for {who}: {error}")
+        else:
+            self.logger.error(f"RabbitMQ channel closed for {who} ({error}), shut it down")
         if (
             self.rabbit_connection
             and not self.rabbit_connection.is_closing
