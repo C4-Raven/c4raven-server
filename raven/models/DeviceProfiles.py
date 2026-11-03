@@ -8,8 +8,6 @@ from raven.extensions import db
 from raven.forms.device_profile_form import DeviceProfileForm
 from raven.functions import iso8601_string_from_datetime
 
-# from .EUD import EUD
-
 
 @dataclass
 class DeviceProfiles(db.Model):

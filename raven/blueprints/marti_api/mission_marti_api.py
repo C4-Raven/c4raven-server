@@ -54,15 +54,6 @@ from raven.models.user import User
 mission_marti_api = Blueprint("mission_marti_api", __name__)
 
 
-# Only allow access to the mission/data sync API over SSL/port 8443 with a valid client cert.
-# nginx will proxy the cert in a header called X-Ssl-Cert by default. This is configurable in ots_https and with the
-# RAVEN_SSL_CERT_HEADER option in config.yml
-# @mission_marti_api.before_request
-# def verify_client_cert_before_request():
-#    if not verify_client_cert():
-#        return jsonify({'success': False, 'error': 'Missing or invalid client certificate'}), 400
-
-
 def _mission_token_header() -> str | None:
     """Return the bearer mission token from the request, if any.
 
@@ -1927,10 +1918,6 @@ def mission_unsubscribe(mission_name: str = None, mission_guid: str = None):
             return role
         eud_uid = role.clientUid
 
-    # if "uid" not in request.args:
-    #    return jsonify({'success': False, 'error': 'Missing UID'}), 400
-
-    # uid = bleach.clean(request.args.get("uid"))
     role = db.session.execute(
         db.session.query(MissionRole).filter_by(clientUid=eud_uid, mission_name=mission_name)
     ).first()

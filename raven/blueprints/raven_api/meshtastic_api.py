@@ -41,7 +41,6 @@ def create_channel():
     # Make the protobuf from settings in order to make the URL
     else:
         try:
-            # channel_set.lora_config.use_preset = 'modem_preset' in request.json.keys()
             channel_set.lora_config.modem_preset = (
                 bleach.clean(request.json.get("modem_preset"))
                 if request.json.get("modem_preset")
@@ -135,7 +134,6 @@ def save_channel(channel_set: apponly_pb2.ChannelSet):
             db.session.commit()
         except sqlalchemy.exc.IntegrityError:
             logger.error("Channel with URL {} already exists".format(url))
-            # return jsonify({'success': False, 'error': "Channel already exists"}), 400
             continue
         except BaseException as e:
             logger.error("Failed to save Meshtastic channel: {}".format(e))

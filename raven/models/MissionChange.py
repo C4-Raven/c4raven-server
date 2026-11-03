@@ -222,7 +222,6 @@ def generate_mission_change_cot(
                 "location",
                 {"lon": point.attrs.get("lon"), "lat": point.attrs.get("lat")},
             )
-        # SubElement(mission_change_element, "contentUid").text = cot_event.attrs['uid']
 
     if mission_uid:
         details_tag = SubElement(mission_change_element, "details")

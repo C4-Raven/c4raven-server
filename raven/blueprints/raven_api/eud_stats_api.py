@@ -15,8 +15,6 @@ def get_stats():
     query = db.session.query(EUDStats)
     query = search(query, EUDStats, "eud_uid")
     # TODO: Implement date range search
-    # query = search(query, EUDStats, 'from')
-    # query = search(query, EUDStats, 'to')
 
     rows = db.session.execute(query.order_by(EUDStats.id.desc()).limit(50)).all()
 
