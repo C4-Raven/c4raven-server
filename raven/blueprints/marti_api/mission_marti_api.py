@@ -20,7 +20,7 @@ from flask import Blueprint, Response
 from flask import current_app as app
 from flask import jsonify, request
 from flask_babel import gettext
-from flask_security import current_user, hash_password, verify_password
+from flask_security import hash_password, verify_password
 from sqlalchemy import insert, or_, update
 from werkzeug.utils import secure_filename
 
@@ -52,15 +52,6 @@ from raven.models.Team import Team
 from raven.models.user import User
 
 mission_marti_api = Blueprint("mission_marti_api", __name__)
-
-
-# Only allow access to the mission/data sync API over SSL/port 8443 with a valid client cert.
-# nginx will proxy the cert in a header called X-Ssl-Cert by default. This is configurable in ots_https and with the
-# RAVEN_SSL_CERT_HEADER option in config.yml
-# @mission_marti_api.before_request
-# def verify_client_cert_before_request():
-#    if not verify_client_cert():
-#        return jsonify({'success': False, 'error': 'Missing or invalid client certificate'}), 400
 
 
 def _mission_token_header() -> str | None:
@@ -809,7 +800,6 @@ def delete_mission(mission_name: str = None):
     """Used by the Data Sync plugin to delete a feed"""
 
     # ATAK sends a creatorUid param, but we ignore it in favor of the UID in the signed JWT token that ATAK also sends.
-    creator_uid = request.args.get("creatorUid")
     # TAK Server also takes DELETE /Marti/api/missions?guid=<guid>
     mission_name = _resolve_mission_name(mission_name, request.args.get("guid"))
     if not mission_name:
@@ -947,8 +937,6 @@ def set_password(mission_name: str = None, mission_guid: str = None):
             ),
             403,
         )
-
-    creator_uid = request.args.get("creatorUid")
 
     if request.method == "PUT":
         password = hash_password(request.args.get("password"))
@@ -1481,7 +1469,7 @@ def change_eud_role(mission_name: str = None, mission_guid: str = None):
         role.clientUid = client_uid
         try:
             role.username = eud.user.username
-        except BaseException as e:
+        except BaseException:
             role.username = "anonymous"
         role.createTime = datetime.datetime.now(datetime.timezone.utc)
         role.role_type = new_role
@@ -1930,10 +1918,6 @@ def mission_unsubscribe(mission_name: str = None, mission_guid: str = None):
             return role
         eud_uid = role.clientUid
 
-    # if "uid" not in request.args:
-    #    return jsonify({'success': False, 'error': 'Missing UID'}), 400
-
-    # uid = bleach.clean(request.args.get("uid"))
     role = db.session.execute(
         db.session.query(MissionRole).filter_by(clientUid=eud_uid, mission_name=mission_name)
     ).first()

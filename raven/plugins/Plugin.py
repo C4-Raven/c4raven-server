@@ -6,7 +6,6 @@ from flask import Blueprint, Flask
 from flask import current_app as app
 from flask import url_for
 
-from raven.extensions import logger
 from raven.plugins.BasePlugin import BasePlugin
 
 

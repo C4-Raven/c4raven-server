@@ -12,15 +12,12 @@ from flask import Blueprint
 from flask import current_app as app
 from flask import jsonify, request
 from flask_babel import gettext
-from OpenSSL import crypto
 from werkzeug.datastructures import ImmutableMultiDict
 
-from raven import __version__ as version
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.extensions import db, logger
 from raven.group_isolation import assign_uploader_groups, can_see, filter_by_groups
 from raven.forms.MediaMTXPathConfig import MediaMTXPathConfig
-from raven.functions import iso8601_string_from_datetime
 from raven.models.EUD import EUD
 from raven.models.user import User
 from raven.models.VideoRecording import VideoRecording
@@ -193,7 +190,7 @@ def video():
                     videoconnections.append(fromstring(str(feed)))
 
             return tostring(videoconnections), 200
-        except BaseException as e:
+        except BaseException:
             logger.error(traceback.format_exc())
             return "", 500
 

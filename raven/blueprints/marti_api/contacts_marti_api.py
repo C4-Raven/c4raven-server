@@ -1,6 +1,6 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify
 
-from raven.extensions import db, logger
+from raven.extensions import db
 from raven.models.EUD import EUD
 
 contacts_api = Blueprint("contacts_api", __name__)

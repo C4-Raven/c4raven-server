@@ -15,7 +15,7 @@ import sqlalchemy.exc
 import yaml
 from flask import Blueprint
 from flask import current_app as app
-from flask import jsonify, request, send_file, send_from_directory, session
+from flask import jsonify, request, send_file, send_from_directory
 from flask_babel import gettext
 from flask_ldap3_login import AuthenticationResponseStatus
 from flask_security import auth_required, current_user, verify_password
@@ -28,7 +28,7 @@ from raven.blueprints.raven_api.onboard_api import export_onboard_truststore
 from raven.cert_revocation import serial_from_pem
 from raven.cert_validity import resolve_cert_days
 from raven.certificate_authority import CertificateAuthority
-from raven.extensions import babel, db, ldap_manager, logger
+from raven.extensions import db, ldap_manager, logger
 from raven.models.Alert import Alert
 from raven.models.APSchedulerJobs import APSchedulerJobs
 from raven.models.CasEvac import CasEvac
@@ -88,7 +88,7 @@ def paginate(query: db.Query, model=None):
                     query = query.order_by(sort_expr.desc())
                 else:
                     query = query.order_by(sort_expr.asc())
-    except BaseException as e:
+    except BaseException:
         return (
             jsonify(
                 {

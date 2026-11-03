@@ -84,9 +84,6 @@ class MumbleIceApp(Ice.Application):
         configured servers
         """
 
-        # if False and 'ice_secret':
-        #     self.ice.getImplicitContext().put("secret", "some_secret")
-
         self.logger.debug("Connecting to Ice server ({}:{})".format("127.0.0.1", 6502))
         base = self.ice.stringToProxy("Meta:tcp -h {} -p {}".format("127.0.0.1", 6502))
         self.meta = Murmur.MetaPrx.uncheckedCast(base)

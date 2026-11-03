@@ -4,7 +4,6 @@ import re
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring
 
-import pika.channel
 from flask import current_app as app
 
 ISO8601_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
@@ -96,19 +95,6 @@ def get_battle_dimension(cot_type):
     return None
 
 
-def parse_type(cot_type):
-    if re.match("^a-.-G-I", cot_type):
-        return "installation"
-    if re.match("^a-.-G-E-V", cot_type):
-        return "vehicle"
-    if re.match("^a-.-G-E", cot_type):
-        return "equipment"
-    if re.match("^a-.-A-W-M-S", cot_type):
-        return "sam"
-    if re.match("^a-.-A-M-F-Q-r", cot_type):
-        return "uav"
-
-
 def cot_type_to_2525c(cot_type):
     mil_std_2525c = "s"
     cot_type_list = cot_type.split("-")
@@ -147,13 +133,6 @@ def iso8601_string_from_datetime(datetime_object: datetime | None = None) -> str
         return datetime_object.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-2] + "Z"
     else:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-2] + "Z"
-
-
-def iso8601_string_from_datetime_no_ms(datetime_object):
-    if datetime_object:
-        return datetime_object.strftime("%Y-%m-%dT%H:%M:%SZ")
-    else:
-        return None
 
 
 def generate_delete_cot(uid: str, cot_type: str) -> Element:

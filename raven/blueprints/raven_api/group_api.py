@@ -2,7 +2,7 @@ import traceback
 
 import bleach
 import sqlalchemy.exc
-from flask import Blueprint, Response
+from flask import Blueprint
 from flask import current_app as app
 from flask import jsonify, request
 from flask_babel import gettext

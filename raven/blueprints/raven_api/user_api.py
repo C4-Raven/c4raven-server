@@ -34,7 +34,7 @@ from raven.blueprints.marti_api.data_package_marti_api import (
     save_data_package_file,
 )
 from raven.blueprints.raven_api.api import paginate, search
-from raven.extensions import db, ldap_manager, logger
+from raven.extensions import db, logger
 from raven.functions import iso8601_string_from_datetime
 from raven.models.DataPackage import DataPackage
 from raven.models.EUD import EUD

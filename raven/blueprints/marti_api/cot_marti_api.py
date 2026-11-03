@@ -78,11 +78,4 @@ def get_cot_by_time_and_bbox():
     logger.debug(request.headers)
     logger.debug(request.args)
 
-    start = request.args.get("start")
-    end = request.args.get("end")
-    left = request.args.get("left")
-    bottom = request.args.get("bottom")
-    right = request.args.get("right")
-    top = request.args.get("top")
-
     return "", 200
