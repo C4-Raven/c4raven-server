@@ -1,13 +1,27 @@
+import atexit
 import os
+import shutil
+import tempfile
 
-import pytest
-import sqlalchemy
-import yaml
-from flask_security import hash_password
+# Point the data folder somewhere throwaway BEFORE anything imports raven: DefaultConfig reads it
+# at import time, and the service modules (raven.cot_parser.cot_parser, raven.eud_handler.eud_handler)
+# build their app at import, reading RAVEN_DATA_FOLDER/config.yml and attaching a log file handler
+# under RAVEN_DATA_FOLDER/logs to the shared "Raven" logger. Left at ~/ots, every later test in the
+# run logged into the live server's cot_parser.log.
+TEST_DATA_FOLDER = tempfile.mkdtemp(prefix="raven-tests-")
+atexit.register(shutil.rmtree, TEST_DATA_FOLDER, ignore_errors=True)
+os.environ["RAVEN_DATA_FOLDER"] = TEST_DATA_FOLDER
+os.environ["RAVEN_CA_FOLDER"] = os.path.join(TEST_DATA_FOLDER, "ca")
+os.environ["UPLOAD_FOLDER"] = os.path.join(TEST_DATA_FOLDER, "uploads")
 
-from raven.app import create_app
-from raven.defaultconfig import DefaultConfig
-from raven.extensions import db, logger
+import pytest  # noqa: E402
+import sqlalchemy  # noqa: E402
+import yaml  # noqa: E402
+from flask_security import hash_password  # noqa: E402
+
+from raven.app import create_app  # noqa: E402
+from raven.defaultconfig import DefaultConfig  # noqa: E402
+from raven.extensions import db, logger  # noqa: E402
 
 
 class AuthActions:
@@ -104,6 +118,9 @@ def app(tmp_path, monkeypatch):
             )
         )
 
+    # create_app() adds a raven.log handler (in this test's folder) to the shared logger: drop it
+    # afterwards so handlers and open files don't pile up and later tests don't log in here
+    handlers = list(logger.handlers)
     app = create_app()
     configured = app.config.get("SQLALCHEMY_DATABASE_URI") or ""
     if configured != uri or not is_test_database(configured):
@@ -124,6 +141,9 @@ def app(tmp_path, monkeypatch):
     with app.app_context():
         db.session.remove()
         db.engine.dispose()
+    for handler in [h for h in logger.handlers if h not in handlers]:
+        logger.removeHandler(handler)
+        handler.close()
 
 
 @pytest.fixture()
