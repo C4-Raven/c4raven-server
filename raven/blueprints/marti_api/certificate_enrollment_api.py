@@ -12,12 +12,14 @@ from flask import current_app as app
 from flask import g, jsonify, request
 from flask_ldap3_login import AuthenticationResponseStatus
 from flask_security import verify_password
+from sqlalchemy import select
 from OpenSSL import crypto
 
 from raven.audit import record_audit_event
 from raven.cert_revocation import serial_from_pem
 from raven.cert_validity import resolve_cert_days
 from raven.certificate_authority import CertificateAuthority
+from raven.db_upsert import insert_ignore
 from raven.extensions import db, ldap_manager, logger
 from raven.models.Certificate import Certificate
 from raven.models.EnrollmentBlock import EnrollmentBlock
@@ -298,23 +300,18 @@ def sign_csr_v2():
             response = tostring(enrollment).decode("utf-8")
             response = '<?xml version="1.0" encoding="UTF-8"?>\n' + response
 
-        try:
-            if uid:
-                eud = EUD()
-                eud.uid = uid
-                eud.user_id = user.id if user else None
-
-                db.session.add(eud)
-                db.session.commit()
-        except sqlalchemy.exc.IntegrityError:
-            db.session.rollback()
-            eud = db.session.execute(db.session.query(EUD).filter_by(uid=uid)).first()[0]
+        if uid:
+            # Re-enrolling devices already have a row: ON CONFLICT DO NOTHING instead of
+            # catching the IntegrityError, which PostgreSQL logged as an error (euds_uid_key)
+            insert_ignore(
+                db.session, EUD, {"uid": uid, "user_id": user.id if user else None}, ["uid"]
+            )
+            db.session.commit()
+            eud = db.session.execute(select(EUD).filter_by(uid=uid)).scalar_one()
             if user and not eud.user_id:
                 eud.user_id = user.id
-                db.session.add(eud)
                 db.session.commit()
 
-        if uid:
             _record_enrolled_certificate(
                 uid, eud, user, common_name, cert_days, issued_serial
             )

@@ -14,6 +14,7 @@ from raven.functions import (
     generate_delete_cot,
     iso8601_string_from_datetime,
 )
+from raven.models import import_all_models
 from raven.models.Alert import Alert
 from raven.models.CasEvac import CasEvac
 from raven.models.Certificate import Certificate
@@ -41,8 +42,15 @@ from raven.models.ZMIST import ZMIST
 scheduler_blueprint = Blueprint("scheduler_blueprint", __name__)
 
 
+def _job_context():
+    """The app context a job runs in, with every model imported first: a job can run before
+    the app has imported them all (see raven.models.import_all_models)."""
+    import_all_models()
+    return apscheduler.app.app_context()
+
+
 def delete_video_recordings():
-    with apscheduler.app.app_context():
+    with _job_context():
         VideoRecording.query.delete()
         db.session.commit()
 
@@ -73,6 +81,12 @@ def delete_video_recordings():
 def purge_data():
     # These are in a specific order to properly handle foreign key relationships
     delete_video_recordings()
+    # Used to run these outside an app context, so it always failed
+    with _job_context():
+        _purge_tables()
+
+
+def _purge_tables():
     ZMIST.query.delete()
     VideoStream.query.delete()
     Alert.query.delete()
@@ -106,7 +120,7 @@ def reconcile_eud_status():
     # unhandled exception mid-CoT-processing -- leaves the row stuck
     # "Connected" forever with no other code path to ever correct it. If a
     # "Connected" EUD hasn't been heard from in a while, it isn't connected.
-    with apscheduler.app.app_context():
+    with _job_context():
         # last_event_time is a naive "timestamp without time zone" column,
         # but it's written from tz-aware Python datetimes -- the driver
         # silently converts those to the DB session's timezone before
@@ -127,7 +141,7 @@ def reconcile_eud_status():
 
 
 def delete_old_data():
-    with apscheduler.app.app_context():
+    with _job_context():
         timestamp = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
             seconds=app.config.get("RAVEN_DELETE_OLD_DATA_SECONDS"),
             minutes=app.config.get("RAVEN_DELETE_OLD_DATA_MINUTES"),
@@ -254,7 +268,7 @@ def expire_group_memberships():
     # page, or from the group's default membership duration) has passed.
     from raven.group_policy import expire_memberships
 
-    with apscheduler.app.app_context():
+    with _job_context():
         try:
             removed = expire_memberships()
             if removed:
@@ -269,7 +283,7 @@ def record_metrics_sample():
     # (raven.metrics.take_sample), keeping the last 24 hours.
     from raven.metrics import take_sample
 
-    with apscheduler.app.app_context():
+    with _job_context():
         try:
             take_sample(db.session)
         except BaseException as e:
@@ -282,7 +296,7 @@ def apply_data_retention():
     # batches. Also expires chat messages held for offline devices (48 hours by default).
     from raven.retention import apply_retention
 
-    with apscheduler.app.app_context():
+    with _job_context():
         try:
             apply_retention()
         except BaseException as e:
@@ -295,7 +309,7 @@ def refresh_crl():
     # streaming port reject every client certificate once the CRL's nextUpdate has passed.
     from raven.cert_revocation import crl_next_update, ensure_crl, report_crl_failure
 
-    with apscheduler.app.app_context():
+    with _job_context():
         try:
             ensure_crl(
                 app.config.get("RAVEN_CA_FOLDER"), app.config.get("RAVEN_CA_PASSWORD"), logger

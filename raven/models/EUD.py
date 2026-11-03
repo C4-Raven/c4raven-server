@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from raven.extensions import db
 from raven.functions import iso8601_string_from_datetime
+from raven.models.Certificate import current_certificate
 from raven.models.Chatrooms import Chatroom
 
 # Leave these imports, they're needed when making new DB migrations
@@ -46,11 +47,21 @@ class EUD(db.Model):
     chatroom_uid = relationship("ChatroomsUids", cascade="all, delete-orphan", back_populates="eud")
     user = relationship("User", back_populates="euds")
     alert = relationship("Alert", cascade="all, delete-orphan", back_populates="eud")
+    # A device uploads any number of data packages and gets a new Certificate row on every
+    # enrollment (revoked rows are kept as the record of the revocation), so both are
+    # one-to-many. They used to be mapped uselist=False, which made SQLAlchemy pick an
+    # arbitrary row and warn "Multiple rows returned with uselist=False" on every read.
     data_packages = relationship(
-        "DataPackage", cascade="all, delete-orphan", back_populates="eud", uselist=False
+        "DataPackage",
+        cascade="all, delete-orphan",
+        back_populates="eud",
+        order_by="DataPackage.id",
     )
-    certificate = relationship(
-        "Certificate", cascade="all, delete, delete-orphan", back_populates="eud", uselist=False
+    certificates = relationship(
+        "Certificate",
+        cascade="all, delete, delete-orphan",
+        back_populates="eud",
+        order_by="Certificate.id",
     )
     markers = relationship("Marker", cascade="all, delete, delete-orphan", back_populates="eud")
     rb_lines = relationship("RBLine", cascade="all, delete-orphan", back_populates="eud")
@@ -58,6 +69,16 @@ class EUD(db.Model):
     owned_missions = relationship("Mission", back_populates="owner")
     stats = relationship("EUDStats", back_populates="eud")
     profiles = relationship("DeviceProfiles", back_populates="eud")
+
+    @property
+    def certificate(self):
+        """The device's current certificate: the newest one that isn't revoked, else the
+        newest one, else None."""
+        return current_certificate(self.certificates)
+
+    @property
+    def latest_data_package(self):
+        return self.data_packages[-1] if self.data_packages else None
 
     def serialize(self):
         return {
@@ -98,9 +119,10 @@ class EUD(db.Model):
             "team_color": self.team.get_team_color() if self.team else None,
             "team_role": self.team_role,
             "federated_from": self.federated_from,
+            # Kept as one object (the newest package) for API compatibility.
             "data_packages": (
-                self.data_packages.to_json(False)
-                if include_data_packages and self.data_packages
+                self.latest_data_package.to_json(False)
+                if include_data_packages and self.latest_data_package
                 else None
             ),
             "config_hash": config_datapackage_hash,
