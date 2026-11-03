@@ -35,7 +35,11 @@ class DataPackage(db.Model):
     install_on_enrollment: Mapped[bool] = mapped_column(Boolean, default=False, nullable=True)
     install_on_connection: Mapped[bool] = mapped_column(Boolean, default=False, nullable=True)
     eud: Mapped["EUD"] = relationship(back_populates="data_packages")
-    certificate = relationship("Certificate", back_populates="data_package", uselist=False)
+    # Re-issuing a certificate package whose zip is byte-identical reuses this row, so more
+    # than one Certificate can point at it; see the certificate property below.
+    certificates = relationship(
+        "Certificate", back_populates="data_package", order_by="Certificate.id"
+    )
     user = relationship("User", back_populates="data_packages")
     recipients = relationship(
         "DataPackageRecipient",
@@ -45,6 +49,12 @@ class DataPackage(db.Model):
     )
     # Groups that may see this package; none = everyone (see raven/group_isolation.py)
     groups = relationship("Group", secondary="data_packages_groups")
+
+    @property
+    def certificate(self):
+        from raven.models.Certificate import current_certificate
+
+        return current_certificate(self.certificates)
 
     @property
     def is_private(self) -> bool:

@@ -35,8 +35,8 @@ class Certificate(db.Model):
     revoked_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     revocation_reason: Mapped[str] = mapped_column(String(64), nullable=True)
     user = relationship("User", back_populates="certificate", uselist=False)
-    eud = relationship("EUD", cascade="all, delete", back_populates="certificate", uselist=False)
-    data_package = relationship("DataPackage", back_populates="certificate", uselist=False)
+    eud = relationship("EUD", cascade="all, delete", back_populates="certificates", uselist=False)
+    data_package = relationship("DataPackage", back_populates="certificates", uselist=False)
 
     def serialize(self):
         return {
@@ -93,3 +93,15 @@ class Certificate(db.Model):
             "revoked_at": iso8601_string_from_datetime(self.revoked_at) if self.revoked_at else None,
             "revocation_reason": self.revocation_reason,
         }
+
+
+def current_certificate(certificates):
+    """Pick the current certificate out of a device's (or data package's) certificate rows,
+    which accumulate one per enrollment: the newest unrevoked one, else the newest one."""
+    if not certificates:
+        return None
+    ordered = sorted(certificates, key=lambda c: c.id or 0, reverse=True)
+    for certificate in ordered:
+        if not certificate.revoked_at:
+            return certificate
+    return ordered[0]
