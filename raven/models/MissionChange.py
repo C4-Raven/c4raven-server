@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, update
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from raven.extensions import db, logger
+from raven.extensions import db
 from raven.functions import iso8601_string_from_datetime
 from raven.models.Mission import Mission
 from raven.models.MissionContent import MissionContent

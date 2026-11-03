@@ -6,7 +6,7 @@ from flask import request
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from raven.extensions import db, logger
+from raven.extensions import db
 from raven.functions import iso8601_string_from_datetime
 from raven.models.MissionRole import MissionRole
 

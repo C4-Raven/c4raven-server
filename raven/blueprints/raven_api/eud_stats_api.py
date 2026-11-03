@@ -1,7 +1,7 @@
 from flask import Blueprint
 from flask_security import auth_required
 
-from raven.blueprints.raven_api.api import paginate, search
+from raven.blueprints.raven_api.api import search
 from raven.extensions import db
 from raven.models.EUDStats import EUDStats
 

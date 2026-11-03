@@ -12,7 +12,6 @@ from flask_security import auth_required, roles_accepted
 from werkzeug.datastructures import ImmutableMultiDict
 from werkzeug.utils import secure_filename
 
-from raven.blueprints.marti_api.certificate_enrollment_api import basic_auth
 from raven.blueprints.marti_api.marti_api import verify_client_cert
 from raven.blueprints.raven_api.api import paginate, search
 from raven.extensions import db, logger

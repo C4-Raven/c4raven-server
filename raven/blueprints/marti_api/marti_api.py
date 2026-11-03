@@ -1,4 +1,3 @@
-import glob
 import os
 import traceback
 from urllib.parse import unquote, urlparse

@@ -3,7 +3,6 @@ import unicodedata
 import flask_security
 from flask_security import UsernameUtil
 
-from raven.extensions import logger
 
 
 class UsernameValidator(UsernameUtil):

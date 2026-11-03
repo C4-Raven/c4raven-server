@@ -20,7 +20,7 @@ from flask import Blueprint, Response
 from flask import current_app as app
 from flask import jsonify, request
 from flask_babel import gettext
-from flask_security import current_user, hash_password, verify_password
+from flask_security import hash_password, verify_password
 from sqlalchemy import insert, or_, update
 from werkzeug.utils import secure_filename
 

@@ -1,6 +1,4 @@
-import socket
 import socketserver
-import ssl
 
 
 class EudServerUdp(socketserver.ForkingUDPServer):

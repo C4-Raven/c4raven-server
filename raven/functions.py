@@ -4,7 +4,6 @@ import re
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring
 
-import pika.channel
 from flask import current_app as app
 
 ISO8601_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"

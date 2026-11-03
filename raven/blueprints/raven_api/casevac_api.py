@@ -1,7 +1,6 @@
 from datetime import timedelta, timezone
 from uuid import UUID
 
-import pika
 import sqlalchemy.exc
 from flask import Blueprint, jsonify, request
 from flask_babel import gettext
