@@ -214,12 +214,6 @@ def _addressing(session, event, sender_uid, user_id=None, target_groups=None):
     return [eud for uid, eud in recipients.items() if uid != sender_uid], read_groups
 
 
-def chat_recipients(session, event, sender_uid, user_id=None, target_groups=None):
-    """The euds rows a GeoChat event is addressed to (excluding the sender), or [] for
-    anything that isn't a chat message or isn't queued (All Chat Rooms)."""
-    return _addressing(session, event, sender_uid, user_id, target_groups)[0]
-
-
 def queue_offline_chat(session, event, sender_uid, user_id=None, now=None, target_groups=None):
     """Stores a copy of a GeoChat event for each addressed device, connected or not (see the
     module docstring). Returns the number of rows queued. Never raises."""

@@ -69,9 +69,6 @@ class MumbleAuthenticator(Murmur.ServerUpdatingAuthenticator):
             self.logger.warning("Mumble auth: Bad password for {}".format(username))
             return -1, None, None
 
-    def idToTexture(self, id, current=None):
-        return
-
     def getInfo(self, id, current=None):
         """
         Gets called to fetch user specific information

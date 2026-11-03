@@ -16,11 +16,6 @@ class GroupTypeEnum(str, enum.Enum):
     LDAP = "LDAP"
 
 
-class GroupDirectionEnum(str, enum.Enum):
-    IN = "IN"  # Write
-    OUT = "OUT"  # Read
-
-
 # A group's default access for new members (see Group.default_access):
 # "both" = IN + OUT, "IN" = send only, "OUT" = receive only.
 ACCESS_DIRECTIONS = {"both": ("IN", "OUT"), "IN": ("IN",), "OUT": ("OUT",)}
@@ -86,12 +81,6 @@ class Group(db.Model):
             bitpos = max_bitpos[0].bitpos + 1
 
         return bitpos
-
-    def set_bitpos(self, new_bitpos: int = None):
-        if new_bitpos:
-            self.bitpos = new_bitpos
-        else:
-            self.bitpos = self.get_next_bitpos()
 
     def serialize(self):
         return {
