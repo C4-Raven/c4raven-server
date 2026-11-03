@@ -1,3 +1,4 @@
+import os
 import time
 import traceback
 
@@ -138,8 +139,36 @@ def get_ca_groups():
 # built-in Keycloak/OAuth support is broken in this Federation Hub release).
 # Serving it here means an admin only needs to be logged into Raven once to
 # get the file, rather than having it handed around out-of-band.
-_FEDHUB_ADMIN_CERT_PATH = "/opt/tak/federation-hub/certs/files/fedhub-admin.p12"
-_FEDHUB_CERT_PASSWORD_FILE = "/opt/tak/federation-hub/certs/.fedhub-cert-passwords"
+#
+# Where the .p12 and its import password live comes from config
+# (RAVEN_FEDHUB_ADMIN_P12 / RAVEN_FEDHUB_ADMIN_P12_PASSWORD_FILE): new
+# installs copy both somewhere the raven user can read, while legacy boxes
+# keep the defaults pointing at Federation Hub's own files.
+_LEGACY_PASSWORD_FILE_NAME = ".fedhub-cert-passwords"
+
+
+def _read_admin_cert_password(path):
+    """Return the admin .p12 import password from ``path``, or None.
+
+    Two formats are accepted:
+      * the legacy Federation Hub ``.fedhub-cert-passwords`` shell-env file
+        (``CAPASS=...`` / ``PASS=...`` lines) -- the ``PASS=`` value is used;
+      * a file holding only the password on a single line (stripped).
+    """
+    with open(path) as f:
+        content = f.read()
+
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    legacy = os.path.basename(path) == _LEGACY_PASSWORD_FILE_NAME or (
+        len(lines) > 1 and any(line.startswith("PASS=") for line in lines)
+    )
+    if legacy:
+        for line in lines:
+            if line.startswith("PASS="):
+                return line.split("=", 1)[1] or None
+        return None
+
+    return lines[0] if len(lines) == 1 else None
 
 
 def _fedhub_cert_2fa_verified():
@@ -186,7 +215,7 @@ def get_admin_cert():
         return jsonify({"success": False, "error": gettext("2FA verification required")}), 403
 
     try:
-        with open(_FEDHUB_ADMIN_CERT_PATH, "rb") as f:
+        with open(app.config.get("RAVEN_FEDHUB_ADMIN_P12"), "rb") as f:
             data = f.read()
     except OSError as e:
         logger.error(f"Failed to read Federation Hub admin cert: {e}")
@@ -209,11 +238,10 @@ def get_admin_cert_password():
         return jsonify({"success": False, "error": gettext("2FA verification required")}), 403
 
     try:
-        with open(_FEDHUB_CERT_PASSWORD_FILE) as f:
-            for line in f:
-                if line.startswith("PASS="):
-                    return jsonify({"password": line.strip().split("=", 1)[1]})
-    except OSError as e:
+        password = _read_admin_cert_password(app.config.get("RAVEN_FEDHUB_ADMIN_P12_PASSWORD_FILE"))
+        if password:
+            return jsonify({"password": password})
+    except (OSError, TypeError, UnicodeDecodeError) as e:
         logger.error(f"Failed to read Federation Hub cert password file: {e}")
 
     return jsonify({"success": False, "error": gettext("Certificate password not found")}), 500

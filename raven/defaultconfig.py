@@ -95,6 +95,18 @@ class DefaultConfig:
     # uses the private CA -- unaffected), so trust the system's default CA
     # bundle here instead of pinning to that private CA's file.
     RAVEN_FEDHUB_CA_BUNDLE = os.getenv("RAVEN_FEDHUB_CA_BUNDLE") or True
+    # The Federation Hub admin console's login cert, served to 2FA-verified
+    # admins by /api/fedhub/admin_cert(/password). The password file holds
+    # only the .p12 import password on one line; the legacy Federation Hub
+    # .fedhub-cert-passwords file (PASS=... lines) is also understood, which
+    # is what these defaults point at on boxes where Raven runs as tak.
+    RAVEN_FEDHUB_ADMIN_P12 = os.getenv(
+        "RAVEN_FEDHUB_ADMIN_P12", "/opt/tak/federation-hub/certs/files/fedhub-admin.p12"
+    )
+    RAVEN_FEDHUB_ADMIN_P12_PASSWORD_FILE = os.getenv(
+        "RAVEN_FEDHUB_ADMIN_P12_PASSWORD_FILE",
+        "/opt/tak/federation-hub/certs/.fedhub-cert-passwords",
+    )
 
     # Federation Hub data plane (FIG protocol, gRPC over mTLS on the broker's
     # v2 port). This is separate from the admin-API integration above -- it's
