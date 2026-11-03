@@ -279,6 +279,13 @@ def init_extensions(app):
     # User included, which is only defined after FsModels.set_db_info above --
     # to be registered, or SQLAlchemy can't resolve the 'User' relationship.
     if not apscheduler.running:
+        # The blueprints, which import most of the models, are only registered after this
+        # returns. A job firing in between (they do on a restart) used to configure the mappers
+        # with EUDStats missing, which failed every later query too and crashed startup
+        # (2026-11-03 13:51, twice).
+        from raven.models import import_all_models
+
+        import_all_models()
         add_new_jobs_to_config(app)
         drop_removed_jobs_from_config(app)
         apscheduler.init_app(app)
