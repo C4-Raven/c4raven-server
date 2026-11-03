@@ -281,3 +281,30 @@ def test_password_that_is_not_a_token_is_not_an_error(app, caplog):
         assert Token.verify_token("mistyped password", "alice") is False
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert "neither its password nor a token" in caplog.text
+
+
+def test_token_with_a_bad_signature_is_still_a_warning(app, caplog):
+    # InvalidSignatureError is a DecodeError subclass: it mustn't be taken for a mistyped password
+    import jwt
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from raven.models.Token import Token
+
+    def pem_pair():
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public = key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        return key, public
+
+    _, server_public = pem_pair()
+    other_key, _ = pem_pair()
+    os.makedirs(os.path.join(app.config["RAVEN_CA_FOLDER"], "certs", "raven"))
+    with open(os.path.join(app.config["RAVEN_CA_FOLDER"], "certs", "raven", "raven.pub"), "wb") as f:
+        f.write(server_public)
+    forged = jwt.encode({"sub": "alice", "aud": "Raven"}, other_key, algorithm="RS256")
+    with app.app_context(), caplog.at_level(logging.DEBUG, logger="Raven"):
+        assert Token.verify_token(forged, "alice") is False
+    assert "neither its password nor a token" not in caplog.text
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]

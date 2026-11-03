@@ -168,6 +168,11 @@ class Token(db.Model):
 
                 return True
 
+            except jwt.exceptions.InvalidSignatureError as e:
+                # A real JWT signed with another key. A DecodeError subclass, so caught first.
+                logger.warning(f"Invalid token: {e}")
+                logger.debug(traceback.format_exc())
+                return False
             except jwt.exceptions.DecodeError as e:
                 # Not a JWT at all. The Basic-auth paths try the password as a token once it
                 # failed as a password, so this is almost always a mistyped password (the
