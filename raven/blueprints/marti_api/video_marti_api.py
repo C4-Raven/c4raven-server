@@ -190,7 +190,7 @@ def video():
                     videoconnections.append(fromstring(str(feed)))
 
             return tostring(videoconnections), 200
-        except BaseException as e:
+        except BaseException:
             logger.error(traceback.format_exc())
             return "", 500
 

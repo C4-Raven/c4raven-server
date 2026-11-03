@@ -809,7 +809,6 @@ def delete_mission(mission_name: str = None):
     """Used by the Data Sync plugin to delete a feed"""
 
     # ATAK sends a creatorUid param, but we ignore it in favor of the UID in the signed JWT token that ATAK also sends.
-    creator_uid = request.args.get("creatorUid")
     # TAK Server also takes DELETE /Marti/api/missions?guid=<guid>
     mission_name = _resolve_mission_name(mission_name, request.args.get("guid"))
     if not mission_name:
@@ -947,8 +946,6 @@ def set_password(mission_name: str = None, mission_guid: str = None):
             ),
             403,
         )
-
-    creator_uid = request.args.get("creatorUid")
 
     if request.method == "PUT":
         password = hash_password(request.args.get("password"))
@@ -1481,7 +1478,7 @@ def change_eud_role(mission_name: str = None, mission_guid: str = None):
         role.clientUid = client_uid
         try:
             role.username = eud.user.username
-        except BaseException as e:
+        except BaseException:
             role.username = "anonymous"
         role.createTime = datetime.datetime.now(datetime.timezone.utc)
         role.role_type = new_role

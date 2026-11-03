@@ -37,7 +37,6 @@ class MeshtasticController(RabbitMQClient):
         with self.context:
             euds = self.db.session.execute(self.db.session.query(EUD)).scalars()
             for eud in euds:
-                meshtastic_id = eud.meshtastic_id
                 if not eud.meshtastic_id:
                     eud.meshtastic_id = int.from_bytes(os.urandom(4), "big")
                     self.db.session.add(eud)

@@ -66,9 +66,9 @@ class PluginManager:
 
                         db.session.add(plugin_row)
                         db.session.commit()
-                except sqlalchemy.exc.IntegrityError as e:
+                except sqlalchemy.exc.IntegrityError:
                     logger.debug(f"{plugin_row.name} is already in the DB")
-                except BaseException as e:
+                except BaseException:
                     logger.debug(f"{plugin.name} already in the database")
 
                 plugin.activate(*args, **kwargs, enabled=self.check_if_plugin_enabled(plugin.name))

@@ -88,7 +88,7 @@ def paginate(query: db.Query, model=None):
                     query = query.order_by(sort_expr.desc())
                 else:
                     query = query.order_by(sort_expr.asc())
-    except BaseException as e:
+    except BaseException:
         return (
             jsonify(
                 {

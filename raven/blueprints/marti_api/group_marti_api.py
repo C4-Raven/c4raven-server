@@ -459,11 +459,6 @@ def get_group(group_name: str, direction: str):
 
 @group_api.route("/Marti/api/subscriptions/all")
 def get_all_subscriptions():
-    sortBy = request.args.get("sortBy")
-    direction = request.args.get("direction")
-    page = request.args.get("page")
-    limit = request.args.get("limit")
-
     response = {
         "version": "3",
         "type": "SubscriptionInfo",
