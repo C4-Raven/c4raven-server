@@ -332,7 +332,7 @@ def new_vpn_qr_string():
         RAVEN_VPN_QR_DEFAULT_EXPIRATION_HOURS (24)
     :param username: Admins may generate a QR for another user (case-insensitive)
 
-    :return: {"success": true, "qr_string", "url", "host", "username", "expiration"}
+    :return: {"success": true, "qr_string", "url", "download_url", "host", "username", "expiration"}
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -399,6 +399,8 @@ def new_vpn_qr_string():
                 "success": True,
                 "qr_string": "tak://com.atakmap.app/import?url=" + quote(url, safe=""),
                 "url": url,
+                # Same-origin link for downloading the package from the web UI (see onboard_package)
+                "download_url": f"/api/onboard/{token}?host={host}",
                 "host": host,
                 "username": username,
                 "expiration": expiration,
@@ -425,8 +427,13 @@ def onboard_package(token):
         if not user:
             return not_found
 
-        # The address the phone actually reached us at
-        host = normalize_ipv4(urlparse(request.url_root).hostname or "")
+        # The address the phone actually reached us at, unless the link names one. The web UI's
+        # download link does (?host=), because it's fetched over the HTTPS site: browsers block
+        # plain-HTTP downloads started from an HTTPS page.
+        if request.args.get("host"):
+            host = normalize_ipv4(request.args.get("host"))
+        else:
+            host = normalize_ipv4(urlparse(request.url_root).hostname or "")
         if not host:
             return not_found
 

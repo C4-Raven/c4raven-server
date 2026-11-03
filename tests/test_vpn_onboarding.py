@@ -443,7 +443,9 @@ def test_vpn_qr_string_format(app):
     r = _qr(client, host="100.76.118.201", expiration=exp)
     assert r.status_code == 200, r.json
     body = r.json
-    assert set(body) == {"success", "qr_string", "url", "host", "username", "expiration"}
+    assert set(body) == {
+        "success", "qr_string", "url", "download_url", "host", "username", "expiration"
+    }
     assert body["success"] is True
     assert body["host"] == "100.76.118.201"
     assert body["username"] == "alice"
@@ -579,6 +581,32 @@ def test_onboard_download(app):
 
     # Reached by hostname (not an IPv4 literal): no package
     assert anon.get(path, base_url="http://tak.example.com:8080").status_code == 404
+
+
+@pytest.mark.skipif(not HAVE_OPENSSL, reason="needs the openssl CLI")
+def test_onboard_download_link_works_over_the_https_site(app):
+    """Browsers block plain-HTTP downloads from the HTTPS UI, so the UI's link is same-origin and
+    names the VPN address itself."""
+    client = app.test_client()
+    _login(app, client, "alice")
+    body = _qr(client, host="100.76.118.201").json
+    assert body["download_url"].startswith("/api/onboard/")
+    assert body["download_url"].endswith("?host=100.76.118.201")
+    assert urlparse(body["download_url"]).path == urlparse(body["url"]).path
+
+    anon = app.test_client()
+    r = anon.get(body["download_url"], base_url="https://tak.example.com")
+    assert r.status_code == 200 and r.mimetype == "application/zip"
+    assert 'filename="Raven_100.76.118.201.zip"' in r.headers["Content-Disposition"]
+    with zipfile.ZipFile(io.BytesIO(r.data)) as z:
+        pref = [n for n in z.namelist() if n.endswith(".pref")][0]
+        assert _pref_entries(z.read(pref))["connectString0"][1] == "100.76.118.201:8089:ssl"
+
+    # The named host must still be an IPv4 address
+    path = urlparse(body["download_url"]).path
+    for bad in ("tak.example.com", "fd7a:115c:a1e0::1", "1.2.3.4:80"):
+        r = anon.get(path, query_string={"host": bad}, base_url="https://tak.example.com")
+        assert r.status_code == 404
 
 
 def test_onboard_rejects_bad_tokens(app):
