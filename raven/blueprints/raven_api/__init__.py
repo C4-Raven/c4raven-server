@@ -15,7 +15,6 @@ from raven.blueprints.raven_api.group_api import group_api
 from raven.blueprints.raven_api.marker_api import marker_api_blueprint
 from raven.blueprints.raven_api.mediamtx_api import mediamtx_api_blueprint
 from raven.blueprints.raven_api.meshtastic_api import meshtastic_api_blueprint
-from raven.blueprints.raven_api.message_search_api import message_search_api_blueprint
 from raven.blueprints.raven_api.metrics_api import metrics_api_blueprint
 from raven.blueprints.raven_api.mission_api import data_sync_api
 from raven.blueprints.raven_api.onboard_api import onboard_api_blueprint
@@ -43,7 +42,6 @@ raven_api.register_blueprint(device_profile_tools_api_blueprint)
 raven_api.register_blueprint(marker_api_blueprint)
 raven_api.register_blueprint(mediamtx_api_blueprint)
 raven_api.register_blueprint(meshtastic_api_blueprint)
-raven_api.register_blueprint(message_search_api_blueprint)
 raven_api.register_blueprint(metrics_api_blueprint)
 raven_api.register_blueprint(packages_blueprint)
 raven_api.register_blueprint(scheduler_api_blueprint)

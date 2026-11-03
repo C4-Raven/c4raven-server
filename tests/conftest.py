@@ -138,10 +138,3 @@ def client(app):
 @pytest.fixture
 def auth(app, client):
     return AuthActions(app, client)
-
-
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers",
-        "real_default_window: message search test that keeps the 24 hour default window",
-    )
