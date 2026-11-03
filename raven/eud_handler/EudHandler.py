@@ -44,6 +44,7 @@ from raven import metrics
 from raven.EmailValidator import EmailValidator
 from raven.PasswordValidator import PasswordValidator
 from raven.cert_revocation import CERT_ROUTING_PREFIX
+from raven.db_upsert import insert_ignore
 from raven.defaultconfig import DefaultConfig
 from raven.extensions import logger as ots_logger, db, ldap_manager
 from raven.functions import iso8601_string_from_datetime, datetime_from_iso8601_string
@@ -736,23 +737,30 @@ class EudHandler(socketserver.BaseRequestHandler):
                 self.user = user
 
                 if uid:
-                    try:
-                        eud = db.session.execute(db.session.query(EUD).filter_by(uid=uid)).first()[
-                            0
-                        ]
-                        self.logger.debug(
-                            "Associating EUD uid {} to user {}".format(eud.uid, user.username)
+                    # Check-then-insert used to race with this device's other connection or
+                    # parse_device_info (euds_uid_key) and the IntegrityError escaped
+                    eud, created = self.get_or_create_eud(uid)
+                    self.logger.debug(
+                        "Associating {} EUD uid {} to user {}".format(
+                            "new" if created else "existing", uid, user.username
                         )
-                        eud.user_id = user.id
-                        db.session.commit()
-                    except:
-                        db.session.rollback()
-                        self.logger.debug("This is a new eud: {} {}".format(uid, user.username))
-                        eud = EUD()
-                        eud.uid = uid
-                        eud.user_id = user.id
+                    )
+                    eud.user_id = user.id
+                    if created and self.callsign:
                         eud.callsign = self.callsign
-                        db.session.add(eud)
+                    try:
+                        db.session.commit()
+                    except sqlalchemy.exc.IntegrityError as e:
+                        # Another device already has this callsign
+                        db.session.rollback()
+                        self.logger.warning(
+                            "Couldn't set EUD {}'s callsign to {}: {}".format(
+                                uid, self.callsign, e.orig
+                            )
+                        )
+                        db.session.execute(
+                            update(EUD).where(EUD.uid == uid).values(user_id=user.id)
+                        )
                         db.session.commit()
 
                     # The commits above expired user's attributes. Reload them while the session
@@ -819,6 +827,34 @@ class EudHandler(socketserver.BaseRequestHandler):
             routing_key="cot_parser",
             properties=pika.BasicProperties(expiration=self.app.config.get("RAVEN_RABBITMQ_TTL")),
         )
+
+    @staticmethod
+    def get_or_create_team(name):
+        """The Team called name, created if it's new (race-free, see raven/db_upsert.py) and
+        linked to the chatroom of the same name if there is one. Commits."""
+        chatroom = db.session.execute(
+            select(Chatroom).filter(Chatroom.name == name)
+        ).scalars().first()
+        insert_ignore(
+            db.session,
+            Team,
+            {"name": name, "chatroom_id": chatroom.id if chatroom else None},
+            ["name"],
+        )
+        db.session.commit()
+        team = db.session.execute(select(Team).filter(Team.name == name)).scalar_one()
+        if not team.chatroom_id and chatroom:
+            team.chatroom_id = chatroom.id
+            db.session.commit()
+        return team
+
+    @staticmethod
+    def get_or_create_eud(uid):
+        """(EUD, created) for uid, inserting a bare row if it's new. Race-free: each connection
+        is its own process and two of them may see a new device at once. Commits."""
+        created = insert_ignore(db.session, EUD, {"uid": uid}, ["uid"])
+        db.session.commit()
+        return db.session.execute(select(EUD).filter_by(uid=uid)).scalar_one(), created
 
     def parse_device_info(self, event):
         link = event.find("link")
@@ -1035,39 +1071,12 @@ class EudHandler(socketserver.BaseRequestHandler):
 
             with self.app.app_context():
                 __group = event.find("__group")
-                team = Team()
+                team = None
 
                 if __group:
-                    team.name = bleach.clean(__group.attrs["name"])
+                    team = self.get_or_create_team(bleach.clean(__group.attrs["name"]))
 
-                    try:
-                        chatroom = db.session.execute(
-                            select(Chatroom).filter(Chatroom.name == team.name)
-                        ).first()[0]
-                        team.chatroom_id = chatroom.id
-                    except TypeError:
-                        chatroom = None
-
-                    try:
-                        db.session.add(team)
-                        db.session.commit()
-                    except sqlalchemy.exc.IntegrityError:
-                        db.session.rollback()
-                        team = db.session.execute(
-                            select(Team).filter(Team.name == __group.attrs["name"])
-                        ).first()[0]
-                        if not team.chatroom_id and chatroom:
-                            team.chatroom_id = chatroom.id
-                            db.session.execute(
-                                update(Team)
-                                .filter(Team.name == chatroom.id)
-                                .values(chatroom_id=chatroom.id)
-                            )
-
-                try:
-                    eud = db.session.execute(select(EUD).filter_by(uid=uid)).first()[0]
-                except:
-                    eud = EUD()
+                eud, _ = self.get_or_create_eud(uid)
 
                 eud.uid = uid
                 if self.callsign:
@@ -1104,19 +1113,32 @@ class EudHandler(socketserver.BaseRequestHandler):
                 else:
                     eud.meshtastic_macaddr = base64.b64encode(os.urandom(6)).decode("ascii")
 
-                if __group:
+                if team is not None:
                     eud.team_id = team.id
                     eud.team_role = bleach.clean(__group.attrs["role"])
 
+                # Read before the commit: a rollback would expire them
+                with db.session.no_autoflush:
+                    eud_values = {
+                        column.key: getattr(eud, column.key)
+                        for column in EUD.__table__.columns
+                        if column.key not in ("id", "uid")
+                    }
                 try:
-                    db.session.add(eud)
                     db.session.commit()
-                except sqlalchemy.exc.IntegrityError:
+                except sqlalchemy.exc.IntegrityError as e:
+                    # The callsign is unique: another device already has it. Keep this
+                    # device's row and update everything else.
                     db.session.rollback()
-                    db.session.execute(
-                        update(EUD).where(EUD.uid == eud.uid).values(**eud.serialize())
+                    self.logger.warning(
+                        "Couldn't save EUD {} with callsign {}: {}".format(
+                            uid, self.callsign, e.orig
+                        )
                     )
+                    eud_values.pop("callsign", None)
+                    db.session.execute(update(EUD).where(EUD.uid == uid).values(**eud_values))
                     db.session.commit()
+                    eud = db.session.execute(select(EUD).filter_by(uid=uid)).scalar_one()
 
                 # Deliver any clear-content commands an admin queued while this
                 # device was offline, by writing straight to this connection's

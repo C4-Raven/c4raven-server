@@ -30,6 +30,7 @@ from pika.channel import Channel
 from sqlalchemy import exc, insert, select, update
 
 from raven import metrics
+from raven.db_upsert import insert_ignore
 from raven.defaultconfig import DefaultConfig
 from raven.extensions import db, logger
 from raven.functions import *
@@ -439,18 +440,21 @@ class CoTController:
             if not remarks:
                 return
 
-            chatroom = Chatroom()
-
-            chatroom.name = chat.attrs["chatroom"]
-            chatroom.id = chat.attrs["id"]
-            chatroom.parent = chat.attrs["parent"] if "parent" in chat.attrs else None
-
+            # Every message names its chatroom; create it the first time only. ON CONFLICT DO
+            # NOTHING rather than catching the IntegrityError, which PostgreSQL logged as an
+            # error for each message to an existing room.
             with self.context:
-                try:
-                    self.db.session.add(chatroom)
-                    self.db.session.commit()
-                except exc.IntegrityError:
-                    self.db.session.rollback()
+                insert_ignore(
+                    self.db.session,
+                    Chatroom,
+                    {
+                        "id": chat.attrs["id"],
+                        "name": chat.attrs["chatroom"],
+                        "parent": chat.attrs["parent"] if "parent" in chat.attrs else None,
+                    },
+                    ["id"],
+                )
+                self.db.session.commit()
 
             geochat = GeoChat()
 
@@ -558,20 +562,23 @@ class CoTController:
                             )
                             self.db.session.commit()
 
-                    chatroom_uid = ChatroomsUids()
-                    chatroom_uid.chatroom_id = chat.attrs["id"]
-                    chatroom_uid.uid = chat_group.attrs[attr]
-
                     with self.context:
                         try:
-                            self.db.session.add(chatroom_uid)
-                            self.db.session.commit()
-                            self.logger.debug(
-                                "add {} to chatroom {}".format(
-                                    chatroom_uid.uid, chatroom_uid.chatroom_id
-                                )
+                            added = insert_ignore(
+                                self.db.session,
+                                ChatroomsUids,
+                                {"chatroom_id": chat.attrs["id"], "uid": chat_group.attrs[attr]},
+                                ["chatroom_id", "uid"],
                             )
+                            self.db.session.commit()
+                            if added:
+                                self.logger.debug(
+                                    "add {} to chatroom {}".format(
+                                        chat_group.attrs[attr], chat.attrs["id"]
+                                    )
+                                )
                         except exc.IntegrityError:
+                            # A member uid that isn't an EUD here (foreign key on PostgreSQL)
                             self.db.session.rollback()
 
     def queue_offline_chat(self, event, uid, user_id, target_groups=None):

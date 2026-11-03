@@ -752,6 +752,35 @@ def test_reenrolling_keeps_the_revoked_row(app):
     assert rows[0]["revocation_reason"] == "keyCompromise"
 
 
+def test_reenrolling_device_causes_no_database_errors(app):
+    """The device's EUD row already exists on re-enrollment: INSERT ... ON CONFLICT DO NOTHING
+    instead of an insert PostgreSQL rejects (and logs as an error, euds_uid_key)."""
+    from sqlalchemy import event
+
+    from raven.models.EUD import EUD
+
+    errors = []
+    with app.app_context():
+        engine = db.engine
+
+    def on_error(context):
+        errors.append(str(context.original_exception))
+
+    event.listen(engine, "handle_error", on_error)
+    try:
+        r1, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+        r2, _ = _sign(app, "alice", "alicepass", ["alice"], uid="ANDROID-a1")
+    finally:
+        event.remove(engine, "handle_error", on_error)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert errors == []
+    with app.app_context():
+        eud = db.session.query(EUD).filter_by(uid="ANDROID-a1").one()
+        assert eud.user_id is not None
+        assert eud.certificate.serial_number == _serial_of(r2)
+        assert len(eud.certificates) == 2
+
+
 def test_reenrolling_never_overwrites_a_revoked_row_even_with_a_unique_eud_uid(app):
     """A database with a unique constraint on certificates.eud_uid (the migration drops it)
     takes the IntegrityError fallback: it may reuse a valid row but never the revoked one."""

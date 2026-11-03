@@ -233,3 +233,22 @@ def test_authenticate_eud_credentials(app):
         assert authenticate_eud_credentials(app, "alice", "") is None
         assert authenticate_eud_credentials(app, "alice", None) is None
         assert authenticate_eud_credentials(app, "nobody", "x") is None
+
+
+def test_auth_for_a_known_device_and_a_taken_callsign(app):
+    # The EUD row is created race-free (another connection or parse_device_info may be creating
+    # it at the same moment); a callsign another device already has doesn't break the login.
+    with app.app_context():
+        db.session.add(EUD(uid="ANDROID-other", callsign="Alpha"))
+        db.session.commit()
+    h = _Handler(app, common_name="alice")
+    h.callsign = "Alpha"
+    h.handle_auth(_auth("alice", "alicepass", uid="ANDROID-alice"))
+    assert _accepted_as(h) == "alice"
+    again = _Handler(app, common_name="alice")
+    again.handle_auth(_auth("alice", "alicepass", uid="ANDROID-alice"))
+    assert _accepted_as(again) == "alice"
+    with app.app_context():
+        eud = db.session.query(EUD).filter_by(uid="ANDROID-alice").one()
+        assert eud.user_id == h.user.id
+        assert eud.callsign is None
