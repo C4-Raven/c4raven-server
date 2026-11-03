@@ -138,10 +138,18 @@ def test_client_disconnect_is_one_line(logs, exc, capsys):
     assert "Traceback" not in capsys.readouterr().err
 
 
-def test_a_real_bug_keeps_its_traceback(logs):
-    _handle_error_with(_server(), KeyError("uid"))
+@pytest.mark.parametrize(
+    "exc",
+    [
+        KeyError("uid"),
+        ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
+        ssl.SSLCertVerificationError(1, "certificate verify failed"),
+    ],
+)
+def test_a_real_bug_keeps_its_traceback(logs, exc):
+    _handle_error_with(_server(), exc)
     errors = raven_records(logs, logging.ERROR)
-    assert len(errors) == 1 and errors[0].exc_info and errors[0].exc_info[0] is KeyError
+    assert len(errors) == 1 and errors[0].exc_info and errors[0].exc_info[0] is type(exc)
     assert "198.51.100.9" in errors[0].getMessage()
 
 

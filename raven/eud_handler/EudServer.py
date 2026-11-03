@@ -10,6 +10,11 @@ CLIENT_GONE_ERRNOS = {errno.ENOTCONN, errno.EPIPE, errno.ECONNRESET, errno.ECONN
 
 
 def is_client_disconnect(e: BaseException) -> bool:
+    # A refused connection or a certificate that fails verification after the client's handshake
+    # is done can only come from a connection the handler opened itself (RabbitMQ, LDAP, an HTTP
+    # call...): a server-side problem that needs its traceback
+    if isinstance(e, (ConnectionRefusedError, ssl.SSLCertVerificationError)):
+        return False
     if isinstance(e, (ConnectionError, TimeoutError, ssl.SSLError)):
         return True
     return isinstance(e, OSError) and e.errno in CLIENT_GONE_ERRNOS
