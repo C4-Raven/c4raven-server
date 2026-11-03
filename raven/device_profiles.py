@@ -45,7 +45,6 @@ VALUE_CLASSES = (STRING, BOOLEAN, INTEGER, LONG, FLOAT)
 
 # Precedence of a match, lowest first
 EVERYONE, GROUP, USER, DEVICE = 0, 1, 2, 3
-MATCH_NAMES = {EVERYONE: "everyone", GROUP: "group", USER: "user", DEVICE: "device"}
 
 MAX_NAME_LENGTH = 255
 MAX_KEY_LENGTH = 255
