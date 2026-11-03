@@ -168,8 +168,15 @@ class Token(db.Model):
 
                 return True
 
+            except jwt.exceptions.DecodeError as e:
+                # Not a JWT at all. The Basic-auth paths try the password as a token once it
+                # failed as a password, so this is almost always a mistyped password (the
+                # caller logs/audits the failed login); not a server error.
+                logger.info(f"Credential for {username} is neither its password nor a token: {e}")
+                return False
             except jwt.exceptions.InvalidTokenError as e:
-                logger.error(f"Invalid token: {e}")
+                # Expired, not yet valid, bad signature or audience: a client-side problem
+                logger.warning(f"Invalid token: {e}")
                 logger.debug(traceback.format_exc())
                 return False
             except BaseException as e:
