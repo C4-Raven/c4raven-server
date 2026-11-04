@@ -1,6 +1,6 @@
 """Clients dropping, and internet scanners probing the streaming ports, are expected: they are
 logged as one line, not as tracebacks (socketserver's default handle_error printed one to stderr,
-i.e. opentakserver.log, for every connection that reset or that close_connection() found already
+i.e. raven.log, for every connection that reset or that close_connection() found already
 gone). Real bugs keep their tracebacks."""
 
 import datetime

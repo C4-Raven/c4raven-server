@@ -12,7 +12,7 @@ RUN chown -R raven:raven /app
 RUN python -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
-RUN pip install git+https://github.com/C4Raven/c4raven-server.git
+RUN pip install /app
 
 USER raven
 

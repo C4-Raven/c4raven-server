@@ -4,7 +4,7 @@ that were mapped as one-to-one.
 - EUD.certificate / EUD.data_packages / DataPackage.certificate were uselist=False although a
   device gets a Certificate row per enrollment and uploads any number of packages: SQLAlchemy
   picked an arbitrary row and warned "Multiple rows returned with uselist=False" (hundreds of
-  times a day in opentakserver.log).
+  times a day in raven.log).
 - Chatrooms, chatroom members, teams and EUDs were created by insert-then-catch-IntegrityError
   (PostgreSQL logged each rejected insert as an ERROR) or check-then-insert (the IntegrityError
   of a lost race escaped). raven.db_upsert.insert_ignore does INSERT ... ON CONFLICT DO NOTHING.

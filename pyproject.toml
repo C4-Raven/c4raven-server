@@ -7,7 +7,10 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/C4-Raven/c4raven-server"
 documentation = "https://github.com/C4-Raven/c4raven-server"
-include = [{path = "raven/translations/**/*", format = ["sdist", "wheel"]}]
+include = [
+    {path = "raven/translations/**/*", format = ["sdist", "wheel"]},
+    {path = "raven/data/iconsets.sqlite", format = ["sdist", "wheel"]},
+]
 
 [tool.poetry.dependencies]
 # adsbxcot and aiscot were deleted from PyPI (both projects 404 since

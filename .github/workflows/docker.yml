@@ -17,13 +17,13 @@ jobs:
       matrix:
         include:
           - dockerfile: ./Dockerfile
-            image: ghcr.io/c4raven/raven
+            image: ghcr.io/c4-raven/raven
           - dockerfile: ./raven/cot_parser/Dockerfile
-            image: ghcr.io/c4raven/raven_cot_parser
+            image: ghcr.io/c4-raven/raven_cot_parser
           - dockerfile: ./raven/eud_handler/Dockerfile
-            image: ghcr.io/c4raven/raven_eud_handler
+            image: ghcr.io/c4-raven/raven_eud_handler
           - dockerfile: ./raven/eud_handler/Dockerfile-ssl
-            image: ghcr.io/c4raven/raven_eud_handler_ssl
+            image: ghcr.io/c4-raven/raven_eud_handler_ssl
     permissions:
       contents: read
       packages: write

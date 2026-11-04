@@ -10,14 +10,12 @@ msgstr ""
 "POT-Creation-Date: 2026-02-26 10:44-0500\n"
 "PO-Revision-Date: 2026-02-26 15:51+0000\n"
 "Last-Translator: Brian Wallen <bwallen@gmail.com>\n"
-"Language-Team: French <https://weblate.opentakserver.io/projects/"
-"opentakserver/opentakserver/fr/>\n"
+"Language-Team: C4 Raven <support@c4raven.net>\n"
 "Language: fr\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=n > 1;\n"
-"X-Generator: Weblate 5.13.3\n"
 "Generated-By: Babel 2.15.0\n"
 
 #: blueprints/marti_api/cot_marti_api.py:32
@@ -73,7 +71,7 @@ msgid "clientUid required"
 msgstr "clientUid requis"
 
 #: blueprints/marti_api/group_marti_api.py:274
-#: blueprints/ots_api/group_api.py:365 blueprints/ots_api/user_api.py:574
+#: blueprints/raven_api/group_api.py:365 blueprints/raven_api/user_api.py:574
 msgid "Direction must be IN or OUT"
 msgstr "La direction doit être IN ou OUT"
 
@@ -119,7 +117,7 @@ msgstr "Aucune mission trouvée avec le GUID : %(mission_guid)s"
 
 #: blueprints/marti_api/mission_marti_api.py:333
 #: blueprints/marti_api/mission_marti_api.py:1456
-#: blueprints/ots_api/mission_api.py:409
+#: blueprints/raven_api/mission_api.py:409
 msgid "Invalid password"
 msgstr "Mot de passe invalide"
 
@@ -142,7 +140,7 @@ msgid "Group not found: %(group_name)s"
 msgstr "Groupe introuvable : %(group_name)s"
 
 #: blueprints/marti_api/mission_marti_api.py:604
-#: blueprints/ots_api/mission_api.py:197
+#: blueprints/raven_api/mission_api.py:197
 #, python-format
 msgid "Failed to add mission: %(e)s"
 msgstr "Échec de l'ajout de la mission : %(e)s"
@@ -157,7 +155,7 @@ msgstr "Nom de mission invalide"
 #: blueprints/marti_api/mission_marti_api.py:940
 #: blueprints/marti_api/mission_marti_api.py:1650
 #: blueprints/marti_api/mission_marti_api.py:2046
-#: blueprints/ots_api/mission_api.py:308
+#: blueprints/raven_api/mission_api.py:308
 #, python-format
 msgid "Mission %(mission_name)s not found"
 msgstr "Mission %(mission_name)s introuvable"
@@ -215,7 +213,7 @@ msgstr "Type d'invitation invalide : %(invitation_type)s"
 
 #: blueprints/marti_api/mission_marti_api.py:1003
 #: blueprints/marti_api/mission_marti_api.py:1591
-#: blueprints/ots_api/mission_api.py:384
+#: blueprints/raven_api/mission_api.py:384
 #, python-format
 msgid "Mission not found: %(mission_name)s"
 msgstr "Mission introuvable : %(mission_name)s"
@@ -235,7 +233,7 @@ msgid "Only mission owners can change EUD roles"
 msgstr "Seuls les responsables de mission peuvent modifier les rôles EUD"
 
 #: blueprints/marti_api/mission_marti_api.py:1157
-#: blueprints/ots_api/marker_api.py:86
+#: blueprints/raven_api/marker_api.py:86
 msgid "Please provide a UID"
 msgstr "Veuillez fournir un UID"
 
@@ -268,7 +266,7 @@ msgstr ""
 "groupe"
 
 #: blueprints/marti_api/mission_marti_api.py:1410
-#: blueprints/ots_api/mediamtx_api.py:58
+#: blueprints/raven_api/mediamtx_api.py:58
 msgid "Invalid token"
 msgstr "Jeton invalide"
 
@@ -333,7 +331,7 @@ msgid "Video not found"
 msgstr "Vidéo introuvable"
 
 #: blueprints/marti_api/video_marti_api.py:216
-#: blueprints/ots_api/group_api.py:209 blueprints/ots_api/user_api.py:508
+#: blueprints/raven_api/group_api.py:209 blueprints/raven_api/user_api.py:508
 #, python-format
 msgid "User %(username)s not found"
 msgstr "Utilisateur %(username)s introuvable"
@@ -343,31 +341,31 @@ msgstr "Utilisateur %(username)s introuvable"
 msgid "Video stream with uid %(uid)s not found"
 msgstr "Flux vidéo avec l'UID %(uid)s introuvable"
 
-#: blueprints/ots_api/api.py:82
+#: blueprints/raven_api/api.py:82
 #, python-format
 msgid "Invalid sort column: %(sort_by)s"
 msgstr "Colonne de tri invalide : %(sort_by)s"
 
-#: blueprints/ots_api/api.py:283
+#: blueprints/raven_api/api.py:283
 #, python-format
 msgid "Invalid username: %(username)s"
 msgstr "Nom d'utilisateur invalide : %(username)s"
 
-#: blueprints/ots_api/api.py:324
+#: blueprints/raven_api/api.py:324
 #, python-format
 msgid "Certificate already exists for %(username)s"
 msgstr "Un certificat existe déjà pour %(username)s"
 
-#: blueprints/ots_api/api.py:360
+#: blueprints/raven_api/api.py:360
 msgid "Please specify a callsign"
 msgstr "Veuillez indiquer un indicatif d'appel"
 
-#: blueprints/ots_api/casevac_api.py:148
+#: blueprints/raven_api/casevac_api.py:148
 #, python-format
 msgid "Unknown UID: %(uid)s"
 msgstr "UID inconnu : %(uid)s"
 
-#: blueprints/ots_api/data_package_api.py:47
+#: blueprints/raven_api/data_package_api.py:47
 msgid ""
 "Server connection data packages can't be installed on enrollment or "
 "connection"
@@ -375,391 +373,391 @@ msgstr ""
 "Les packages de données de connexion au serveur ne peuvent pas être "
 "installés lors de l'inscription ou de la connexion"
 
-#: blueprints/ots_api/data_package_api.py:83
+#: blueprints/raven_api/data_package_api.py:83
 msgid "Invalid/unknown hash"
 msgstr "Hachage invalide/inconnu"
 
-#: blueprints/ots_api/data_package_api.py:134
+#: blueprints/raven_api/data_package_api.py:134
 msgid "Please provide a data package hash"
 msgstr "Veuillez fournir le hachage du paquet de données"
 
-#: blueprints/ots_api/data_package_api.py:150
+#: blueprints/raven_api/data_package_api.py:150
 #, python-format
 msgid "Data package with hash '%(hash)s' not found"
 msgstr "Paquet de données avec le hachage '%(hash)s' introuvable"
 
-#: blueprints/ots_api/device_profile_api.py:61
+#: blueprints/raven_api/device_profile_api.py:61
 msgid "Please specify the preference_key"
 msgstr "Veuillez préciser la clé de préférence"
 
-#: blueprints/ots_api/device_profile_api.py:74
+#: blueprints/raven_api/device_profile_api.py:74
 #, python-format
 msgid "Unknown preference_key: %(preference_key)s"
 msgstr "Clé de préférence inconnue : %(preference_key)s"
 
-#: blueprints/ots_api/group_api.py:41 blueprints/ots_api/group_api.py:124
-#: blueprints/ots_api/group_api.py:165
+#: blueprints/raven_api/group_api.py:41 blueprints/raven_api/group_api.py:124
+#: blueprints/raven_api/group_api.py:165
 msgid "LDAP is enabled. Please view and edit groups on your LDAP server"
 msgstr ""
 "LDAP est activé. Veuillez consulter et modifier les groupes sur votre "
 "serveur LDAP"
 
-#: blueprints/ots_api/group_api.py:182
+#: blueprints/raven_api/group_api.py:182
 msgid "Please provide the username, group name, and direction"
 msgstr "Veuillez indiquer le nom d'utilisateur, le nom du groupe et l'orientation"
 
-#: blueprints/ots_api/group_api.py:197
+#: blueprints/raven_api/group_api.py:197
 #, python-format
 msgid "Invalid direction: %(direction)s"
 msgstr "Direction invalide : %(direction)s"
 
-#: blueprints/ots_api/group_api.py:217
+#: blueprints/raven_api/group_api.py:217
 #, python-format
 msgid "Group %(group_name)s not found"
 msgstr "Groupe %(group_name)s introuvable"
 
-#: blueprints/ots_api/group_api.py:253
+#: blueprints/raven_api/group_api.py:253
 #, python-format
 msgid "Failed to remove %(username)s from %(group_name)s: %(e)s"
 msgstr "Échec de la suppression de %(username)s de %(group_name)s : %(e)s"
 
-#: blueprints/ots_api/group_api.py:274
+#: blueprints/raven_api/group_api.py:274
 msgid "LDAP is enabled, please use your LDAP server to add groups"
 msgstr ""
 "LDAP est activé, veuillez utiliser votre serveur LDAP pour ajouter des "
 "groupes"
 
-#: blueprints/ots_api/group_api.py:281
+#: blueprints/raven_api/group_api.py:281
 msgid "Missing name"
 msgstr "Nom manquant"
 
-#: blueprints/ots_api/group_api.py:303
+#: blueprints/raven_api/group_api.py:303
 #, python-format
 msgid "%(name)s group already exists"
 msgstr "Le groupe %(name)s existe déjà"
 
-#: blueprints/ots_api/group_api.py:315
+#: blueprints/raven_api/group_api.py:315
 #, python-format
 msgid "Failed to add %(name)s group: %(e)s"
 msgstr "Échec de l'ajout du groupe %(name)s : %(e)s"
 
-#: blueprints/ots_api/group_api.py:341 blueprints/ots_api/user_api.py:548
+#: blueprints/raven_api/group_api.py:341 blueprints/raven_api/user_api.py:548
 msgid "LDAP is enabled, please use your LDAP server to add users to groups"
 msgstr ""
 "LDAP est activé, veuillez utiliser votre serveur LDAP pour ajouter des "
 "utilisateurs aux groupes"
 
-#: blueprints/ots_api/group_api.py:358
+#: blueprints/raven_api/group_api.py:358
 msgid "Please provide a list of users, group name, and direction"
 msgstr ""
 "Veuillez fournir une liste des utilisateurs, le nom du groupe et "
 "l'orientation"
 
-#: blueprints/ots_api/group_api.py:374 blueprints/ots_api/user_api.py:236
-#: blueprints/ots_api/user_api.py:286 blueprints/ots_api/user_api.py:352
-#: blueprints/ots_api/user_api.py:390
+#: blueprints/raven_api/group_api.py:374 blueprints/raven_api/user_api.py:236
+#: blueprints/raven_api/user_api.py:286 blueprints/raven_api/user_api.py:352
+#: blueprints/raven_api/user_api.py:390
 #, python-format
 msgid "User %(username)s does not exist"
 msgstr "L'utilisateur %(username)s n'existe pas"
 
-#: blueprints/ots_api/group_api.py:386
+#: blueprints/raven_api/group_api.py:386
 #, python-format
 msgid "Group %(group_name)s does not exist"
 msgstr "Le groupe %(group_name)s n'existe pas"
 
-#: blueprints/ots_api/group_api.py:416
+#: blueprints/raven_api/group_api.py:416
 msgid "LDAP is enabled, please use your LDAP server to delete groups"
 msgstr ""
 "LDAP est activé, veuillez utiliser votre serveur LDAP pour supprimer les "
 "groupes"
 
-#: blueprints/ots_api/group_api.py:425
+#: blueprints/raven_api/group_api.py:425
 msgid "Missing group name"
 msgstr "Nom du groupe manquant"
 
-#: blueprints/ots_api/group_api.py:430
+#: blueprints/raven_api/group_api.py:430
 msgid "The __ANON__ group cannot be deleted"
 msgstr "Le groupe __ANON__ ne peut pas être supprimé"
 
-#: blueprints/ots_api/group_api.py:443
+#: blueprints/raven_api/group_api.py:443
 #, python-format
 msgid "No such group: %(group_name)s"
 msgstr "Groupe inexistant : %(group_name)s"
 
-#: blueprints/ots_api/group_api.py:465
+#: blueprints/raven_api/group_api.py:465
 #, python-format
 msgid "Failed to delete %(group_name)s: %(e)s"
 msgstr "Échec de la suppression de %(group_name)s : %(e)s"
 
-#: blueprints/ots_api/language_api.py:13
+#: blueprints/raven_api/language_api.py:13
 msgid "This is a test"
 msgstr "Ceci est un test"
 
-#: blueprints/ots_api/marker_api.py:48
+#: blueprints/raven_api/marker_api.py:48
 msgid "Please provide a latitude and longitude"
 msgstr "Veuillez indiquer une latitude et une longitude"
 
-#: blueprints/ots_api/marker_api.py:57
+#: blueprints/raven_api/marker_api.py:57
 #, python-format
 msgid "Invalid latitude: %(latitude)s"
 msgstr "Latitude invalide : %(latitude)s"
 
-#: blueprints/ots_api/marker_api.py:69
+#: blueprints/raven_api/marker_api.py:69
 #, python-format
 msgid "Invalid longitude: %(longitude)s"
 msgstr "Longitude invalide : %(longitude)s"
 
-#: blueprints/ots_api/marker_api.py:80
+#: blueprints/raven_api/marker_api.py:80
 #, python-format
 msgid "Failed to parse lat/lon: %(e)s"
 msgstr "Échec de l'analyse de la latitude/longitude : %(e)s"
 
-#: blueprints/ots_api/marker_api.py:88
+#: blueprints/raven_api/marker_api.py:88
 msgid "Please provide a name"
 msgstr "Veuillez indiquer un nom"
 
-#: blueprints/ots_api/marker_api.py:96
+#: blueprints/raven_api/marker_api.py:96
 msgid "Invalid UID. UIDs need to be in UUID4 format"
 msgstr "UID invalide. Les UID doivent être au format UUID4"
 
-#: blueprints/ots_api/marker_api.py:112
+#: blueprints/raven_api/marker_api.py:112
 #, python-format
 msgid "Invalid type: %(cot_type)s"
 msgstr "Type invalide : %(cot_type)s"
 
-#: blueprints/ots_api/marker_api.py:269
+#: blueprints/raven_api/marker_api.py:269
 #, python-format
 msgid "Failed to parse data: %(e)s"
 msgstr "Échec de l'analyse des données : %(e)s"
 
-#: blueprints/ots_api/marker_api.py:283
+#: blueprints/raven_api/marker_api.py:283
 msgid "Please provide the UID of the marker to delete"
 msgstr "Veuillez fournir l'UID du marqueur à supprimer"
 
-#: blueprints/ots_api/marker_api.py:294
+#: blueprints/raven_api/marker_api.py:294
 #, fuzzy
 msgid "Unknown UID"
 msgstr "UID inconnu"
 
-#: blueprints/ots_api/mediamtx_api.py:305
-#: blueprints/ots_api/mediamtx_api.py:404
+#: blueprints/raven_api/mediamtx_api.py:305
+#: blueprints/raven_api/mediamtx_api.py:404
 msgid "Please specify a path name"
 msgstr "Veuillez spécifier un nom de chemin d’accès"
 
-#: blueprints/ots_api/mediamtx_api.py:309
+#: blueprints/raven_api/mediamtx_api.py:309
 msgid "Path cannot begin with a slash"
 msgstr "Un chemin ne peut pas commencer par une barre oblique"
 
-#: blueprints/ots_api/mediamtx_api.py:327
-#: blueprints/ots_api/mediamtx_api.py:413
+#: blueprints/raven_api/mediamtx_api.py:327
+#: blueprints/raven_api/mediamtx_api.py:413
 #, python-format
 msgid "Path %(path)s not found"
 msgstr "Chemin d’accès %(path)s introuvable"
 
-#: blueprints/ots_api/mediamtx_api.py:421
+#: blueprints/raven_api/mediamtx_api.py:421
 msgid "MediaMTX is not running"
 msgstr "MediaMTX n'est pas en cours d'exécution"
 
-#: blueprints/ots_api/meshtastic_api.py:167
+#: blueprints/raven_api/meshtastic_api.py:167
 msgid "Please provide the URL of the channel to delete"
 msgstr "Veuillez fournir l'URL de la chaîne à supprimer"
 
-#: blueprints/ots_api/mission_api.py:163 blueprints/ots_api/mission_api.py:281
+#: blueprints/raven_api/mission_api.py:163 blueprints/raven_api/mission_api.py:281
 #, python-format
 msgid "Invalid property: %(key)s"
 msgstr "Propriété invalide : %(key)s"
 
-#: blueprints/ots_api/mission_api.py:254
+#: blueprints/raven_api/mission_api.py:254
 msgid "Only an admin or the mission creator can change this mission"
 msgstr ""
 "Seul un administrateur ou le créateur de la mission peut modifier cette "
 "mission"
 
-#: blueprints/ots_api/mission_api.py:298
+#: blueprints/raven_api/mission_api.py:298
 msgid "Please specify a mission name"
 msgstr "Veuillez préciser le nom de la mission"
 
-#: blueprints/ots_api/mission_api.py:400
+#: blueprints/raven_api/mission_api.py:400
 msgid "Please provide the mission password"
 msgstr "Veuillez fournir le mot de passe de la mission"
 
-#: blueprints/ots_api/plugin_api.py:50
+#: blueprints/raven_api/plugin_api.py:50
 msgid "Server plugins must be zip, whl, or tar.gz files"
 msgstr "Les plugins serveur doivent être des fichiers zip, whl ou tar.gz"
 
-#: blueprints/ots_api/plugin_api.py:66 blueprints/ots_api/plugin_api.py:99
-#: blueprints/ots_api/plugin_api.py:115 blueprints/ots_api/plugin_api.py:130
+#: blueprints/raven_api/plugin_api.py:66 blueprints/raven_api/plugin_api.py:99
+#: blueprints/raven_api/plugin_api.py:115 blueprints/raven_api/plugin_api.py:130
 msgid "Plugins are disabled"
 msgstr "Les plugins sont désactivés"
 
-#: blueprints/ots_api/plugin_api.py:91
+#: blueprints/raven_api/plugin_api.py:91
 #, python-format
 msgid "Plugin %(plugin_name)s not found"
 msgstr "Module %(plugin_name)s introuvable"
 
-#: blueprints/ots_api/token_api.py:191
+#: blueprints/raven_api/token_api.py:191
 #, python-format
 msgid "No token found for %(username)s"
 msgstr "Aucun jeton trouvé pour %(username)s"
 
-#: blueprints/ots_api/token_api.py:222
+#: blueprints/raven_api/token_api.py:222
 #, python-format
 msgid "Failed to delete token: %(e)s"
 msgstr "Échec de la suppression du jeton : %(e)s"
 
-#: blueprints/ots_api/user_api.py:36
+#: blueprints/raven_api/user_api.py:36
 msgid "LDAP is enabled, please use your LDAP server to create users"
 msgstr ""
 "Le protocole LDAP est activé. Veuillez utiliser votre serveur LDAP pour "
 "créer des utilisateurs"
 
-#: blueprints/ots_api/user_api.py:53
+#: blueprints/raven_api/user_api.py:53
 msgid "Passwords do not match"
 msgstr "Les mots de passe ne correspondent pas"
 
-#: blueprints/ots_api/user_api.py:65 blueprints/ots_api/user_api.py:338
+#: blueprints/raven_api/user_api.py:65 blueprints/raven_api/user_api.py:338
 #, python-format
 msgid "Role %(role)s does not exist"
 msgstr "Le rôle %(role)s n'existe pas"
 
-#: blueprints/ots_api/user_api.py:75
+#: blueprints/raven_api/user_api.py:75
 msgid "Only administrators can add users to the administrators role"
 msgstr ""
 "Seuls les administrateurs peuvent ajouter des utilisateurs au rôle "
 "d'administrateur"
 
-#: blueprints/ots_api/user_api.py:99
+#: blueprints/raven_api/user_api.py:99
 #, python-format
 msgid "User %(username)s already exists"
 msgstr "L'utilisateur %(username)s existe déjà"
 
-#: blueprints/ots_api/user_api.py:114
+#: blueprints/raven_api/user_api.py:114
 msgid "LDAP is enabled, please use your LDAP server to delete users"
 msgstr ""
 "Le protocole LDAP est activé. Veuillez utiliser votre serveur LDAP pour "
 "supprimer les utilisateurs"
 
-#: blueprints/ots_api/user_api.py:126
+#: blueprints/raven_api/user_api.py:126
 msgid "You can't delete your own account"
 msgstr "Vous ne pouvez pas supprimer votre propre compte"
 
-#: blueprints/ots_api/user_api.py:139
+#: blueprints/raven_api/user_api.py:139
 #, python-format
 msgid "Failed to delete user: %(e)s"
 msgstr "Échec de la suppression de l'utilisateur : %(e)s"
 
-#: blueprints/ots_api/user_api.py:155
+#: blueprints/raven_api/user_api.py:155
 msgid "LDAP is enabled, please use your LDAP server to reset passwords"
 msgstr ""
 "Le protocole LDAP est activé. Veuillez utiliser votre serveur LDAP pour "
 "réinitialiser les mots de passe"
 
-#: blueprints/ots_api/user_api.py:169
+#: blueprints/raven_api/user_api.py:169
 msgid "Please specify a username and new password"
 msgstr "Veuillez indiquer un nom d'utilisateur et un nouveau mot de passe"
 
-#: blueprints/ots_api/user_api.py:181
+#: blueprints/raven_api/user_api.py:181
 #, python-format
 msgid "Your password must be at least %(characters)s characters long"
 msgstr "Votre mot de passe doit comporter au moins %(characters)s caractères"
 
-#: blueprints/ots_api/user_api.py:198
+#: blueprints/raven_api/user_api.py:198
 #, python-format
 msgid "Could not find user %(username)s"
 msgstr "Impossible de trouver l'utilisateur %(username)s"
 
-#: blueprints/ots_api/user_api.py:213
+#: blueprints/raven_api/user_api.py:213
 msgid "LDAP is enabled, please use your LDAP server to deactivate users"
 msgstr ""
 "Le protocole LDAP est activé. Veuillez utiliser votre serveur LDAP pour "
 "désactiver les utilisateurs"
 
-#: blueprints/ots_api/user_api.py:225
+#: blueprints/raven_api/user_api.py:225
 msgid "Please specify the username to deactivate"
 msgstr "Veuillez indiquer le nom d'utilisateur à désactiver"
 
-#: blueprints/ots_api/user_api.py:250
+#: blueprints/raven_api/user_api.py:250
 #, python-format
 msgid "%(username)s is already deactivated"
 msgstr "%(username)s est déjà désactivé"
 
-#: blueprints/ots_api/user_api.py:263
+#: blueprints/raven_api/user_api.py:263
 msgid "LDAP is enabled, please use your LDAP server to activate users"
 msgstr ""
 "Le protocole LDAP est activé. Veuillez utiliser votre serveur LDAP pour "
 "activer les utilisateurs"
 
-#: blueprints/ots_api/user_api.py:275
+#: blueprints/raven_api/user_api.py:275
 msgid "Please specify the username to activate"
 msgstr "Veuillez indiquer le nom d'utilisateur à activer"
 
-#: blueprints/ots_api/user_api.py:300
+#: blueprints/raven_api/user_api.py:300
 #, python-format
 msgid "%(username)s is already activated"
 msgstr "%(username)s est déjà activé"
 
-#: blueprints/ots_api/user_api.py:313
+#: blueprints/raven_api/user_api.py:313
 msgid "LDAP is enabled, please use your LDAP server to assign roles"
 msgstr ""
 "LDAP est activé, veuillez utiliser votre serveur LDAP pour attribuer les "
 "rôles"
 
-#: blueprints/ots_api/user_api.py:327
+#: blueprints/raven_api/user_api.py:327
 msgid "Please specify a username and roles"
 msgstr "Veuillez indiquer un nom d'utilisateur et des rôles"
 
-#: blueprints/ots_api/user_api.py:401
+#: blueprints/raven_api/user_api.py:401
 #, python-format
 msgid "EUD %(eud_uid)s not found"
 msgstr "EUD %(eud_uid)s introuvable"
 
-#: blueprints/ots_api/user_api.py:414
+#: blueprints/raven_api/user_api.py:414
 #, python-format
 msgid "%(uid)s is already assigned to another user"
 msgstr "%(uid)s est déjà attribué à un autre utilisateur"
 
-#: blueprints/ots_api/user_api.py:435 blueprints/ots_api/user_api.py:457
+#: blueprints/raven_api/user_api.py:435 blueprints/raven_api/user_api.py:457
 msgid "LDAP is enabled, please use your LDAP server to manage users"
 msgstr ""
 "Le protocole LDAP est activé. Veuillez utiliser votre serveur LDAP pour "
 "gérer les utilisateurs"
 
-#: blueprints/ots_api/user_api.py:488
+#: blueprints/raven_api/user_api.py:488
 msgid "LDAP is enabled, please use your LDAP server to manage groups"
 msgstr ""
 "LDAP est activé, veuillez utiliser votre serveur LDAP pour gérer les "
 "groupes"
 
-#: blueprints/ots_api/user_api.py:498
+#: blueprints/raven_api/user_api.py:498
 msgid "Please provide a username"
 msgstr "Veuillez fournir un nom d'utilisateur"
 
-#: blueprints/ots_api/user_api.py:565
+#: blueprints/raven_api/user_api.py:565
 msgid "Please provide a list of groups, a username, and a direction"
 msgstr ""
 "Veuillez fournir une liste de groupes, un nom d'utilisateur et une "
 "direction"
 
-#: blueprints/ots_api/user_api.py:582
+#: blueprints/raven_api/user_api.py:582
 #, python-format
 msgid "User %(username)s doesn't exist"
 msgstr "L'utilisateur %(username)s n'existe pas"
 
-#: blueprints/ots_api/user_api.py:596
+#: blueprints/raven_api/user_api.py:596
 #, python-format
 msgid "Group %(group_name)s doesn't exist"
 msgstr "Le groupe %(group_name)s n'existe pas"
 
-#: blueprints/ots_api/video_api.py:46
+#: blueprints/raven_api/video_api.py:46
 msgid "Please specify a valid path"
 msgstr "Veuillez indiquer un chemin valide"
 
-#: blueprints/ots_api/video_api.py:72
+#: blueprints/raven_api/video_api.py:72
 #, python-format
 msgid "Invalid recording_id: %(recording_id)s"
 msgstr "recording_id invalide : %(recording_id)s"
 
-#: blueprints/ots_api/video_api.py:97
+#: blueprints/raven_api/video_api.py:97
 msgid "Recording not found"
 msgstr "Enregistrement introuvable"
 

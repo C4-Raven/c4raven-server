@@ -17,7 +17,6 @@ import colorlog
 import flask_wtf
 import pika
 import pytz
-import requests
 import sqlalchemy
 import yaml
 from apscheduler.jobstores.base import JobLookupError
@@ -638,39 +637,49 @@ def create_default_groups(app):
                 db.session.commit()
 
 
+BUNDLED_ICONSETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "iconsets.sqlite")
+
+
+def load_bundled_icons(path=BUNDLED_ICONSETS_PATH):
+    """Insert every row of the bundled iconsets.sqlite into the icons table.
+
+    Reads the file shipped with the package, read-only, with no network access.
+    Returns the number of icons inserted. Must run inside an app context.
+    """
+
+    def dict_factory(cursor, row):
+        d = {}
+        for idx, col in enumerate(cursor.description):
+            d[col[0]] = row[idx]
+        return d
+
+    con = sqlite3.connect("file:{}?mode=ro".format(quote(path)), uri=True)
+    try:
+        con.row_factory = dict_factory
+        cur = con.cursor()
+        rows = cur.execute("SELECT * FROM icons")
+        count = 0
+        for row in rows:
+            db.session.execute(insert(Icon).values(**row))
+            count += 1
+        db.session.commit()
+        return count
+    finally:
+        con.close()
+
+
 def main(app):
     with app.app_context():
-        # Download the icon sets if they aren't already in the DB
+        # Load the bundled icon sets if they aren't already in the DB. The
+        # sqlite file ships inside the package (raven/data/iconsets.sqlite);
+        # nothing is fetched over the network.
         icons = db.session.query(Icon).count()
         if icons == 0:
-            logger.info("Downloading icons...")
+            logger.info("Loading bundled icons...")
             try:
-                r = requests.get(
-                    "https://github.com/brian7704/OpenTAKServer-Installer/raw/master/iconsets.sqlite",
-                    stream=True,
-                )
-                with open(
-                    os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "icons.sqlite"), "wb"
-                ) as f:
-                    f.write(r.content)
-
-                def dict_factory(cursor, row):
-                    d = {}
-                    for idx, col in enumerate(cursor.description):
-                        d[col[0]] = row[idx]
-                    return d
-
-                con = sqlite3.connect(
-                    os.path.join(app.config.get("RAVEN_DATA_FOLDER"), "icons.sqlite")
-                )
-                con.row_factory = dict_factory
-                cur = con.cursor()
-                rows = cur.execute("SELECT * FROM icons")
-                for row in rows:
-                    db.session.execute(insert(Icon).values(**row))
-                db.session.commit()
+                load_bundled_icons()
             except BaseException as e:
-                logger.error("Failed to download icons: {}".format(e))
+                logger.error("Failed to load icons: {}".format(e))
                 logger.debug(traceback.format_exc())
 
         if app.config.get("DEBUG"):

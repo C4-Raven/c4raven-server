@@ -1,10 +1,9 @@
 """Added citrap table
 
 Backs the Reports and Returns / CITRAP report submission endpoints
-(raven/blueprints/marti_api/citrap_api.py). Ported from the upstream
-project's in-progress "reports" branch, minus the geoalchemy2
-Geography column on points (not a dependency this fork carries) --
-reports are stored with plain lat/lon like everything else, and most
+(raven/blueprints/marti_api/citrap_api.py). Points are stored with
+plain lat/lon like everything else (no geoalchemy2 Geography column),
+and most
 columns are nullable since not every report XML sets every attribute.
 
 Revision ID: 8a43097881d7

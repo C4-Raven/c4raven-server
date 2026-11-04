@@ -53,7 +53,7 @@ class EudServer(socketserver.ForkingTCPServer):
 
     def handle_error(self, request, client_address):
         """Called (in the forked child) when the handler raised. socketserver's default prints a
-        traceback to stderr, which flooded opentakserver.log with clients dropping mid-connection.
+        traceback to stderr, which flooded raven.log with clients dropping mid-connection.
         A disconnect is one line here; anything else is a bug and keeps its traceback."""
         e = sys.exc_info()[1]
         if e is not None and is_client_disconnect(e):

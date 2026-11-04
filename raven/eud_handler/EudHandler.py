@@ -46,7 +46,7 @@ from raven.PasswordValidator import PasswordValidator
 from raven.cert_revocation import CERT_ROUTING_PREFIX
 from raven.db_upsert import insert_ignore
 from raven.defaultconfig import DefaultConfig
-from raven.extensions import logger as ots_logger, db, ldap_manager
+from raven.extensions import logger as raven_logger, db, ldap_manager
 from raven.functions import iso8601_string_from_datetime, datetime_from_iso8601_string
 
 # These unused imports are required by SQLAlchemy, don't remove them
@@ -118,7 +118,7 @@ def authenticate_eud_credentials(app, username, password):
         if Token.verify_token(password, user.username, consume=False, check_max=False):
             return user
     except BaseException as e:
-        ots_logger.error(f"Failed to verify credentials for {username}: {e}")
+        raven_logger.error(f"Failed to verify credentials for {username}: {e}")
 
     return None
 
@@ -130,7 +130,7 @@ class EudHandler(socketserver.BaseRequestHandler):
     common_name = None
     user = None
     is_ssl = False
-    logger = ots_logger
+    logger = raven_logger
     app = None
     rabbit_connection = None
     rabbit_channel = None
@@ -157,7 +157,7 @@ class EudHandler(socketserver.BaseRequestHandler):
     cert_control_bound = False
 
     def __init__(self, request: socket, client_address, server):
-        # Do NOT set self.logger here. The class-level `logger = ots_logger`
+        # Do NOT set self.logger here. The class-level `logger = raven_logger`
         # attribute (the properly-configured "Raven" logger, with this
         # process's file handler attached) already covers every instance
         # unless overridden. It used to be overridden right here with

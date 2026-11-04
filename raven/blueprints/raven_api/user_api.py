@@ -786,7 +786,7 @@ def _generate_fileshare_cot(
     this used the wrong sha256sum attribute name (should be sha256) and were missing the
     <ackrequest> and <marti><dest> elements — found by checking FreeTAKServer's own
     working implementation of the same push (FreeTAKServer/core/services/RestAPI.py),
-    since neither this server nor the upstream project has ever implemented this.
+    since this server had never implemented it.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     event = Element(

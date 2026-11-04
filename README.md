@@ -1,8 +1,8 @@
 # Raven
 
-Raven is the TAK (Team Awareness Kit) server behind [C4 Raven](https://tak.c4raven.net) —
-a security-hardened fork of [the upstream project](https://github.com/brian7704/OpenTAKServer)
-this is derived from, paired with the [Raven UI](https://github.com/C4-Raven/c4raven-ui) frontend.
+Raven is the security-hardened TAK (Team Awareness Kit) server behind
+[C4 Raven](https://tak.c4raven.net), paired with the
+[Raven UI](https://github.com/C4-Raven/c4raven-ui) frontend.
 
 ## Current Features
 
@@ -59,8 +59,9 @@ and its [CHANGELOG](https://github.com/C4-Raven/c4raven-server-setup/blob/master
 for what changed in each release. Servers installed from source are
 updated with that repo's `update.sh` or with
 [c4raven-updater](https://github.com/C4-Raven/c4raven-updater), which also
-handles the older single-user layout (`~/.opentakserver_venv`, `~/ots`,
-`opentakserver.service`) and can finish an install that stopped partway.
+handles the older single-user layout (`~/.raven_venv`, `~/ots`,
+`raven.service`, `/var/www/html/raven`) and can finish an install that
+stopped partway.
 
 ## Architecture
 
@@ -168,9 +169,6 @@ coverage reports):
 poetry run pytest
 ```
 
-## Credits
+## License
 
-Raven is a fork of [the upstream project](https://github.com/brian7704/OpenTAKServer)
-by Brian (brian7704) and contributors, licensed GPL-3.0-or-later. The upstream
-project's [Discord server](https://discord.gg/6uaVHjtfXN) is a good place for
-general upstream/TAK questions not specific to this fork.
+GPL-3.0-or-later (see LICENSE). Portions © Brian (brian7704) and contributors.

@@ -30,7 +30,7 @@ class Point(db.Model):
     battery: Mapped[float] = mapped_column(Float, nullable=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime, index=True)
     azimuth: Mapped[float] = mapped_column(Float, nullable=True)
-    # Camera field of view from TAK ICU and OpenTAK ICU
+    # Camera field of view from ICU camera apps
     fov: Mapped[float] = mapped_column(Float, nullable=True)
     cot_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("cot.id", ondelete="CASCADE"), nullable=True, index=True

@@ -188,7 +188,7 @@ class CoTController:
                 else:
                     p.speed = 0
 
-            # For TAK ICU and OpenTAK ICU CoT's with bearing from the compass
+            # For CoTs from ICU camera apps with bearing from the compass
             sensor = event.find("sensor")
             if sensor:
                 if "azimuth" in sensor.attrs:
@@ -275,7 +275,7 @@ class CoTController:
                 ).first()[0]
 
                 # This CoT is a position update for an EUD. Send it to socketio clients so it can be seen on the UI map
-                # OpenTAK ICU position updates don't include the <takv> tag, but we still want to send the updated position
+                # Some ICU camera apps send position updates without the <takv> tag, but we still want to send the updated position
                 # to the UI's map
                 if event.find("takv") or event.find("__video"):
                     self.socketio.emit("point", p.to_json(), namespace="/socket.io")
@@ -702,7 +702,7 @@ class CoTController:
             not event.find("takv")
             and (not event.find("contact") or "endpoint" not in event.find("contact").attrs)
             and
-            # Ignore video streams from sources like OpenTAK ICU
+            # Ignore video streams from sources like ICU camera apps
             event.attrs["type"] != "b-m-p-s-p-loc"
         ):
 
@@ -1303,7 +1303,7 @@ class CoTController:
                                 self.logger.debug("Updated {}".format(uid))
                                 eud_json = eud.to_json()
                                 # The first time an EUD connects but doesn't have a location.
-                                # Tells the UI what kind of EUD this is, ie ATAK/WinTAK/iTAK or OpenTAK ICU
+                                # Tells the UI what kind of EUD this is, ie ATAK/WinTAK/iTAK or an ICU camera app
                                 if not eud_json["last_point"]:
                                     eud_json["type"] = event.attrs["type"]
                                 self.socketio.emit("eud", eud.to_json(), namespace="/socket.io")

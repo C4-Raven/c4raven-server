@@ -7,9 +7,8 @@ Every Raven process writes a TimedRotatingFileHandler log into <RAVEN_DATA_FOLDE
     [2026-10-31 11:02:03,456] - Raven[1234] - module - funcName - 42 - ERROR - message
 
 and multi-line messages / tracebacks on the following lines. The systemd units also append the
-processes' stdout/stderr to a file in the same folder (opentakserver.log on the legacy layout,
-raven.log on the /opt/raven layout), so crashes that happen before logging is set up, and
-uncaught tracebacks printed by Python, end up in these files as lines without the header.
+processes' stdout/stderr to raven.log in the same folder (on every install layout), so crashes
+that happen before logging is set up, and uncaught tracebacks printed by Python, end up in these files as lines without the header.
 Those become "raw" entries (timestamp/pid/line null, level from Python's "LEVEL:logger:"
 prefix or guessed from the text) unless they continue a WARNING/ERROR entry. Stderr copies of the "Raven"
 logger's own records are dropped as duplicates of the file records. Raw entries are ordered by
@@ -82,8 +81,8 @@ PLAIN_LEVEL_RE = re.compile(rb"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+\[")
 # Python's default logging format, e.g. "ERROR:raven.app:Exception on /api/foo [GET]".
 BASIC_FORMAT_RE = re.compile(rb"^(DEBUG|INFO|WARNING|ERROR|CRITICAL):([\w.\-]+):(.*)$")
 # Loggers that also write to a log file with the full header (see raven.extensions.logger), so
-# their stderr copies are duplicates. "OpenTAKServer" is the pre-rename logger name.
-DUPLICATE_LOGGERS = {"Raven", "OpenTAKServer"}
+# their stderr copies are duplicates.
+DUPLICATE_LOGGERS = {"Raven"}
 SEPARATOR_RE = re.compile(rb"^-{20,}\s*$")
 # Unindented lines that begin a new block of stderr output.
 RECORD_START_RE = re.compile(

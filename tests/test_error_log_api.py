@@ -247,7 +247,7 @@ def test_stderr_capture(app, admin):
     # tracebacks printed for uncaught exceptions.
     write(
         app,
-        "opentakserver.log",
+        "raven.log",
         "INFO:Raven:Starting in production mode\n"
         "ERROR:Raven:duplicate of a file record\n"
         "ERROR:raven.app:Exception on /api/foo [GET]\n"

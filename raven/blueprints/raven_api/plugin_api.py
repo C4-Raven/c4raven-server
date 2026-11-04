@@ -9,6 +9,7 @@ from flask_security import roles_required
 from werkzeug.utils import secure_filename
 
 from raven.extensions import logger
+from raven.plugins.plugin_repo import get_plugin_repo as configured_plugin_repo
 
 plugin_blueprint = Blueprint("plugin_api_blueprint", __name__)
 
@@ -68,7 +69,8 @@ def upload_plugin():
 @plugin_blueprint.route("/api/plugins/repo")
 @roles_required("administrator")
 def get_plugin_repo():
-    return jsonify({"success": True, "repo_url": app.config.get("RAVEN_PLUGIN_REPO")})
+    # "" means no repository is configured (installs by name are refused).
+    return jsonify({"success": True, "repo_url": configured_plugin_repo(app.config)})
 
 
 @plugin_blueprint.route("/api/plugins/<plugin_name>", strict_slashes=False)

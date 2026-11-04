@@ -235,7 +235,7 @@ def status():
     )
     system_uptime = now - system_boot_time
 
-    ots_uptime = now - app.start_time
+    server_uptime = now - app.start_time
 
     cpu_time = psutil.cpu_times()
     cpu_time_dict = {"user": cpu_time.user, "system": cpu_time.system, "idle": cpu_time.idle}
@@ -284,8 +284,8 @@ def status():
         "online_euds": len(online_euds),
         "system_boot_time": system_boot_time.strftime("%Y-%m-%d %H:%M:%SZ"),
         "system_uptime": system_uptime.total_seconds(),
-        "ots_start_time": app.start_time.strftime("%Y-%m-%d %H:%M:%SZ"),
-        "ots_uptime": ots_uptime.total_seconds(),
+        "server_start_time": app.start_time.strftime("%Y-%m-%d %H:%M:%SZ"),
+        "server_uptime": server_uptime.total_seconds(),
         "cpu_time": cpu_time_dict,
         # System-wide, like every other stat in this response (memory, disk,
         # network) -- this used to be psutil.Process().cpu_percent(), which
@@ -296,7 +296,7 @@ def status():
         "memory": vmem_dict,
         "disk_usage": disk_usage_dict,
         "network": network_dict,
-        "ots_version": version,
+        "server_version": version,
         "uname": uname,
         "os_release": os_release,
         "python_version": platform.python_version(),

@@ -19,6 +19,7 @@ from raven.blueprints.raven_socketio import administrator_only
 from raven.extensions import db, logger, socketio
 from raven.models.Plugins import Plugins
 from raven.plugins.Plugin import Plugin
+from raven.plugins.plugin_repo import NO_PLUGIN_REPO_MESSAGE, get_plugin_repo
 
 if TYPE_CHECKING:
     from typing import Any
@@ -169,7 +170,18 @@ class PluginManager:
                 logger.debug(traceback.format_exc())
 
         elif json.get("action") == "install":
-            command = f"{sys.executable} -m pip --no-input install {json.get('plugin_distro')} -i {app.config.get('RAVEN_PLUGIN_REPO')}"
+            plugin_repo = get_plugin_repo(app.config)
+            if not plugin_repo:
+                logger.error(NO_PLUGIN_REPO_MESSAGE)
+                socketio.emit(
+                    "plugin_package_manager",
+                    {"success": False, "message": NO_PLUGIN_REPO_MESSAGE},
+                    namespace="/socket.io",
+                    to=request.sid,
+                    ignore_queue=True,
+                )
+                return
+            command = f"{sys.executable} -m pip --no-input install {json.get('plugin_distro')} -i {plugin_repo}"
 
         elif json.get("action") == "install_local":
             logger.info(f"{json.get('action')} {json.get('plugin_file_name')}")

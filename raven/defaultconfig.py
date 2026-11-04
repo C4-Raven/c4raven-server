@@ -209,8 +209,8 @@ class DefaultConfig:
     RAVEN_LDAP_CALLSIGN_ATTRIBUTE = "callsignAttribute"
 
     # LDAP user attributes with this prefix can be used to control ATAK settings for a specific user
-    RAVEN_LDAP_PREFERENCE_ATTRIBUTE_PREFIX = "ots_"
-    RAVEN_LDAP_GROUP_PREFIX = "ots_"
+    RAVEN_LDAP_PREFERENCE_ATTRIBUTE_PREFIX = "raven_"
+    RAVEN_LDAP_GROUP_PREFIX = "raven_"
 
     # Flask-LDAP3-Login settings
     LDAP_HOST = "127.0.0.1"
@@ -235,8 +235,11 @@ class DefaultConfig:
     RAVEN_AIS_GROUP = "AIS"
 
     RAVEN_ENABLE_PLUGINS = True
-    RAVEN_PLUGIN_REPO = "https://repo.opentakserver.io/brian/prod/"
-    RAVEN_PLUGIN_PREFIXES = ["ots-", "ots_"]
+    # Package index that "install" in the plugin manager pulls from. Empty by
+    # default: no repository is configured, so only uploaded plugin files can be
+    # installed until an operator sets RAVEN_PLUGIN_REPO.
+    RAVEN_PLUGIN_REPO = os.getenv("RAVEN_PLUGIN_REPO", "")
+    RAVEN_PLUGIN_PREFIXES = ["raven-", "raven_"]
 
     # AIS Settings
     RAVEN_AISHUB_USERNAME = None
