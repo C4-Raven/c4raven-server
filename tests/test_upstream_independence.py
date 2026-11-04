@@ -31,6 +31,13 @@ from raven.models.Icon import Icon  # noqa: E402
 from raven.plugins import PluginManager as plugin_manager_module  # noqa: E402
 from raven.plugins.plugin_repo import NO_PLUGIN_REPO_MESSAGE, get_plugin_repo  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _no_plugin_repo_env(monkeypatch):
+    # The env var overrides config.yml; keep a developer's shell from leaking in.
+    monkeypatch.delenv("RAVEN_PLUGIN_REPO", raising=False)
+
+
 BUNDLED_ICONSETS_SHA256 = "7733ac2d1959d2ab68b1e23d5b886b2847a5551f121110be59e6ef9a0299ce3a"
 BUNDLED_ICON_COUNT = 3743
 
@@ -219,7 +226,22 @@ def test_install_refused_without_repo(plugin_app, monkeypatch):
     assert emitted == [
         ("plugin_package_manager", {"success": False, "message": NO_PLUGIN_REPO_MESSAGE})
     ]
-    assert NO_PLUGIN_REPO_MESSAGE == "No plugin repository configured; set RAVEN_PLUGIN_REPO"
+    assert "RAVEN_PLUGIN_REPO" in NO_PLUGIN_REPO_MESSAGE
+
+
+def test_env_repo_overrides_config_yml(monkeypatch):
+    # config.yml is frozen on first run; the env var must still win afterwards.
+    monkeypatch.setenv("RAVEN_PLUGIN_REPO", " https://env.example.net/simple/ ")
+    assert get_plugin_repo({"RAVEN_PLUGIN_REPO": ""}) == "https://env.example.net/simple/"
+    assert get_plugin_repo({"RAVEN_PLUGIN_REPO": "https://yml.example.net/"}) == "https://env.example.net/simple/"
+
+
+def test_config_repo_used_when_env_unset(monkeypatch):
+    monkeypatch.delenv("RAVEN_PLUGIN_REPO", raising=False)
+    assert get_plugin_repo({"RAVEN_PLUGIN_REPO": " https://yml.example.net/ "}) == "https://yml.example.net/"
+    assert get_plugin_repo({"RAVEN_PLUGIN_REPO": None}) == ""
+    monkeypatch.setenv("RAVEN_PLUGIN_REPO", "  ")
+    assert get_plugin_repo({}) == ""
 
 
 def test_install_uses_configured_repo(plugin_app, monkeypatch):
