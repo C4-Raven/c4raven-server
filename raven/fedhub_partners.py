@@ -34,6 +34,7 @@ import socket
 import threading
 import uuid
 from contextlib import contextmanager
+from urllib.parse import quote
 
 import requests
 from flask_babel import gettext
@@ -67,6 +68,12 @@ class PartnerError(Exception):
         self.message = message
         self.status = status
         self.extra = extra
+
+    undo_safe = True
+
+    def with_undo(self, safe):
+        self.undo_safe = safe
+        return self
 
     def to_json(self):
         body = {"success": False, "error": self.message, "code": self.code}
@@ -355,23 +362,32 @@ def parse_ca_file(data):
             "invalid_ca", gettext("That file isn't an X.509 certificate in PEM or DER format")
         )
 
-    der = cert.public_bytes(Encoding.DER)
-    sha256 = hashlib.sha256(der).hexdigest()
-    subject = cert.subject.rfc4514_string()
+    # The loaders are lazy: a malformed name, extension or date only fails when it's read
     try:
-        basic = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
-        is_ca = bool(basic.ca)
-    except x509.ExtensionNotFound:
-        is_ca = False
-    try:
-        not_after = cert.not_valid_after_utc
-    except AttributeError:  # cryptography < 42
-        not_after = cert.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+        der = cert.public_bytes(Encoding.DER)
+        sha256 = hashlib.sha256(der).hexdigest()
+        subject = cert.subject.rfc4514_string()
+        issuer = cert.issuer.rfc4514_string()
+        try:
+            basic = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+            is_ca = bool(basic.ca)
+        except x509.ExtensionNotFound:
+            is_ca = False
+        try:
+            not_after = cert.not_valid_after_utc
+        except AttributeError:  # cryptography < 42
+            not_after = cert.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+        pem = cert.public_bytes(Encoding.PEM)
+    except Exception:
+        raise PartnerError(
+            "bad_certificate",
+            gettext("That certificate is damaged or uses a format the hub can't read"),
+        )
     return {
-        "pem": cert.public_bytes(Encoding.PEM),
+        "pem": pem,
         "sha256": sha256,
         "subject": subject,
-        "issuer": cert.issuer.rfc4514_string(),
+        "issuer": issuer,
         "uid": f"{subject}-{sha256}",
         "not_after": not_after.isoformat().replace("+00:00", "Z"),
         "is_ca": is_ca,
@@ -542,7 +558,41 @@ def _incoming_from_ca(entry, connections):
     return found
 
 
-def partner_problems(entry, policy, own_uid, known_cas, conns, now=None):
+HUB_CLIENT = "FEDERATION_HUB_CLIENT"
+
+
+def dial_conflicts(entries, connections):
+    """Partner ids caught in "both sides dial" (G6).
+
+    A partner whose own (linked) outgoing node dials it while a connection from its CA comes
+    in is flagged. An outgoing node not linked to any CA (e.g. made in the native console)
+    can't be matched to a CA, so while it dials anyone and another hub dials in
+    (remoteConnectionType FEDERATION_HUB_CLIENT) from a partner's CA, both that outgoing
+    partner and the CA partner are flagged.
+    """
+    flagged = set()
+    for entry in entries:
+        if entry["outgoing"] and entry["ca_uid"] and _incoming_from_ca(entry, connections):
+            flagged.add(entry["id"])
+    unlinked = [e for e in entries if e["outgoing"] and not e["ca_uid"]]
+    if not unlinked:
+        return flagged
+    out_names = [e["outgoing"].get("name") for e in entries if e["outgoing"] and e["outgoing"].get("name")]
+    for conn in connections or []:
+        if conn.get("remoteConnectionType") != HUB_CLIENT:
+            continue
+        cid = conn.get("connectionId") or ""
+        if any(cid.startswith(name) for name in out_names):
+            continue  # that's one of our own outgoing connections
+        groups = conn.get("groupIdentities") or []
+        for entry in entries:
+            if entry["ca_uid"] and entry["ca_uid"] in groups and not entry["outgoing"]:
+                flagged.add(entry["id"])
+                flagged.update(e["id"] for e in unlinked if _enabled(e["outgoing"]))
+    return flagged
+
+
+def partner_problems(entry, policy, own_uid, known_cas, conns, now=None, dial_conflict=False):
     problems = []
     if entry["ca_uid"] and not find_ca(known_cas, uid=entry["ca_uid"]):
         problems.append("ca_not_trusted")
@@ -558,7 +608,7 @@ def partner_problems(entry, policy, own_uid, known_cas, conns, now=None):
     receive_type = filter_from_rule(receive)["type"] if receive else "allGroups"
     if share_type != "allGroups" or (_kind(entry) == "raven_hub" and receive_type != "allGroups"):
         problems.append("filter_not_all_groups")
-    if entry["outgoing"] and _incoming_from_ca(entry, conns):
+    if dial_conflict:
         problems.append("both_sides_dial")
     left = days_left(_expires(entry), now)
     if left is not None:
@@ -569,7 +619,8 @@ def partner_problems(entry, policy, own_uid, known_cas, conns, now=None):
     return problems
 
 
-def build_partner(entry, policy, own_uid, known_cas, conns=None, metrics=None, now=None):
+def build_partner(entry, policy, own_uid, known_cas, conns=None, metrics=None, now=None,
+                  dial_conflict=False):
     conns = conns or []
     ca_node, outgoing = entry["ca_node"], entry["outgoing"]
     ca = None
@@ -598,7 +649,7 @@ def build_partner(entry, policy, own_uid, known_cas, conns=None, metrics=None, n
     share = _rule(policy, own["id"], primary["id"]) if own else None
     receive = _rule(policy, primary["id"], own["id"]) if own else None
     enabled = all(_enabled(n) for n in _entry_nodes(entry))
-    problems = partner_problems(entry, policy, own_uid, known_cas, conns, now)
+    problems = partner_problems(entry, policy, own_uid, known_cas, conns, now, dial_conflict)
     if not enabled:
         status = "disabled"
     elif conns:
@@ -628,8 +679,10 @@ def build_partner(entry, policy, own_uid, known_cas, conns=None, metrics=None, n
 def build_partners(policy, own_uid, known_cas, connections, metrics, bridge_uid, now=None):
     entries = partner_entries(policy, own_uid) if policy else []
     by_partner, bridge, rest = attribute_connections(entries, connections, own_uid, bridge_uid)
+    conflicts = dial_conflicts(entries, connections)
     partners = [
-        build_partner(e, policy, own_uid, known_cas, by_partner[e["id"]], metrics, now)
+        build_partner(e, policy, own_uid, known_cas, by_partner[e["id"]], metrics, now,
+                      dial_conflict=e["id"] in conflicts)
         for e in entries
     ]
     return partners, bridge, rest
@@ -929,7 +982,19 @@ def remove_partner(policy, own_uid, partner_id):
 
 
 def ca_referenced(policy, uid):
-    return bool(uid) and bool(group_nodes(policy, uid))
+    """Whether any node of ``policy`` uses the CA: a CA node for it, or an outgoing node
+    Raven linked to it."""
+    if not uid:
+        return False
+    if group_nodes(policy, uid):
+        return True
+    return any(e.get("type") == OUTGOING and node_meta(e).get("ca") == uid for e in entities(policy))
+
+
+def unlinked_outgoing(policy):
+    """Outgoing nodes with no Raven link to a CA. The hub verifies each remote with some CA in
+    its truststore, and for these Raven can't tell which."""
+    return [e for e in entities(policy) if e.get("type") == OUTGOING and not node_meta(e).get("ca")]
 
 
 def entity_ids(policy):
@@ -957,12 +1022,60 @@ def tcp_connect(host, port, timeout=TCP_TIMEOUT_SECONDS):
         return False, str(e) or e.__class__.__name__
 
 
-def reachability(host, port, resolver=resolve, connector=tcp_connect):
+def address_allowed(address):
+    """Whether Raven may probe this address for an admin. Private (RFC 1918) addresses are
+    fine -- partners often sit on a LAN or VPN -- but loopback, link-local, multicast and
+    unspecified addresses would let the probe poke at this box or its local segment."""
+    try:
+        ip = ipaddress.ip_address(str(address).split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return not (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified)
+
+
+def probe(host, port, resolver=resolve, connector=tcp_connect):
+    """DNS + TCP probe of host:port -> {dns_ok, addresses, tcp_ok, error, blocked}.
+
+    The TCP test connects to the resolved address (not the name again), and refuses
+    addresses that :func:`address_allowed` rejects, before and after DNS."""
+    result = {"dns_ok": False, "addresses": [], "tcp_ok": False, "error": None, "blocked": False}
+    try:
+        port = validate_port(port)
+    except PartnerError as e:
+        result["error"] = e.message
+        return result
     dns_ok, addresses, error = resolver(host)
-    tcp_ok = False
-    if dns_ok:
-        tcp_ok, error = connector(host, port)
-    return {"dns_ok": dns_ok, "addresses": addresses, "tcp_ok": tcp_ok, "error": error}
+    result.update(dns_ok=dns_ok, addresses=addresses, error=error)
+    if not dns_ok:
+        return result
+    if not addresses or not all(address_allowed(a) for a in addresses):
+        result["blocked"] = True
+        result["error"] = gettext(
+            "Raven doesn't test loopback, link-local, multicast or unspecified addresses"
+        )
+        return result
+    tcp_ok, error = connector(addresses[0], port)
+    result.update(tcp_ok=tcp_ok, error=error)
+    return result
+
+
+def reachability(host, port, resolver=resolve, connector=tcp_connect):
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None and not address_allowed(literal):
+        raise PartnerError(
+            "address_not_allowed",
+            gettext("Raven doesn't test loopback, link-local, multicast or unspecified addresses"),
+        )
+    result = probe(host, port, resolver, connector)
+    blocked = result.pop("blocked")
+    if blocked:
+        raise PartnerError("address_not_allowed", result["error"], addresses=result["addresses"])
+    return result
 
 
 def _check(code, level, title, detail, fix=None):
@@ -1023,27 +1136,35 @@ def build_checks(entry, partner, policy, own_uid, known_cas, connections, resolv
         checks.append(_check("filter_compatible", "ok", title, gettext("Everything is shared")))
 
     title = gettext("Only one side connects")
-    incoming = _incoming_from_ca(entry, connections)
-    if entry["outgoing"] and incoming:
-        checks.append(_check("dial_direction", "error", title,
-                             gettext("We connect to them and they also connect to us; the hub drops one "
-                                     "of the two connections over and over"),
-                             gettext("Remove the outgoing connection on one side (here: edit the server "
-                                     "and choose \"They connect to us\")")))
+    if "both_sides_dial" in partner["problems"]:
+        if entry["outgoing"] and entry["ca_uid"]:
+            detail = gettext("We connect to them and they also connect to us; the hub drops one "
+                             "of the two connections over and over")
+        else:
+            detail = gettext("This hub dials out to another hub while a hub this partner trusts also "
+                             "dials in; if they're the same server the hub drops one of the two "
+                             "connections over and over")
+        checks.append(_check("dial_direction", "error", title, detail,
+                             gettext("Keep only one direction: remove the outgoing connection here, or "
+                                     "ask the other admin to remove theirs")))
     else:
         checks.append(_check("dial_direction", "ok", title,
                              gettext("We connect to them") if entry["outgoing"] else gettext("They connect to us")))
 
     out = partner["outgoing"]
     if out:
-        dns_ok, addresses, error = resolver(out["host"])
+        result = probe(out["host"], out["port"], resolver, connector)
+        dns_ok, addresses, error = result["dns_ok"], result["addresses"], result["error"]
         checks.append(_check("dns", "ok" if dns_ok else "error", gettext("Their address resolves"),
                              ", ".join(addresses) if dns_ok
                              else gettext("%(host)s can't be resolved: %(error)s", host=out["host"], error=error),
                              None if dns_ok else gettext("Check the spelling; it must be the exact name in "
                                                          "their server certificate")))
-        if dns_ok:
-            tcp_ok, error = connector(out["host"], out["port"])
+        if dns_ok and result["blocked"]:
+            checks.append(_check("tcp", "error", gettext("Their port is reachable"), error,
+                                 gettext("Use the partner's real address, not a loopback or link-local one")))
+        elif dns_ok:
+            tcp_ok, error = result["tcp_ok"], result["error"]
             checks.append(_check("tcp", "ok" if tcp_ok else "error", gettext("Their port is reachable"),
                                  gettext("%(host)s:%(port)s accepts connections", host=out["host"], port=out["port"])
                                  if tcp_ok else gettext("Can't connect to %(host)s:%(port)s: %(error)s",
@@ -1096,6 +1217,11 @@ def build_checks(entry, partner, policy, own_uid, known_cas, connections, resolv
 # --- hub client and orchestration ---------------------------------------------------------
 
 
+def seg(value):
+    """One URL path segment for the hub, fully escaped (CA uids hold commas, '=' and spaces)."""
+    return quote(str(value), safe="")
+
+
 class HubUnavailable(PartnerError):
     def __init__(self, timeout=False):
         if timeout:
@@ -1111,6 +1237,9 @@ class HubError(PartnerError):
         if text:
             message = f"{message}: {text}"
         super().__init__("hub_error", message, 502, hub_status=getattr(response, "status_code", None))
+
+
+NO_ACTIVE_POLICY_TEXT = "The active federation policy does not have any graph data"
 
 
 class HubClient:
@@ -1147,15 +1276,20 @@ class HubClient:
             raise HubUnavailable(timeout=True)
         except requests.exceptions.RequestException:
             raise HubUnavailable()
-        if r.status_code in (401, 403) or r.status_code >= 500 and "graph data" not in (r.text or ""):
-            raise HubError(gettext("read the active policy"), r)
-        if r.status_code >= 400 or not r.content:
+        what = gettext("read the active policy")
+        # The hub's one documented "no active policy" answer (FederationHubUIService.getActivePolicy):
+        # 404 with this text. Anything else unexpected must stop a change before it writes.
+        if r.status_code == 404 and NO_ACTIVE_POLICY_TEXT in (r.text or ""):
             return None
+        if r.status_code >= 400:
+            raise HubError(what, r)
         try:
             policy = r.json()
         except ValueError:
-            return None
-        return policy if isinstance(policy, dict) and policy.get("name") else None
+            raise HubError(what, r)
+        if not isinstance(policy, dict) or not policy.get("name") or not isinstance(policy.get("policy"), dict):
+            raise HubError(what, r)
+        return policy
 
     def known_cas(self):
         return self.json("GET", "/getKnownCaGroups", gettext("list its CA certificates")) or []
@@ -1180,7 +1314,7 @@ class HubClient:
                   files={"file": ("ca.pem", pem, "application/x-pem-file")}, data={"nickname": nickname})
 
     def delete_ca(self, uid):
-        self.call("DELETE", f"/deleteGroupCa/{uid}", gettext("remove the CA certificate"))
+        self.call("DELETE", f"/deleteGroupCa/{seg(uid)}", gettext("remove the CA certificate"))
 
     def rename_ca(self, ca, nickname):
         body = dict(ca)
@@ -1192,10 +1326,10 @@ class HubClient:
 
     def activate(self, name):
         # The hub's route is a GET that changes state (G15)
-        self.call("GET", f"/activateFederationPolicy/{name}", gettext("activate the policy"))
+        self.call("GET", f"/activateFederationPolicy/{seg(name)}", gettext("activate the policy"))
 
     def disconnect(self, connection_id):
-        self.call("DELETE", f"/disconnectFederate/{connection_id}", gettext("disconnect the connection"))
+        self.call("DELETE", f"/disconnectFederate/{seg(connection_id)}", gettext("disconnect the connection"))
 
 
 _POLICY_LOCK = threading.Lock()
@@ -1222,22 +1356,32 @@ def prepare_for_save(policy):
 
 
 def apply_policy(client, new_policy, previous=None, logger=None):
-    """Save + activate + confirm. On failure re-saves and re-activates ``previous`` (when
-    there was one) and re-raises. Returns the hub's active policy afterwards."""
+    """Save + activate + confirm (re-read the active policy).
+
+    On failure the previous policy (if there was one) is saved and activated again and the
+    original error is re-raised with ``undo_safe = True``: the caller may undo its own other
+    changes (e.g. delete a CA it added). When that isn't safe -- there was no previous policy
+    to go back to and the hub may already enforce the new one, or restoring failed -- a
+    500 error with ``undo_safe = False`` is raised instead and the caller must leave
+    everything in place.
+    """
     new_policy = prepare_for_save(new_policy)
     name = new_policy.get("name")
+    stage = "save"
     try:
         client.save_policy(new_policy)
+        stage = "activate"
         client.activate(name)
+        stage = "confirm"
         active = client.active_policy()
         if not active or active.get("name") != name or entity_ids(active) != entity_ids(new_policy):
             raise PartnerError(
                 "not_applied",
-                gettext("Federation Hub accepted the change but isn't enforcing it. Nothing was changed"),
+                gettext("Federation Hub accepted the change but isn't enforcing it"),
                 502,
             )
         return active
-    except PartnerError:
+    except PartnerError as error:
         if previous:
             try:
                 client.save_policy(prepare_for_save(previous))
@@ -1245,4 +1389,68 @@ def apply_policy(client, new_policy, previous=None, logger=None):
             except PartnerError as e:
                 if logger:
                     logger.error(f"Federation Hub: couldn't restore the previous policy: {e.message}")
-        raise
+                raise half_changed(error) from error
+            error.undo_safe = True
+            error.extra["restored"] = True
+            raise
+        if stage == "save":
+            # Nothing was activated, so the hub still enforces what it did before
+            error.undo_safe = True
+            raise
+        raise PartnerError(
+            "partially_applied",
+            gettext(
+                "Federation Hub may already be enforcing part of this change (%(error)s). There was "
+                "no earlier policy to go back to, so the policy and any CA certificate it uses were "
+                "left in place. Check them under Advanced",
+                error=error.message,
+            ),
+            500,
+        ).with_undo(False) from error
+
+
+def half_changed(cause):
+    return PartnerError(
+        "rollback_failed",
+        gettext(
+            "Federation Hub may be half-changed: the change failed (%(error)s) and the previous "
+            "policy couldn't be restored. Nothing else was undone; check the hub under Advanced",
+            error=cause.message,
+        ),
+        500,
+    ).with_undo(False)
+
+
+def unique_policy_name(taken, base=DEFAULT_POLICY_NAME):
+    taken = {str(t) for t in taken}
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}-{n}" in taken:
+        n += 1
+    return f"{base}-{n}"
+
+
+def policy_to_change(client):
+    """The active policy plus what to start from for a change: (previous, policy).
+
+    With no active policy a fresh one is only made when the hub has no stored policies at
+    all (under a name no stored policy uses). If stored policies exist, the admin has to
+    activate one of them first: refuse rather than shadow them with a new one."""
+    previous = client.active_policy()
+    if previous:
+        return previous, previous
+    stored = [p for p in client.stored_policies() if isinstance(p, dict)]
+    names = [p.get("name") for p in stored if p.get("name")]
+    if names:
+        raise PartnerError(
+            "no_active_policy",
+            gettext(
+                "Federation Hub has no active policy. Activate one of the stored policies (%(names)s) "
+                "under Advanced first",
+                names=", ".join(names),
+            ),
+            409,
+            stored_policies=names,
+        )
+    return None, empty_policy(unique_policy_name(names))

@@ -76,7 +76,7 @@ def get_connections():
 @federation_hub_api.route("/api/fedhub/connections/<connection_id>", methods=["DELETE"])
 @roles_required("administrator")
 def disconnect_connection(connection_id):
-    return _proxy("DELETE", f"/disconnectFederate/{bleach.clean(connection_id)}")
+    return _proxy("DELETE", f"/disconnectFederate/{fp.seg(connection_id)}")
 
 
 @federation_hub_api.route("/api/fedhub/connections/groups", methods=["POST"])
@@ -322,7 +322,7 @@ def update_ca_group_nickname():
 @federation_hub_api.route("/api/fedhub/ca_groups/<uid>", methods=["DELETE"])
 @roles_required("administrator")
 def delete_ca_group(uid):
-    return _proxy("DELETE", f"/deleteGroupCa/{bleach.clean(uid)}")
+    return _proxy("DELETE", f"/deleteGroupCa/{fp.seg(uid)}")
 
 
 @federation_hub_api.route("/api/fedhub/federations")
@@ -334,26 +334,26 @@ def get_federations():
 @federation_hub_api.route("/api/fedhub/federations/<name>")
 @roles_required("administrator")
 def get_federation(name):
-    return _proxy("GET", f"/federation/{bleach.clean(name)}")
+    return _proxy("GET", f"/federation/{fp.seg(name)}")
 
 
 @federation_hub_api.route("/api/fedhub/federations/<name>/graph")
 @roles_required("administrator")
 def get_federation_graph(name):
-    return _proxy("GET", f"/graphAsJson/{bleach.clean(name)}")
+    return _proxy("GET", f"/graphAsJson/{fp.seg(name)}")
 
 
 @federation_hub_api.route("/api/fedhub/federations/<name>/activate", methods=["POST"])
 @roles_required("administrator")
 def activate_federation_policy(name):
     # Federation Hub itself exposes this as a GET (it's their route, not ours)
-    return _proxy("GET", f"/activateFederationPolicy/{bleach.clean(name)}")
+    return _proxy("GET", f"/activateFederationPolicy/{fp.seg(name)}")
 
 
 @federation_hub_api.route("/api/fedhub/federations/<name>/policy", methods=["DELETE"])
 @roles_required("administrator")
 def delete_federation_policy(name):
-    return _proxy("DELETE", f"/deleteFederationPolicy/{bleach.clean(name)}")
+    return _proxy("DELETE", f"/deleteFederationPolicy/{fp.seg(name)}")
 
 
 @federation_hub_api.route("/api/fedhub/policy")
@@ -377,9 +377,22 @@ def save_policy():
         )
     client = _client()
     try:
+        if not isinstance(body.get("policy"), dict):
+            raise fp.PartnerError("invalid_policy", gettext("The policy has no graph"))
+        force = fp.parse_bool(request.args.get("force_without_own_ca"), False)
         with fp.policy_lock():
-            client.save_policy(fp.prepare_for_save(body))
-            client.activate(body["name"])
+            own = fp.own_ca(client.known_cas())
+            previous = client.active_policy()
+            if own and not force and not fp.own_node(body, own["uid"]):
+                raise fp.PartnerError(
+                    "own_ca_missing_from_policy",
+                    gettext(
+                        "This policy doesn't include this hub's own CA, so Raven's own connection "
+                        "to the hub would be refused once it's active. Add it, or apply anyway"
+                    ),
+                    400,
+                )
+            fp.apply_policy(client, body, previous, logger)
     except fp.PartnerError as e:
         return _partner_error(e)
     return jsonify({"success": True, "activated": True, "name": body["name"]})
@@ -674,8 +687,7 @@ def create_partner():
         with fp.policy_lock():
             known = client.known_cas()
             own = _require_own(known)
-            previous = client.active_policy()
-            policy = previous or fp.empty_policy()
+            previous, policy = fp.policy_to_change(client)
 
             if ca_info is not None:
                 existing = fp.find_ca(known, sha256=ca_info["sha256"])
@@ -743,13 +755,13 @@ def create_partner():
                 )
                 active = fp.apply_policy(client, new_policy, previous, logger)
             except fp.PartnerError as e:
-                if ca_added:
+                if ca_added and e.undo_safe:
                     try:
                         client.delete_ca(existing["uid"])
                     except fp.PartnerError as rollback:
                         logger.error(f"Federation Hub: couldn't remove the CA again: {rollback.message}")
                         e.extra["rollback_failed"] = True
-                if renamed_from is not None:
+                if renamed_from is not None and e.undo_safe:
                     try:
                         client.rename_ca(renamed_from, renamed_from.get("nickname"))
                     except fp.PartnerError as rollback:
@@ -833,8 +845,8 @@ def update_partner(partner_id):
             try:
                 new_policy, new_id = fp.update_partner(previous, own, partner_id, changes)
                 active = fp.apply_policy(client, new_policy, previous, logger)
-            except fp.PartnerError:
-                if renamed is not None:
+            except fp.PartnerError as e:
+                if renamed is not None and e.undo_safe:
                     try:
                         client.rename_ca(renamed, renamed.get("nickname"))
                     except fp.PartnerError as rollback:
@@ -862,7 +874,22 @@ def delete_partner(partner_id):
             fp.apply_policy(client, new_policy, previous, logger)
 
             body = {"success": True, "id": partner_id, "ca_removed": False}
-            if ca_uid and not keep_ca and fp.find_ca(known, uid=ca_uid) and ca_uid != own["uid"]:
+            unlinked = fp.unlinked_outgoing(new_policy)
+            removable = ca_uid and not keep_ca and fp.find_ca(known, uid=ca_uid) and ca_uid != own["uid"]
+            if not removable:
+                pass  # nothing to remove, or the admin asked to keep it
+            elif fp.ca_referenced(new_policy, ca_uid):
+                body["warning"] = gettext(
+                    "The server was removed. Its CA was kept because the active policy still uses it"
+                )
+            elif unlinked:
+                body["warning"] = gettext(
+                    "The server was removed. Its CA was kept because the outgoing connection "
+                    "%(names)s may need it to verify the other side; remove it under Advanced > "
+                    "CA certificates if you're sure it doesn't",
+                    names=", ".join(fp._display(e) for e in unlinked),
+                )
+            else:
                 try:
                     stored = client.stored_policies()
                     users = [
@@ -1063,8 +1090,8 @@ def repair_policy():
         with fp.policy_lock():
             known = client.known_cas()
             own = _require_own(known)
-            previous = client.active_policy()
-            new_policy, added = fp.ensure_own_node(previous or fp.empty_policy(), own)
+            previous, policy = fp.policy_to_change(client)
+            new_policy, added = fp.ensure_own_node(policy, own)
             if not added:
                 return jsonify({"success": True, "changed": False})
             fp.apply_policy(client, new_policy, previous, logger)
@@ -1203,9 +1230,9 @@ def check_reachability():
             raise fp.PartnerError("invalid_request", gettext("Send the host and port as JSON"))
         host = fp.validate_host(data.get("host"))
         port = fp.validate_port(data.get("port") or fp.DEFAULT_V2_PORT)
+        result = fp.reachability(host, port, resolver=fp.resolve, connector=fp.tcp_connect)
     except fp.PartnerError as e:
         return _partner_error(e)
-    result = fp.reachability(host, port, resolver=fp.resolve, connector=fp.tcp_connect)
     return jsonify(dict(result, host=host, port=port))
 
 

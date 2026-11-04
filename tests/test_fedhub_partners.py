@@ -262,6 +262,9 @@ class FakeResponse:
         return json.loads(self.content)
 
 
+NO_POLICY_TEXT = "The active federation policy does not have any graph data associated with it"
+
+
 class FakeHub:
     def __init__(self, policy=None, cas=None):
         policy = policy if policy is not None else live_policy()
@@ -272,6 +275,7 @@ class FakeHub:
         self.metrics = {"totalMessagesDropped": 0, "channelInfos": []}
         self.calls = []
         self.fail = {}  # "METHOD /path-prefix" -> status
+        self.fail_once = {}  # same, but only for the next matching call
         self.down = False
         self.timeout = False
 
@@ -285,6 +289,10 @@ class FakeHub:
             raise requests.exceptions.ConnectionError("down")
         if self.timeout:
             raise requests.exceptions.Timeout("slow")
+        for prefix, status in list(self.fail_once.items()):
+            if call.startswith(prefix):
+                del self.fail_once[prefix]
+                return FakeResponse(status, "boom", "text/plain")
         for prefix, status in self.fail.items():
             if call.startswith(prefix):
                 return FakeResponse(status, "boom", "text/plain")
@@ -293,9 +301,8 @@ class FakeHub:
     def route(self, method, path, kwargs):
         if path == "/getActivePolicy":
             if not self.active:
-                return FakeResponse(
-                    400, "The active federation policy does not have any graph data", "text/plain"
-                )
+                # FederationHubUIService.getActivePolicy: NOT_FOUND with this text
+                return FakeResponse(404, NO_POLICY_TEXT, "text/plain")
             return FakeResponse(200, self.active)
         if path == "/getKnownCaGroups":
             return FakeResponse(200, self.cas)
@@ -333,10 +340,12 @@ class FakeHub:
             return FakeResponse(200, body)
         if path.startswith("/activateFederationPolicy/"):
             name = unquote(path.rsplit("/", 1)[1])
+            if name not in self.policies:
+                return FakeResponse(500, "Could save and activate policy", "text/plain")
             self.active = copy.deepcopy(self.policies[name])
             return FakeResponse(200)
         if path.startswith("/disconnectFederate/"):
-            cid = path[len("/disconnectFederate/"):]
+            cid = unquote(path[len("/disconnectFederate/"):])
             self.connections = [c for c in self.connections if c["connectionId"] != cid]
             return FakeResponse(200)
         if path.startswith("/getKnownGroupsForGraphNode/"):
@@ -573,6 +582,28 @@ def test_parse_ca_file_rejects_bundles_and_garbage():
     assert info["subject"].startswith("CN=TAK-ROOT-CA,")
 
 
+def test_parse_ca_file_malformed_extension():
+    from cryptography.x509.oid import ExtensionOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Broken CA")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.UnrecognizedExtension(ExtensionOID.BASIC_CONSTRAINTS, b"\x05\x00garbage"), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    with pytest.raises(fp.PartnerError) as e:
+        fp.parse_ca_file(cert.public_bytes(Encoding.PEM))
+    assert e.value.code == "bad_certificate" and e.value.status == 400
+
+
 def test_policy_lock_busy():
     with fp.policy_lock():
         result = []
@@ -687,7 +718,7 @@ def test_create_we_dial_when_they_already_dial(admin, hub):
 
 def test_create_rolls_back_when_activate_fails(admin, hub):
     before = copy.deepcopy(hub.active)
-    hub.fail["GET /activateFederationPolicy"] = 500
+    hub.fail_once["GET /activateFederationPolicy"] = 500
     r = post_partner(admin)
     assert r.status_code == 502
     assert r.json["code"] == "hub_error"
@@ -718,6 +749,77 @@ def test_create_with_no_active_policy(admin, hub):
     assert r.status_code == 201, r.json
     assert hub.active["name"] == fp.DEFAULT_POLICY_NAME
     assert fp.own_node(hub.active, OWN["uid"])
+
+
+def test_no_active_policy_but_stored_ones_refuses(admin, hub):
+    hub.active = None  # "Tak" is still stored
+    for r in (post_partner(admin), admin.post("/api/fedhub/repair")):
+        assert r.status_code == 409
+        assert r.json["code"] == "no_active_policy"
+        assert r.json["stored_policies"] == ["Tak"]
+    assert not hub.paths("POST /addNewGroupCa", "POST /saveFederationPolicy", "GET /activateFederationPolicy")
+
+
+def test_unique_policy_name():
+    assert fp.unique_policy_name([]) == "C4Raven"
+    assert fp.unique_policy_name(["C4Raven", "C4Raven-2"]) == "C4Raven-3"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        FakeResponse(400, NO_POLICY_TEXT, "text/plain"),  # right text, wrong status
+        FakeResponse(500, NO_POLICY_TEXT, "text/plain"),
+        FakeResponse(404, "Not Found", "text/plain"),
+        FakeResponse(401, "", "text/plain"),
+        FakeResponse(200, "<html>proxy error</html>", "text/html"),
+        FakeResponse(200, {"version": "v3"}),  # no name
+        FakeResponse(200, b""),
+    ],
+)
+def test_unexpected_active_policy_answer_aborts_before_writing(admin, hub, monkeypatch, response):
+    original = hub.route
+
+    def odd(method, path, kwargs):
+        return response if path == "/getActivePolicy" else original(method, path, kwargs)
+
+    monkeypatch.setattr(hub, "route", odd)
+    for r in (post_partner(admin), admin.post("/api/fedhub/repair")):
+        assert r.status_code == 502, r.json
+        assert r.json["code"] == "hub_error"
+    assert not hub.paths("POST /addNewGroupCa", "POST /saveFederationPolicy", "GET /activateFederationPolicy",
+                         "DELETE /deleteGroupCa")
+    with pytest.raises(fp.HubError):
+        fp.HubClient(hub).active_policy()
+
+
+def test_no_previous_policy_confirm_failure_keeps_ca(admin, hub, monkeypatch):
+    hub.active = None
+    hub.policies = {}
+    original = hub.route
+
+    def stale(method, path, kwargs):
+        if path.startswith("/activateFederationPolicy/"):
+            return FakeResponse(200)  # says yes, enforces nothing
+        return original(method, path, kwargs)
+
+    monkeypatch.setattr(hub, "route", stale)
+    r = post_partner(admin)
+    assert r.status_code == 500
+    assert r.json["code"] == "partially_applied"
+    assert "left in place" in r.json["error"]
+    assert fp.find_ca(hub.cas, uid=tak_uid())  # the stored policy still references it
+    assert not hub.paths("DELETE /deleteGroupCa/")
+
+
+def test_failed_restore_keeps_ca_and_reports_half_changed(admin, hub):
+    hub.fail["GET /activateFederationPolicy"] = 500  # the new one AND the restore fail
+    r = post_partner(admin)
+    assert r.status_code == 500
+    assert r.json["code"] == "rollback_failed"
+    assert "half-changed" in r.json["error"] and "Advanced" in r.json["error"]
+    assert fp.find_ca(hub.cas, uid=tak_uid())
+    assert not hub.paths("DELETE /deleteGroupCa/")
 
 
 # --- update / delete ----------------------------------------------------------------------
@@ -770,13 +872,22 @@ def test_patch_errors(admin, hub):
 
 
 def test_patch_rolls_back_nickname(admin, hub):
-    hub.fail["POST /saveFederationPolicy"] = 500
+    hub.fail_once["POST /saveFederationPolicy"] = 500
     r = admin.patch(f"/api/fedhub/partners/{OTHER['uid']}", json={"name": "Raven B"})
     assert r.status_code == 502
     assert fp.find_ca(hub.cas, uid=OTHER["uid"])["nickname"] == "Pub Server"
 
 
+def without_native_outgoing(hub):
+    policy = live_policy()
+    policy["policy"]["entities"] = [e for e in policy["policy"]["entities"] if e["id"] != "vpn-out"]
+    policy["policy"]["rules"] = [r for r in policy["policy"]["rules"] if "vpn-out" not in (r["source"], r["destination"])]
+    hub.active = copy.deepcopy(policy)
+    hub.policies = {"Tak": copy.deepcopy(policy)}
+
+
 def test_delete_removes_policy_before_ca(app, admin, hub):
+    without_native_outgoing(hub)
     r = admin.delete(f"/api/fedhub/partners/{OTHER['uid']}")
     assert r.status_code == 200, r.json
     assert r.json == {"success": True, "id": OTHER["uid"], "ca_removed": True}
@@ -794,7 +905,40 @@ def test_delete_keep_ca(admin, hub):
     assert not hub.paths("DELETE /deleteGroupCa/")
 
 
+def test_delete_keeps_ca_while_an_unlinked_outgoing_exists(admin, hub):
+    # Live layout: the native-console outgoing "VPN Server" isn't linked to any CA
+    r = admin.delete(f"/api/fedhub/partners/{OTHER['uid']}")
+    assert r.status_code == 200
+    assert r.json["ca_removed"] is False and "VPN Server" in r.json["warning"]
+    assert fp.find_ca(hub.cas, uid=OTHER["uid"])
+    assert not hub.paths("DELETE /deleteGroupCa/")
+
+
+def test_delete_keeps_ca_still_used_in_active_policy(admin, hub):
+    without_native_outgoing(hub)
+    post_partner(admin, direction="we_dial", host="tak.partner.example", port="9001")
+    # a second outgoing linked to the same CA stays behind
+    policy = copy.deepcopy(hub.active)
+    extra = fp.new_outgoing_node("TAK X backup", "tak2.partner.example", 9001, ca_uid=tak_uid())
+    policy["policy"]["entities"].append(extra)
+    hub.active = copy.deepcopy(policy)
+    hub.policies["Tak"] = copy.deepcopy(policy)
+    r = admin.delete(f"/api/fedhub/partners/{tak_uid()}")
+    assert r.json["ca_removed"] is False and "active policy still uses it" in r.json["warning"]
+    assert fp.find_ca(hub.cas, uid=tak_uid())
+
+
+def test_delete_escapes_ca_uid(admin, hub):
+    without_native_outgoing(hub)
+    admin.delete(f"/api/fedhub/partners/{OTHER['uid']}")
+    from urllib.parse import quote
+
+    assert hub.paths("DELETE /deleteGroupCa/") == [f"DELETE /deleteGroupCa/{quote(OTHER['uid'], safe='')}"]
+    assert "," not in hub.paths("DELETE /deleteGroupCa/")[0]
+
+
 def test_delete_keeps_ca_used_by_another_policy(admin, hub):
+    without_native_outgoing(hub)
     hub.policies["Spare"] = dict(live_policy(), name="Spare")
     r = admin.delete(f"/api/fedhub/partners/{OTHER['uid']}")
     assert r.json["ca_removed"] is False and "Spare" in r.json["warning"]
@@ -808,7 +952,7 @@ def test_delete_outgoing_only_partner(admin, hub):
 
 
 def test_delete_activate_failure_keeps_ca(admin, hub):
-    hub.fail["GET /activateFederationPolicy"] = 500
+    hub.fail_once["GET /activateFederationPolicy"] = 500
     r = admin.delete(f"/api/fedhub/partners/{OTHER['uid']}")
     assert r.status_code == 502
     assert fp.find_ca(hub.cas, uid=OTHER["uid"])
@@ -859,6 +1003,28 @@ def test_reconnect(admin, hub):
     r = admin.post(f"/api/fedhub/partners/{OTHER['uid']}/reconnect")
     assert r.json == {"success": True, "disconnected": 1}
     assert hub.connections == [BRIDGE_CONN]
+    # "Pub server_..." has a space: escaped as one path segment
+    assert hub.paths("DELETE /disconnectFederate/Pub%20server_")
+
+
+def test_activate_escapes_policy_name(admin, hub):
+    policy = dict(live_policy(), name="My/Policy, v2")
+    hub.active = copy.deepcopy(policy)
+    hub.policies = {policy["name"]: copy.deepcopy(policy)}
+    r = admin.patch(f"/api/fedhub/partners/{OTHER['uid']}", json={"enabled": False})
+    assert r.status_code == 200, r.json
+    assert hub.paths("GET /activateFederationPolicy/My%2FPolicy%2C%20v2")
+
+
+def test_legacy_proxy_routes_escape_segments(admin, hub):
+    admin.delete("/api/fedhub/ca_groups/CN=a b,O=x&y")
+    admin.post("/api/fedhub/federations/a b/activate")
+    admin.get("/api/fedhub/federations/a&b")
+    admin.delete("/api/fedhub/connections/x y")
+    assert hub.paths("DELETE /deleteGroupCa/CN%3Da%20b%2CO%3Dx%26y")
+    assert hub.paths("GET /activateFederationPolicy/a%20b")
+    assert hub.paths("GET /federation/a%26b")
+    assert hub.paths("DELETE /disconnectFederate/x%20y")
 
 
 # --- overview / repair ----------------------------------------------------------------------
@@ -884,7 +1050,10 @@ def test_overview_attributes_connections_and_metrics(admin, hub):
     assert vpn["interconnected"] is True
     assert [c["connectionId"] for c in vpn["connections"]] == [OTHER_HUB_CONN["connectionId"]]
     assert vpn["traffic"] == {"msgs_out": 101, "msgs_in": 223, "bytes_out": 54284, "bytes_in": 145315}
-    assert out["direction"] == "we_dial" and out["ca"] is None and out["status"] == "waiting"
+    assert out["direction"] == "we_dial" and out["ca"] is None
+    # G6, live layout: the native outgoing "VPN Server" dials while hub "VPN" dials in
+    assert "both_sides_dial" in vpn["problems"] and "both_sides_dial" in out["problems"]
+    assert out["status"] == "error"
     assert out["outgoing"] == {"name": "VPN Server_7399fa0c-cbaa-40b6-9c3c-3184959715e5",
                                "host": "192.0.2.37", "port": 9102, "enabled": True}
 
@@ -894,6 +1063,20 @@ def test_overview_flags_both_sides_dialing(admin, hub):
     hub.connections = [dict(OTHER_HUB_CONN, groupIdentities=[tak_uid()])]
     p = [p for p in admin.get("/api/fedhub/overview").json["partners"] if p["id"] == tak_uid()][0]
     assert "both_sides_dial" in p["problems"]
+
+
+def test_overview_no_dial_conflict_without_incoming_hub(admin, hub):
+    hub.connections = [BRIDGE_CONN, dict(OTHER_HUB_CONN, remoteConnectionType="FEDERATION_HUB_SERVER")]
+    partners = admin.get("/api/fedhub/overview").json["partners"]
+    assert all("both_sides_dial" not in p["problems"] for p in partners)
+
+
+def test_check_flags_native_outgoing_and_incoming_hub(admin, hub):
+    hub.connections = [OTHER_HUB_CONN]
+    pid = "VPN Server_7399fa0c-cbaa-40b6-9c3c-3184959715e5"
+    for partner_id in (pid, OTHER["uid"]):
+        by = {c["code"]: c for c in admin.get(f"/api/fedhub/partners/{partner_id}/check").json}
+        assert by["dial_direction"]["ok"] is False, partner_id
 
 
 def test_overview_hub_down(admin, hub):
@@ -960,6 +1143,44 @@ def test_reachability(admin, hub, monkeypatch):
     assert r.status_code == 400 and r.json["code"] == "invalid_host"
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "169.254.169.254", "ff02::1", "0.0.0.0", "::1", "fe80::1"])
+def test_reachability_rejects_local_addresses(admin, hub, host):
+    r = admin.post("/api/fedhub/reachability", json={"host": host, "port": 9102})
+    assert r.status_code == 400 and r.json["code"] == "address_not_allowed"
+
+
+def test_reachability_rejects_names_resolving_locally(admin, hub, monkeypatch):
+    calls = []
+    monkeypatch.setattr(fp, "resolve", lambda host: (True, ["127.0.0.1"], None))
+    monkeypatch.setattr(fp, "tcp_connect", lambda host, port, timeout=3: calls.append(host) or (True, None))
+    r = admin.post("/api/fedhub/reachability", json={"host": "evil.example", "port": 22})
+    assert r.status_code == 400 and r.json["code"] == "address_not_allowed"
+    assert calls == []
+
+
+def test_reachability_allows_private_and_connects_to_resolved_address(admin, hub, monkeypatch):
+    calls = []
+    monkeypatch.setattr(fp, "resolve", lambda host: (True, ["10.0.0.5"], None))
+    monkeypatch.setattr(fp, "tcp_connect", lambda host, port, timeout=3: calls.append((host, port)) or (True, None))
+    r = admin.post("/api/fedhub/reachability", json={"host": "lan.example", "port": 9102})
+    assert r.json["tcp_ok"] is True
+    assert calls == [("10.0.0.5", 9102)]
+    assert admin.post("/api/fedhub/reachability", json={"host": "192.168.1.9", "port": 70000}).json["code"] == "invalid_port"
+
+
+def test_check_refuses_tcp_to_loopback(admin, hub, monkeypatch):
+    post_partner(admin, direction="we_dial", host="tak.partner.example", port="9001")
+    monkeypatch.setattr(fp, "resolve", lambda host: (True, ["127.0.0.1"], None))
+    monkeypatch.setattr(fp, "tcp_connect", lambda *a, **k: pytest.fail("must not connect"))
+    by = {c["code"]: c for c in admin.get(f"/api/fedhub/partners/{tak_uid()}/check").json}
+    assert by["dns"]["ok"] is True and by["tcp"]["ok"] is False
+
+
+def test_probe_rejects_bad_port_from_policy():
+    result = fp.probe("192.0.2.1", 0, resolver=lambda h: pytest.fail("no dns"), connector=None)
+    assert result["tcp_ok"] is False and result["error"]
+
+
 def test_reachability_real_functions_locally():
     import socket
 
@@ -968,7 +1189,7 @@ def test_reachability_real_functions_locally():
     server.listen(1)
     try:
         port = server.getsockname()[1]
-        assert fp.reachability("127.0.0.1", port)["tcp_ok"] is True
+        assert fp.tcp_connect("127.0.0.1", port) == (True, None)
     finally:
         server.close()
 
@@ -1036,6 +1257,28 @@ def test_known_groups_by_partner_id(admin, hub, monkeypatch):
 
 
 # --- fixes on existing routes -------------------------------------------------------------
+
+
+def test_policy_activate_refuses_policy_without_own_ca(admin, hub):
+    policy = live_policy()
+    policy["policy"]["entities"] = [e for e in policy["policy"]["entities"] if e["id"] != "own-node"]
+    r = admin.post("/api/fedhub/policy?activate=1", json=policy)
+    assert r.status_code == 400 and r.json["code"] == "own_ca_missing_from_policy"
+    assert not hub.paths("POST /saveFederationPolicy")
+    r = admin.post("/api/fedhub/policy?activate=1&force_without_own_ca=1", json=policy)
+    assert r.status_code == 200, r.json
+    assert not fp.own_node(hub.active, OWN["uid"])
+
+
+def test_policy_activate_rolls_back(admin, hub):
+    before = copy.deepcopy(hub.active)
+    policy = live_policy()
+    policy["policy"]["entities"].append(fp.new_group_node(tak_uid(), "TAK X"))
+    hub.fail_once["GET /activateFederationPolicy"] = 500
+    r = admin.post("/api/fedhub/policy?activate=1", json=policy)
+    assert r.status_code == 502 and r.json["code"] == "hub_error"
+    assert hub.policies["Tak"] == fp.prepare_for_save(before)
+    assert hub.active == before
 
 
 def test_policy_save_and_activate(admin, hub):
