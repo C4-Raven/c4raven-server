@@ -162,6 +162,15 @@ def group_nodes(policy, uid):
     return [e for e in entities(policy) if e.get("type") == GROUP and e.get("name") == uid]
 
 
+def own_node_enabled(policy, own_uid):
+    """The hub's own CA node, only if it's enabled. A disabled one makes the broker refuse
+    Raven's own bridge just like a missing one (G1), so callers treat both as missing."""
+    for node in group_nodes(policy, own_uid) if own_uid else []:
+        if _enabled(node):
+            return node
+    return None
+
+
 def own_node(policy, own_uid):
     nodes = group_nodes(policy, own_uid) if own_uid else []
     return nodes[0] if nodes else None
@@ -492,6 +501,18 @@ def _expires(entry):
     return None
 
 
+def connection_is(cid, name):
+    """Whether a hub connection id belongs to the identity ``name`` (an outgoing node name such
+    as "VPN Server_<uuid4>", or the bridge uid "raven-federate"). The hub builds ids as
+    "<name>-<fingerprint>-<server id>" (live: "raven-federate-4149...-1339...",
+    "Pub server_eb40...-c0dc...-6227...-MwccocTf"), so the name must be followed by "-" or end
+    the id: a bare prefix test would take "V" for "VPN_...".
+    """
+    if not cid or not name:
+        return False
+    return cid == name or cid.startswith(name + "-")
+
+
 def attribute_connections(entries, connections, own_uid, bridge_uid):
     """Splits live connections into per-partner lists, the bridge's and the rest."""
     by_partner = {e["id"]: [] for e in entries}
@@ -503,7 +524,7 @@ def attribute_connections(entries, connections, own_uid, bridge_uid):
         owner = None
         for entry in entries:
             out = entry["outgoing"]
-            if out and out.get("name") and cid.startswith(out["name"]):
+            if out and connection_is(cid, out.get("name")):
                 owner = entry
                 break
         if owner is None:
@@ -513,7 +534,7 @@ def attribute_connections(entries, connections, own_uid, bridge_uid):
                     break
         if owner is not None:
             by_partner[owner["id"]].append(conn)
-        elif bridge_uid and cid.startswith(bridge_uid) and (not own_uid or own_uid in groups):
+        elif connection_is(cid, bridge_uid) and (not own_uid or own_uid in groups):
             own_bridge.append(conn)
         else:
             rest.append(conn)
@@ -553,7 +574,7 @@ def _incoming_from_ca(entry, connections):
     found = []
     for conn in connections or []:
         cid = conn.get("connectionId") or ""
-        if uid in (conn.get("groupIdentities") or []) and not (out_name and cid.startswith(out_name)):
+        if uid in (conn.get("groupIdentities") or []) and not connection_is(cid, out_name):
             found.append(conn)
     return found
 
@@ -571,10 +592,11 @@ def dial_conflicts(entries, connections):
     partner and the CA partner are flagged.
     """
     flagged = set()
-    for entry in entries:
-        if entry["outgoing"] and entry["ca_uid"] and _incoming_from_ca(entry, connections):
+    dialing = [e for e in entries if e["outgoing"] and _enabled(e["outgoing"])]  # a disabled one doesn't dial
+    for entry in dialing:
+        if entry["ca_uid"] and _incoming_from_ca(entry, connections):
             flagged.add(entry["id"])
-    unlinked = [e for e in entries if e["outgoing"] and not e["ca_uid"]]
+    unlinked = [e for e in dialing if not e["ca_uid"]]
     if not unlinked:
         return flagged
     out_names = [e["outgoing"].get("name") for e in entries if e["outgoing"] and e["outgoing"].get("name")]
@@ -582,13 +604,13 @@ def dial_conflicts(entries, connections):
         if conn.get("remoteConnectionType") != HUB_CLIENT:
             continue
         cid = conn.get("connectionId") or ""
-        if any(cid.startswith(name) for name in out_names):
+        if any(connection_is(cid, name) for name in out_names):
             continue  # that's one of our own outgoing connections
         groups = conn.get("groupIdentities") or []
         for entry in entries:
             if entry["ca_uid"] and entry["ca_uid"] in groups and not entry["outgoing"]:
                 flagged.add(entry["id"])
-                flagged.update(e["id"] for e in unlinked if _enabled(e["outgoing"]))
+                flagged.update(e["id"] for e in unlinked)
     return flagged
 
 
@@ -832,10 +854,15 @@ def new_outgoing_node(display_name, host, port, kind=None, ca_uid=None):
 
 
 def ensure_own_node(policy, own):
-    """Adds the hub's own CA node if the policy lacks it. Returns (policy copy, added?)."""
+    """Adds the hub's own CA node if the policy lacks it, or re-enables it if it's disabled.
+    Returns (policy copy, changed?)."""
     policy = copy.deepcopy(policy)
-    if own_node(policy, own["uid"]):
+    if own_node_enabled(policy, own["uid"]):
         return policy, False
+    existing = own_node(policy, own["uid"])
+    if existing is not None:
+        existing.setdefault("config", {})["enabled"] = True
+        return policy, True
     node = new_group_node(own["uid"], own.get("nickname") or "This hub")
     entities(policy).append(node)
     add_view_node(policy, node["id"])
@@ -896,7 +923,7 @@ def update_partner(policy, own, partner_id, changes):
     policy, _ = ensure_own_node(policy, own)
     entry = find_entry(policy, own["uid"], partner_id)
     if entry is None:
-        raise PartnerError("not_found", gettext("That server isn't in the active federation policy"), 404)
+        raise PartnerError("not_found", gettext("That partner isn't in the active federation policy"), 404)
     own_entity = own_node(policy, own["uid"])
 
     direction = changes.get("direction")
@@ -940,7 +967,7 @@ def update_partner(policy, own, partner_id, changes):
             node.setdefault("config", {})["enabled"] = bool(changes["enabled"])
     if "interconnected" in changes:
         if not entry["ca_node"]:
-            raise PartnerError("needs_ca", gettext("Only a server with a trusted CA can be interconnected"))
+            raise PartnerError("needs_ca", gettext("Only a partner with a trusted CA can be interconnected"))
         entry["ca_node"].setdefault("config", {})["interconnected"] = bool(changes["interconnected"])
     if ("host" in changes or "port" in changes) and direction != "they_dial":
         if entry["outgoing"] and not created_outgoing:
@@ -951,7 +978,7 @@ def update_partner(policy, own, partner_id, changes):
                 config["port"] = int(changes["port"])
         elif not entry["outgoing"]:
             raise PartnerError(
-                "not_dialing", gettext("We don't connect to this server, so it has no address to change")
+                "not_dialing", gettext("We don't connect to this partner, so it has no address to change")
             )
     for key, outbound in (("share", True), ("receive", False)):
         if key in changes:
@@ -970,7 +997,7 @@ def remove_partner(policy, own_uid, partner_id):
     policy = copy.deepcopy(policy)
     entry = find_entry(policy, own_uid, partner_id)
     if entry is None:
-        raise PartnerError("not_found", gettext("That server isn't in the active federation policy"), 404)
+        raise PartnerError("not_found", gettext("That partner isn't in the active federation policy"), 404)
     ids = {n["id"] for n in _entry_nodes(entry)}
     if entry["ca_uid"]:
         ids |= {n["id"] for n in group_nodes(policy, entry["ca_uid"])}
@@ -1094,29 +1121,35 @@ def build_checks(entry, partner, policy, own_uid, known_cas, connections, resolv
     if not uid:
         checks.append(_check("ca_trusted", "warning", title,
                              gettext("This connection isn't linked to a trusted CA, so Raven can't tell"),
-                             gettext("Make sure the other server's CA is added under Advanced > CA certificates")))
+                             gettext("Make sure the partner's CA is added under Advanced > Certificates")))
     elif find_ca(known_cas, uid=uid):
         checks.append(_check("ca_trusted", "ok", title,
                              gettext("Fingerprint %(fp)s", fp=fingerprint(partner["ca"]["sha256"]))))
     else:
         checks.append(_check("ca_trusted", "error", title,
                              gettext("The hub no longer trusts this CA"),
-                             gettext("Remove this server and connect it again with its CA file")))
+                             gettext("Remove this partner and connect it again with its CA file")))
 
     title = gettext("Their CA is in the active policy")
     if not uid:
         checks.append(_check("ca_in_policy", "skipped", title, gettext("Not needed: we connect to them")))
-    elif entry["ca_node"] and _enabled(entry["ca_node"]):
+    elif not entry["ca_node"]:
+        checks.append(_check("ca_in_policy", "error", title,
+                             gettext("The partner's certificate isn't in the active policy, so the hub "
+                                     "refuses its connections"),
+                             gettext("Use Repair, or remove the partner and add it again")))
+    elif _enabled(entry["ca_node"]):
         checks.append(_check("ca_in_policy", "ok", title, gettext("Connections from this CA are accepted")))
     else:
-        checks.append(_check("ca_in_policy", "error", title, gettext("This server is disabled"),
-                             gettext("Enable it")))
+        checks.append(_check("ca_in_policy", "error", title,
+                             gettext("This partner is disabled, so the hub refuses its connections"),
+                             gettext("Enable the partner")))
 
     own = own_node(policy, own_uid)
     primary = _primary(entry)
     out_rule = _rule(policy, own["id"], primary["id"]) if own else None
     in_rule = _rule(policy, primary["id"], own["id"]) if own else None
-    fix = gettext("Edit the server and save what to share, or use Repair if this hub's own CA is missing")
+    fix = gettext("Edit the partner and save what to share, or use Repair if this hub's own CA is missing")
     checks.append(_check("rules_out", "ok" if out_rule else "error", gettext("We share data with them"),
                          gettext("A rule sends our data to them") if out_rule
                          else gettext("No rule sends our data to them"), None if out_rule else fix))
@@ -1142,7 +1175,7 @@ def build_checks(entry, partner, policy, own_uid, known_cas, connections, resolv
                              "of the two connections over and over")
         else:
             detail = gettext("This hub dials out to another hub while a hub this partner trusts also "
-                             "dials in; if they're the same server the hub drops one of the two "
+                             "dials in; if they're the same partner the hub drops one of the two "
                              "connections over and over")
         checks.append(_check("dial_direction", "error", title, detail,
                              gettext("Keep only one direction: remove the outgoing connection here, or "
@@ -1355,7 +1388,7 @@ def prepare_for_save(policy):
     return policy
 
 
-def apply_policy(client, new_policy, previous=None, logger=None):
+def apply_policy(client, new_policy, previous=None, logger=None, own_uid=None):
     """Save + activate + confirm (re-read the active policy).
 
     On failure the previous policy (if there was one) is saved and activated again and the
@@ -1374,7 +1407,10 @@ def apply_policy(client, new_policy, previous=None, logger=None):
         client.activate(name)
         stage = "confirm"
         active = client.active_policy()
-        if not active or active.get("name") != name or entity_ids(active) != entity_ids(new_policy):
+        own_lost = bool(own_uid) and bool(own_node_enabled(new_policy, own_uid)) and not own_node_enabled(
+            active or {}, own_uid
+        )
+        if not active or active.get("name") != name or entity_ids(active) != entity_ids(new_policy) or own_lost:
             raise PartnerError(
                 "not_applied",
                 gettext("Federation Hub accepted the change but isn't enforcing it"),
@@ -1386,9 +1422,14 @@ def apply_policy(client, new_policy, previous=None, logger=None):
             try:
                 client.save_policy(prepare_for_save(previous))
                 client.activate(previous.get("name"))
+                restored = client.active_policy()
             except PartnerError as e:
                 if logger:
                     logger.error(f"Federation Hub: couldn't restore the previous policy: {e.message}")
+                raise half_changed(error) from error
+            if not restored or restored.get("name") != previous.get("name") or entity_ids(restored) != entity_ids(previous):
+                if logger:
+                    logger.error("Federation Hub: the restored policy isn't the one that's active")
                 raise half_changed(error) from error
             error.undo_safe = True
             error.extra["restored"] = True
@@ -1407,6 +1448,39 @@ def apply_policy(client, new_policy, previous=None, logger=None):
             ),
             500,
         ).with_undo(False) from error
+
+
+def partially_applied(cause):
+    return PartnerError(
+        "partially_applied",
+        gettext(
+            "Federation Hub may already hold part of this change (%(error)s). A stored policy uses "
+            "the CA certificate, so it was left in place. Check the hub under Advanced",
+            error=cause.message,
+        ),
+        500,
+    ).with_undo(False)
+
+
+def stored_policy_uses_ca(client, uid):
+    """True if any stored policy references the CA, or if that can't be checked."""
+    try:
+        stored = client.stored_policies()
+    except PartnerError:
+        return True
+    return any(isinstance(p, dict) and isinstance(p.get("policy"), dict) and ca_referenced(p, uid) for p in stored)
+
+
+def ca_users(policy, uid):
+    """Display names of the nodes of ``policy`` that use the CA."""
+    if not policy or not uid:
+        return []
+    return [
+        _display(e)
+        for e in entities(policy)
+        if (e.get("type") == GROUP and e.get("name") == uid)
+        or (e.get("type") == OUTGOING and node_meta(e).get("ca") == uid)
+    ]
 
 
 def half_changed(cause):
@@ -1446,8 +1520,9 @@ def policy_to_change(client):
         raise PartnerError(
             "no_active_policy",
             gettext(
-                "Federation Hub has no active policy. Activate one of the stored policies (%(names)s) "
-                "under Advanced first",
+                "Federation Hub has no active policy, and Repair can't create one while stored "
+                "policies exist. Activate one of them (%(names)s) under Advanced > Policy editor, "
+                "or with its Activate button",
                 names=", ".join(names),
             ),
             409,

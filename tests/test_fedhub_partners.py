@@ -1018,11 +1018,11 @@ def test_activate_escapes_policy_name(admin, hub):
 
 def test_legacy_proxy_routes_escape_segments(admin, hub):
     admin.delete("/api/fedhub/ca_groups/CN=a b,O=x&y")
-    admin.post("/api/fedhub/federations/a b/activate")
+    admin.post("/api/fedhub/federations/a b/activate")  # looked up first, then activated
     admin.get("/api/fedhub/federations/a&b")
     admin.delete("/api/fedhub/connections/x y")
     assert hub.paths("DELETE /deleteGroupCa/CN%3Da%20b%2CO%3Dx%26y")
-    assert hub.paths("GET /activateFederationPolicy/a%20b")
+    assert hub.paths("GET /federation/a%20b")
     assert hub.paths("GET /federation/a%26b")
     assert hub.paths("DELETE /disconnectFederate/x%20y")
 
@@ -1324,3 +1324,275 @@ def test_new_labels_match_views():
                  "get_admin_cert", "get_admin_cert_password"):
         assert callable(getattr(api, view)), view
         assert isinstance(ADMIN_ACTION_LABELS[view], str), view
+
+
+# --- a disabled own-CA node counts as missing (G1) ------------------------------------------
+
+
+def with_own_disabled(policy):
+    policy = copy.deepcopy(policy)
+    for entity in policy["policy"]["entities"]:
+        if entity["id"] == "own-node":
+            entity["config"]["enabled"] = False
+    return policy
+
+
+def test_disabled_own_node_counts_as_missing():
+    assert fp.own_node(with_own_disabled(live_policy()), OWN["uid"])
+    assert fp.own_node_enabled(with_own_disabled(live_policy()), OWN["uid"]) is None
+    assert fp.own_node_enabled(live_policy(), OWN["uid"])["id"] == "own-node"
+
+
+def test_policy_activate_refuses_disabled_own_node(admin, hub):
+    policy = with_own_disabled(live_policy())
+    r = admin.post("/api/fedhub/policy?activate=1", json=policy)
+    assert r.status_code == 400 and r.json["code"] == "own_ca_missing_from_policy"
+    assert not hub.paths("POST /saveFederationPolicy")
+    r = admin.post("/api/fedhub/policy?activate=1&force_without_own_ca=1", json=policy)
+    assert r.status_code == 200, r.json
+
+
+def test_overview_and_repair_with_disabled_own_node(admin, hub):
+    policy = with_own_disabled(live_policy())
+    hub.active = copy.deepcopy(policy)
+    hub.policies["Tak"] = copy.deepcopy(policy)
+    assert "own_ca_missing" in admin.get("/api/fedhub/overview").json["problems"]
+
+    r = admin.post("/api/fedhub/repair")
+    assert r.json == {"success": True, "changed": True, "policy": "Tak"}
+    own = fp.own_node(hub.active, OWN["uid"])
+    assert own["id"] == "own-node" and own["config"]["enabled"] is True  # re-enabled, not duplicated
+    assert len(fp.group_nodes(hub.active, OWN["uid"])) == 1
+    assert "own_ca_missing" not in admin.get("/api/fedhub/overview").json["problems"]
+
+
+def test_apply_policy_confirm_requires_enabled_own_node(hub, monkeypatch):
+    original = hub.route
+
+    def disables_own(method, path, kwargs):
+        response = original(method, path, kwargs)
+        if path.startswith("/activateFederationPolicy/") and hub.active:
+            hub.active = with_own_disabled(hub.active)
+        return response
+
+    monkeypatch.setattr(hub, "route", disables_own)
+    client = fp.HubClient(hub)
+    previous = client.active_policy()
+    with pytest.raises(fp.PartnerError) as e:
+        fp.apply_policy(client, live_policy(), previous, own_uid=OWN["uid"])
+    assert e.value.code == "not_applied"
+    # without own_uid the old behaviour holds
+    monkeypatch.setattr(hub, "route", original)
+    assert fp.apply_policy(client, live_policy(), previous)["name"] == "Tak"
+
+
+# --- handoff follows who connects (G6) ------------------------------------------------------
+
+
+def handoff_steps(admin, query):
+    r = admin.get(f"/api/fedhub/handoff?{query}")
+    assert r.status_code == 200, r.json
+    return r.json
+
+
+def test_handoff_when_we_dial(admin, hub):
+    j = handoff_steps(admin, "direction=we_dial")
+    assert j["direction"] == "we_dial"
+    raven = " ".join(j["steps"]["raven_hub"])
+    assert '"They connect to us"' in raven and "add nothing outgoing" in raven
+    assert '"We connect to them"' not in raven
+    tak = " ".join(j["steps"]["tak_server"])
+    assert "Don't add an Outgoing Connection" in tak and "port 9102" not in tak
+    assert "Don't connect to us" in " ".join(j["steps"]["other"])
+
+
+def test_handoff_when_they_dial(admin, hub):
+    j = handoff_steps(admin, "direction=they_dial")
+    raven = " ".join(j["steps"]["raven_hub"])
+    assert '"We connect to them"' in raven and "tak.example.net:9102" in raven
+    assert '"They connect to us"' not in raven
+    tak = " ".join(j["steps"]["tak_server"])
+    assert "Add an Outgoing Connection: address tak.example.net, port 9102" in tak
+    assert "tak.example.net:9102" in " ".join(j["steps"]["other"])
+
+
+def test_handoff_without_direction_asks_to_agree(admin, hub):
+    j = handoff_steps(admin, "")
+    assert j["direction"] is None
+    for kind in ("raven_hub", "tak_server", "other"):
+        text = " ".join(j["steps"][kind])
+        assert "which ONE side connects" in text, kind
+        assert "If you connect to us" in text and "If we connect to you" in text, kind
+    txt = admin.get("/api/fedhub/handoff?format=txt").get_data(as_text=True)
+    assert "which ONE side connects" in txt
+
+
+def test_handoff_uses_partner_direction(admin, hub):
+    post_partner(admin, direction="we_dial", host="tak.partner.example", port="9001")
+    from urllib.parse import quote
+
+    j = handoff_steps(admin, f"partner_id={quote(tak_uid(), safe='')}&direction=they_dial")
+    assert j["direction"] == "we_dial"  # the partner's real setup wins
+    assert list(j["steps"]) == ["tak_server"]
+    assert "Don't add an Outgoing Connection" in " ".join(j["steps"]["tak_server"])
+    assert admin.get("/api/fedhub/handoff?partner_id=nope").status_code == 404
+    r = admin.get("/api/fedhub/handoff?direction=sideways")
+    assert r.status_code == 400 and r.json["code"] == "invalid_direction"
+
+
+def test_check_wording_says_partner(admin, hub):
+    admin.patch(f"/api/fedhub/partners/{OTHER['uid']}", json={"enabled": False})
+    by = {c["code"]: c for c in admin.get(f"/api/fedhub/partners/{OTHER['uid']}/check").json}
+    assert by["ca_in_policy"]["detail"].startswith("This partner is disabled")
+    assert by["ca_in_policy"]["fix"] == "Enable the partner"
+
+
+def test_ca_in_policy_missing_node_wording():
+    policy = minimal_policy()
+    out = fp.new_outgoing_node("X", "x.example", 9102)
+    policy["policy"]["entities"].append(out)
+    entry = {"id": "x", "ca_uid": tak_uid(), "ca_node": None, "outgoing": out}
+    partner = fp.build_partner(entry, policy, OWN["uid"], [OWN])
+    checks = fp.build_checks(entry, partner, policy, OWN["uid"], [OWN], [],
+                             resolver=lambda h: (True, ["192.0.2.1"], None),
+                             connector=lambda h, p: (True, None))
+    item = [c for c in checks if c["code"] == "ca_in_policy"][0]
+    assert "isn't in the active policy" in item["detail"] and "Repair" in item["fix"]
+
+
+def test_no_active_policy_text_points_to_policy_editor(admin, hub):
+    hub.active = None
+    r = admin.post("/api/fedhub/repair")
+    assert "Advanced > Policy editor" in r.json["error"] and "Repair can't create one" in r.json["error"]
+
+
+# --- re-review: legacy activate / CA delete, disabled outgoings, restore confirm, ids ---------
+
+
+def test_legacy_activate_goes_through_apply_policy(admin, hub):
+    spare = dict(live_policy(), name="Spare")
+    hub.policies["Spare"] = copy.deepcopy(spare)
+    r = admin.post("/api/fedhub/federations/Spare/activate")
+    assert r.status_code == 200, r.json
+    assert r.json == {"success": True, "activated": True, "name": "Spare"}
+    assert hub.active["name"] == "Spare"
+
+
+def test_legacy_activate_refuses_policy_without_enabled_own_ca(admin, hub):
+    hub.policies["Bad"] = with_own_disabled(dict(live_policy(), name="Bad"))
+    r = admin.post("/api/fedhub/federations/Bad/activate")
+    assert r.status_code == 400 and r.json["code"] == "own_ca_missing_from_policy"
+    assert hub.active["name"] == "Tak"
+    assert not hub.paths("GET /activateFederationPolicy")
+    r = admin.post("/api/fedhub/federations/Bad/activate?force_without_own_ca=1")
+    assert r.status_code == 200 and hub.active["name"] == "Bad"
+    assert admin.post("/api/fedhub/federations/Nope/activate").status_code in (404, 502)
+
+
+def test_legacy_activate_rolls_back(admin, hub):
+    before = copy.deepcopy(hub.active)
+    hub.policies["Spare"] = dict(live_policy(), name="Spare")
+    hub.fail_once["GET /activateFederationPolicy/Spare"] = 500
+    r = admin.post("/api/fedhub/federations/Spare/activate")
+    assert r.status_code == 502
+    assert hub.active == before
+
+
+def test_legacy_ca_delete_guards(admin, hub):
+    from urllib.parse import quote
+
+    r = admin.delete(f"/api/fedhub/ca_groups/{quote(OWN['uid'], safe='')}")
+    assert r.status_code == 400 and r.json["code"] == "own_ca"
+    r = admin.delete(f"/api/fedhub/ca_groups/{quote(OTHER['uid'], safe='')}")
+    assert r.status_code == 409 and r.json["code"] == "ca_in_use" and r.json["nodes"] == ["VPN"]
+    assert not hub.paths("DELETE /deleteGroupCa/")
+    r = admin.delete(f"/api/fedhub/ca_groups/{quote(OTHER['uid'], safe='')}?force=1")
+    assert r.status_code == 200 and not fp.find_ca(hub.cas, uid=OTHER["uid"])
+
+
+def test_disabled_unlinked_outgoing_is_no_dial_conflict(admin, hub):
+    policy = live_policy()
+    for e in policy["policy"]["entities"]:
+        if e["id"] == "vpn-out":
+            e["config"]["enabled"] = False
+    hub.active = copy.deepcopy(policy)
+    hub.policies["Tak"] = copy.deepcopy(policy)
+    hub.connections = [OTHER_HUB_CONN]
+    partners = admin.get("/api/fedhub/overview").json["partners"]
+    assert all("both_sides_dial" not in p["problems"] for p in partners)
+
+
+def test_restore_is_confirmed_by_rereading(admin, hub, monkeypatch):
+    original = hub.route
+
+    # first activate (the new policy) fails; the restore "succeeds" but the hub keeps nothing
+    state = {"n": 0}
+
+    def flaky(method, path, kwargs):
+        if path.startswith("/activateFederationPolicy/"):
+            state["n"] += 1
+            if state["n"] == 1:
+                return FakeResponse(500, "boom", "text/plain")
+            hub.active = with_own_disabled(fp.empty_policy("Other"))  # not what we restored
+            return FakeResponse(200)
+        return original(method, path, kwargs)
+
+    monkeypatch.setattr(hub, "route", flaky)
+    r = post_partner(admin)
+    assert r.status_code == 500 and r.json["code"] == "rollback_failed"
+    assert fp.find_ca(hub.cas, uid=tak_uid())  # kept
+    assert not hub.paths("DELETE /deleteGroupCa/")
+
+
+def test_timed_out_save_that_was_stored_keeps_ca(admin, hub, monkeypatch):
+    hub.active = None
+    hub.policies = {}
+    original = hub.route
+
+    def save_then_time_out(method, path, kwargs):
+        if path == "/saveFederationPolicy":
+            original(method, path, kwargs)  # the hub wrote it...
+            raise requests.exceptions.Timeout("slow")  # ...but the answer never came
+        return original(method, path, kwargs)
+
+    monkeypatch.setattr(hub, "route", save_then_time_out)
+    r = post_partner(admin)
+    assert r.status_code == 500 and r.json["code"] == "partially_applied"
+    assert fp.find_ca(hub.cas, uid=tak_uid())
+    assert not hub.paths("DELETE /deleteGroupCa/")
+
+
+def test_timed_out_save_that_wasnt_stored_removes_ca(admin, hub, monkeypatch):
+    hub.active = None
+    hub.policies = {}
+    original = hub.route
+
+    def time_out(method, path, kwargs):
+        if path == "/saveFederationPolicy":
+            raise requests.exceptions.Timeout("slow")
+        return original(method, path, kwargs)
+
+    monkeypatch.setattr(hub, "route", time_out)
+    r = post_partner(admin)
+    assert r.status_code == 504 and r.json["code"] == "hub_timeout"
+    assert not fp.find_ca(hub.cas, uid=tak_uid())
+
+
+def test_connection_ids_match_exactly():
+    assert fp.connection_is("VPN Server_7399fa0c-cbaa-40b6-9c3c-3184959715e5-c0dc-6227-x",
+                            "VPN Server_7399fa0c-cbaa-40b6-9c3c-3184959715e5")
+    assert fp.connection_is(BRIDGE_CONN["connectionId"], "raven-federate")
+    assert not fp.connection_is("VPN_1234-abc", "V")
+    assert not fp.connection_is("raven-federate2-abc", "raven-federate")
+    assert not fp.connection_is("", "x") and not fp.connection_is("x", None)
+
+
+def test_short_outgoing_name_doesnt_capture_other_connections():
+    policy = minimal_policy()
+    short = fp.new_outgoing_node("V", "v.example", 9102)
+    short["name"] = "V"  # a native-console node without the uuid suffix
+    policy["policy"]["entities"].append(short)
+    entries = fp.partner_entries(policy, OWN["uid"])
+    conn = dict(OTHER_HUB_CONN, connectionId="VPN_7399fa0c-abc-def", groupIdentities=["CN=x-1"])
+    by_partner, _, rest = fp.attribute_connections(entries, [conn], OWN["uid"], "raven-federate")
+    assert by_partner["V"] == [] and rest == [conn]

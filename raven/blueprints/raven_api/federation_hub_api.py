@@ -322,7 +322,35 @@ def update_ca_group_nickname():
 @federation_hub_api.route("/api/fedhub/ca_groups/<uid>", methods=["DELETE"])
 @roles_required("administrator")
 def delete_ca_group(uid):
-    return _proxy("DELETE", f"/deleteGroupCa/{fp.seg(uid)}")
+    """Removes a trusted CA (the native console's delete). Refuses this hub's own CA, and a CA
+    the active policy still uses unless ?force=1 (G11: the nodes would dangle)."""
+    client = _client()
+    force = fp.parse_bool(request.args.get("force"), False)
+    try:
+        with fp.policy_lock():
+            own = fp.own_ca(client.known_cas())
+            if own and own.get("uid") == uid:
+                raise fp.PartnerError(
+                    "own_ca",
+                    gettext("That is this hub's own CA. Removing it would cut off every connection"),
+                    400,
+                )
+            users = fp.ca_users(client.active_policy(), uid)
+            if users and not force:
+                raise fp.PartnerError(
+                    "ca_in_use",
+                    gettext(
+                        "The active policy still uses this CA (%(names)s). Remove those partners "
+                        "or nodes first",
+                        names=", ".join(str(u) for u in users),
+                    ),
+                    409,
+                    nodes=users,
+                )
+            client.delete_ca(uid)
+    except fp.PartnerError as e:
+        return _partner_error(e)
+    return jsonify({"success": True})
 
 
 @federation_hub_api.route("/api/fedhub/federations")
@@ -346,8 +374,32 @@ def get_federation_graph(name):
 @federation_hub_api.route("/api/fedhub/federations/<name>/activate", methods=["POST"])
 @roles_required("administrator")
 def activate_federation_policy(name):
-    # Federation Hub itself exposes this as a GET (it's their route, not ours)
-    return _proxy("GET", f"/activateFederationPolicy/{fp.seg(name)}")
+    """Makes a stored policy the active one, through the same locked save/activate/confirm
+    path as partner changes: rolled back to the previous active policy on failure, and refused
+    if the policy would cut off Raven's own bridge unless ?force_without_own_ca=1."""
+    client = _client()
+    force = fp.parse_bool(request.args.get("force_without_own_ca"), False)
+    try:
+        with fp.policy_lock():
+            own = fp.own_ca(client.known_cas())
+            stored = client.json("GET", f"/federation/{fp.seg(name)}", gettext("read the policy"))
+            if not isinstance(stored, dict) or not isinstance(stored.get("policy"), dict):
+                raise fp.PartnerError("not_found", gettext("No stored policy with that name"), 404)
+            if own and not force and not fp.own_node_enabled(stored, own["uid"]):
+                raise fp.PartnerError(
+                    "own_ca_missing_from_policy",
+                    gettext(
+                        "This policy doesn't include this hub's own CA (or it's disabled), so "
+                        "Raven's own connection to the hub would be refused once it's active. "
+                        "Use Repair after activating, or fix the policy first"
+                    ),
+                    400,
+                )
+            previous = client.active_policy()
+            fp.apply_policy(client, stored, previous, logger, own_uid=own["uid"] if own else None)
+    except fp.PartnerError as e:
+        return _partner_error(e)
+    return jsonify({"success": True, "activated": True, "name": name})
 
 
 @federation_hub_api.route("/api/fedhub/federations/<name>/policy", methods=["DELETE"])
@@ -383,7 +435,7 @@ def save_policy():
         with fp.policy_lock():
             own = fp.own_ca(client.known_cas())
             previous = client.active_policy()
-            if own and not force and not fp.own_node(body, own["uid"]):
+            if own and not force and not fp.own_node_enabled(body, own["uid"]):
                 raise fp.PartnerError(
                     "own_ca_missing_from_policy",
                     gettext(
@@ -392,7 +444,7 @@ def save_policy():
                     ),
                     400,
                 )
-            fp.apply_policy(client, body, previous, logger)
+            fp.apply_policy(client, body, previous, logger, own_uid=own["uid"] if own else None)
     except fp.PartnerError as e:
         return _partner_error(e)
     return jsonify({"success": True, "activated": True, "name": body["name"]})
@@ -540,7 +592,7 @@ def _partner_view(client, policy, known, partner_id):
         if partner["id"] == partner_id:
             return partner, connections
     raise fp.PartnerError(
-        "not_found", gettext("That server isn't in the active federation policy"), 404
+        "not_found", gettext("That partner isn't in the active federation policy"), 404
     )
 
 
@@ -639,7 +691,7 @@ def get_overview():
         body["problems"].append("own_ca_unknown")
     if not policy:
         body["problems"].append("no_active_policy")
-    if own and (not policy or not fp.own_node(policy, own_uid)):
+    if own and (not policy or not fp.own_node_enabled(policy, own_uid)):
         body["problems"].append("own_ca_missing")
 
     partners, bridge_conns, rest = fp.build_partners(
@@ -753,8 +805,11 @@ def create_partner():
                     receive=receive,
                     expires=ca_info["not_after"] if ca_info else None,
                 )
-                active = fp.apply_policy(client, new_policy, previous, logger)
+                active = fp.apply_policy(client, new_policy, previous, logger, own_uid=own["uid"])
             except fp.PartnerError as e:
+                if ca_added and e.undo_safe and fp.stored_policy_uses_ca(client, existing["uid"]):
+                    # e.g. a save that timed out on the hub's side but was still written
+                    raise fp.partially_applied(e) from e
                 if ca_added and e.undo_safe:
                     try:
                         client.delete_ca(existing["uid"])
@@ -816,7 +871,7 @@ def update_partner(partner_id):
             entry = fp.find_entry(previous, own["uid"], partner_id)
             if entry is None:
                 raise fp.PartnerError(
-                    "not_found", gettext("That server isn't in the active federation policy"), 404
+                    "not_found", gettext("That partner isn't in the active federation policy"), 404
                 )
 
             dials = entry["outgoing"] is not None
@@ -844,7 +899,7 @@ def update_partner(partner_id):
                     known = [dict(c, nickname=changes["name"]) if c is ca else c for c in known]
             try:
                 new_policy, new_id = fp.update_partner(previous, own, partner_id, changes)
-                active = fp.apply_policy(client, new_policy, previous, logger)
+                active = fp.apply_policy(client, new_policy, previous, logger, own_uid=own["uid"])
             except fp.PartnerError as e:
                 if renamed is not None and e.undo_safe:
                     try:
@@ -871,7 +926,7 @@ def delete_partner(partner_id):
             new_policy, ca_uid = fp.remove_partner(previous, own["uid"], partner_id)
             # Policy first, CA second (G11): deleting a CA that's still in the active policy
             # leaves dangling nodes, and deleting it restarts the hub's v2 server anyway
-            fp.apply_policy(client, new_policy, previous, logger)
+            fp.apply_policy(client, new_policy, previous, logger, own_uid=own["uid"])
 
             body = {"success": True, "id": partner_id, "ca_removed": False}
             unlinked = fp.unlinked_outgoing(new_policy)
@@ -886,7 +941,7 @@ def delete_partner(partner_id):
                 body["warning"] = gettext(
                     "The server was removed. Its CA was kept because the outgoing connection "
                     "%(names)s may need it to verify the other side; remove it under Advanced > "
-                    "CA certificates if you're sure it doesn't",
+                    "Certificates if you're sure it doesn't",
                     names=", ".join(fp._display(e) for e in unlinked),
                 )
             else:
@@ -966,19 +1021,101 @@ def reconnect_partner(partner_id):
     return jsonify({"success": True, "disconnected": len(partner["connections"])})
 
 
-def _handoff_steps(host, port, own_name, fingerprint):
+def _handoff_steps(host, port, own_name, fingerprint, direction=None):
+    """What the OTHER admin does, per kind of server. ``direction`` is OUR side's choice
+    (we_dial: this hub connects to them; they_dial: they connect to us; None: not decided).
+    Only one side may connect (G6), so their instructions are always the opposite of ours."""
     where = f"{host}:{port}"
+    agree = gettext(
+        "Agree with the other admin which ONE side connects. If both sides connect, the hubs "
+        "drop one of the two connections over and over."
+    )
+
+    if direction == "we_dial":
+        raven_connect = [
+            gettext(
+                "Under \"Who connects\", choose \"They connect to us\": we connect to you, so add "
+                "nothing outgoing on your side. Make sure your port 9102 is reachable from us."
+            )
+        ]
+        tak_connect = [
+            gettext(
+                "Don't add an Outgoing Connection to us: we connect to your TAK Server's federation "
+                "port (9001 by default). Make sure it's reachable from us."
+            )
+        ]
+        other_connect = [
+            gettext(
+                "Don't connect to us: we connect to you. Make sure your federation port is "
+                "reachable from us."
+            )
+        ]
+    elif direction == "they_dial":
+        raven_connect = [
+            gettext(
+                "Under \"Who connects\", choose \"We connect to them\" and enter %(where)s. We "
+                "won't connect to you.",
+                where=where,
+            )
+        ]
+        tak_connect = [
+            gettext(
+                "Add an Outgoing Connection: address %(host)s, port %(port)s, protocol version 2, "
+                "enabled. We won't connect to you.",
+                host=host,
+                port=port,
+            )
+        ]
+        other_connect = [
+            gettext(
+                "Connect to %(where)s using federation protocol v2 over mutual TLS. We won't connect "
+                "to you.",
+                where=where,
+            )
+        ]
+    else:
+        raven_connect = [
+            agree,
+            gettext(
+                "If you connect to us: under \"Who connects\", choose \"We connect to them\" and "
+                "enter %(where)s.",
+                where=where,
+            ),
+            gettext(
+                "If we connect to you: choose \"They connect to us\" and add nothing outgoing; "
+                "make sure your port 9102 is reachable from us."
+            ),
+        ]
+        tak_connect = [
+            agree,
+            gettext(
+                "If you connect to us: add an Outgoing Connection with address %(host)s, port "
+                "%(port)s, protocol version 2, enabled.",
+                host=host,
+                port=port,
+            ),
+            gettext(
+                "If we connect to you: add no Outgoing Connection; make sure your federation port "
+                "(9001 by default) is reachable from us."
+            ),
+        ]
+        other_connect = [
+            agree,
+            gettext(
+                "If you connect to us: connect to %(where)s using federation protocol v2 over "
+                "mutual TLS.",
+                where=where,
+            ),
+            gettext("If we connect to you: don't connect to us; make sure your federation port is reachable."),
+        ]
+
     return {
         "raven_hub": [
             gettext("Open Federation Hub in your C4 Raven and click \"Connect a server\"."),
             gettext("Choose \"Raven with its own hub\"."),
             gettext("Download your hub's CA and send it to us; upload our CA (attached) when asked."),
             gettext("Check that our CA's fingerprint is %(fp)s.", fp=fingerprint),
-            gettext(
-                "Under \"Who connects\", choose \"We connect to them\" and enter %(where)s, "
-                "unless we agreed that we connect to you. Only one side may connect.",
-                where=where,
-            ),
+            *raven_connect,
             gettext("Leave \"What to share\" on \"Everything\" and click Connect."),
         ],
         "tak_server": [
@@ -994,13 +1131,7 @@ def _handoff_steps(host, port, own_name, fingerprint):
             gettext(
                 "Send us /opt/tak/certs/files/ca.pem: the CA that issued your server certificate."
             ),
-            gettext(
-                "Add an Outgoing Connection: address %(host)s, port %(port)s, protocol version 2, "
-                "enabled. Skip this if we agreed that we connect to you (then we dial your "
-                "federation port, 9001 by default).",
-                host=host,
-                port=port,
-            ),
+            *tak_connect,
             gettext(
                 "Under Active Connections, open Manage Groups for the %(name)s federate and choose "
                 "the inbound and outbound groups (for example __ANON__ or your federation group). "
@@ -1011,11 +1142,7 @@ def _handoff_steps(host, port, own_name, fingerprint):
         "other": [
             gettext("Trust our CA (attached) in your federation trust store. Fingerprint: %(fp)s.", fp=fingerprint),
             gettext("Send us the CA that issued the certificate your server presents."),
-            gettext(
-                "Connect to %(where)s using federation protocol v2 over mutual TLS, unless we "
-                "agreed that we connect to you. Only one side may connect.",
-                where=where,
-            ),
+            *other_connect,
         ],
     }
 
@@ -1025,18 +1152,29 @@ def _handoff_steps(host, port, own_name, fingerprint):
 def get_handoff():
     client = _client()
     try:
+        direction = request.args.get("direction") or None
+        if direction is not None:
+            direction = fp.validate_direction(direction)
         pem = client.self_ca()
         info = fp.parse_ca_file(pem)
-        own = fp.own_ca(_optional(client.known_cas, [])) or {}
+        known = _optional(client.known_cas, [])
+        own = fp.own_ca(known) or {}
         port = _v2_port(client)
+        partner_id = request.args.get("partner_id")
+        kind = request.args.get("kind")
+        if partner_id:
+            # The partner's actual setup wins over a direction passed alongside
+            policy = _require_policy(client)
+            partner, _ = _partner_view(client, policy, known, partner_id)
+            direction = partner["direction"]
+            kind = kind or partner["kind"]
     except fp.PartnerError as e:
         return _partner_error(e)
 
     host = _broker_host()
     nickname = own.get("nickname") or gettext("this hub")
     fpr = fp.fingerprint(info["sha256"])
-    steps = _handoff_steps(host, port, nickname, fpr)
-    kind = request.args.get("kind")
+    steps = _handoff_steps(host, port, nickname, fpr, direction)
     if kind in fp.KINDS:
         steps = {kind: steps[kind]}
     body = {
@@ -1048,6 +1186,7 @@ def get_handoff():
         "not_after": info["not_after"],
         "host": host,
         "port": port,
+        "direction": direction,
         "steps": steps,
     }
     if request.args.get("format") != "txt":
@@ -1094,7 +1233,7 @@ def repair_policy():
             new_policy, added = fp.ensure_own_node(policy, own)
             if not added:
                 return jsonify({"success": True, "changed": False})
-            fp.apply_policy(client, new_policy, previous, logger)
+            fp.apply_policy(client, new_policy, previous, logger, own_uid=own["uid"])
     except fp.PartnerError as e:
         return _partner_error(e)
     return jsonify({"success": True, "changed": True, "policy": new_policy.get("name")})
@@ -1154,7 +1293,7 @@ def get_known_groups(node_id):
             entry = fp.find_entry(policy, own["uid"] if own else None, node_id)
             if entry is None:
                 raise fp.PartnerError(
-                    "not_found", gettext("That server isn't in the active federation policy"), 404
+                    "not_found", gettext("That partner isn't in the active federation policy"), 404
                 )
             node_ids = [n["id"] for n in (entry["ca_node"], entry["outgoing"]) if n]
         groups = []
