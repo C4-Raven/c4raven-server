@@ -302,6 +302,16 @@ ADMIN_ACTION_LABELS = {
     "disconnect_connection": "Disconnected federation connection",
     "restart_broker": "Restarted federation broker",
     "verify_admin_cert_2fa": "Verified federation admin certificate",
+    "get_admin_cert": "Downloaded federation admin certificate",
+    "get_admin_cert_password": "Viewed federation admin certificate password",
+    "create_partner": "Connected federation server",
+    "update_partner": "Changed federation server",
+    "delete_partner": "Removed federation server",
+    "reconnect_partner": "Reconnected federation server",
+    "repair_policy": "Repaired federation policy",
+    "inspect_ca": "Inspected federation CA certificate",
+    "generate_token": "Generated federation token",
+    "check_reachability": "Tested federation server reachability",
     # Data retention
     "put_retention": "Changed data retention settings",
 }

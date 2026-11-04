@@ -95,6 +95,9 @@ class DefaultConfig:
     # uses the private CA -- unaffected), so trust the system's default CA
     # bundle here instead of pinning to that private CA's file.
     RAVEN_FEDHUB_CA_BUNDLE = os.getenv("RAVEN_FEDHUB_CA_BUNDLE") or True
+    # The name partners dial to reach this hub's broker (v2, port 9102). It must be the name
+    # in the broker's server cert. Empty: the host of RAVEN_FEDHUB_BROKER_ADDRESS is used.
+    RAVEN_FEDHUB_HOST = os.getenv("RAVEN_FEDHUB_HOST", "")
     # The Federation Hub admin console's login cert, served to 2FA-verified
     # admins by /api/fedhub/admin_cert(/password). The password file holds
     # only the .p12 import password on one line; the legacy Federation Hub
@@ -295,7 +298,7 @@ class DefaultConfig:
 
     # flask-sqlalchemy
     SQLALCHEMY_DATABASE_URI = os.getenv(
-        "SQLALCHEMY_DATABASE_URI", f"postgresql+psycopg://ots:POSTGRESQL_PASSWORD@127.0.0.1/ots"
+        "SQLALCHEMY_DATABASE_URI", "postgresql+psycopg://ots:POSTGRESQL_PASSWORD@127.0.0.1/ots"
     )
     SQLALCHEMY_ECHO = os.getenv("SQLALCHEMY_ECHO", "False").lower() in ["true", "1", "yes"]
     SQLALCHEMY_ENGINE_OPTIONS = {"pool_pre_ping": True}
