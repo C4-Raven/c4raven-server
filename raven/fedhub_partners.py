@@ -1137,7 +1137,7 @@ def build_checks(entry, partner, policy, own_uid, known_cas, connections, resolv
         checks.append(_check("ca_in_policy", "error", title,
                              gettext("The partner's certificate isn't in the active policy, so the hub "
                                      "refuses its connections"),
-                             gettext("Use Repair, or remove the partner and add it again")))
+                             gettext("Remove the partner and connect it again (its certificate is kept if still trusted)")))
     elif _enabled(entry["ca_node"]):
         checks.append(_check("ca_in_policy", "ok", title, gettext("Connections from this CA are accepted")))
     else:

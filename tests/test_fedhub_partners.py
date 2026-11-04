@@ -1457,7 +1457,10 @@ def test_ca_in_policy_missing_node_wording():
                              resolver=lambda h: (True, ["192.0.2.1"], None),
                              connector=lambda h, p: (True, None))
     item = [c for c in checks if c["code"] == "ca_in_policy"][0]
-    assert "isn't in the active policy" in item["detail"] and "Repair" in item["fix"]
+    assert "isn't in the active policy" in item["detail"]
+    # Repair only restores our own CA node, so it is not the fix for a partner's certificate
+    assert item["fix"] == "Remove the partner and connect it again (its certificate is kept if still trusted)"
+    assert "Repair" not in item["fix"]
 
 
 def test_no_active_policy_text_points_to_policy_editor(admin, hub):
